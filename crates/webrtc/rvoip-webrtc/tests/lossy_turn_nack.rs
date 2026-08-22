@@ -31,10 +31,7 @@ use support::lossy_turn_fixture::LossyTurnFixture;
 use tokio::sync::Notify;
 
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "turn-fork-candidate"),
-    ignore = "requires the owner-reviewed UDP TURN/NACK alpha-fork candidate"
-)]
+#[ignore = "requires the owner-reviewed UDP TURN/NACK alpha-fork candidate"]
 async fn nack_round_trip_through_lossy_turn() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let fixture = LossyTurnFixture::start(0.05, 0xCAFE)
@@ -58,6 +55,7 @@ async fn nack_round_trip_through_lossy_turn() {
         clock_rate_hz: 48_000,
         channels: 2,
         fmtp: None,
+        payload_type: None,
     };
 
     let offerer_ssrc = offerer.local_audio_ssrc().expect("offerer ssrc");

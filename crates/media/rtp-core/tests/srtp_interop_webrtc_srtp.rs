@@ -110,11 +110,19 @@ fn interop_survives_a_sequence_wrap() {
 }
 
 fn sample_rtcp_packet(ssrc: u32) -> Vec<u8> {
-    // Minimal SR (Sender Report) packet: V=2,P=0,RC=0; PT=200; length=1;
-    // SSRC; 8 bytes of opaque report payload.
-    let mut data = vec![0x80, 200, 0x00, 0x01];
+    // Valid SR (Sender Report) packet: V=2, P=0, RC=0, PT=200;
+    // length=6 (7 words = 28 bytes): SSRC(4) + NTP(8) + RTP ts(4)
+    // + sender packet count(4) + sender octet count(4) = 24 body bytes.
+    let mut data = vec![0x80, 200, 0x00, 0x06];
     data.extend_from_slice(&ssrc.to_be_bytes());
+    // NTP timestamp (8 bytes)
     data.extend_from_slice(&[0x55u8; 8]);
+    // RTP timestamp (4 bytes)
+    data.extend_from_slice(&[0x55u8; 4]);
+    // Sender packet count (4 bytes)
+    data.extend_from_slice(&[0x55u8; 4]);
+    // Sender octet count (4 bytes)
+    data.extend_from_slice(&[0x55u8; 4]);
     data
 }
 

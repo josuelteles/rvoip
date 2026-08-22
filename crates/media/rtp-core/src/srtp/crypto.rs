@@ -130,12 +130,19 @@ struct SrtpSessionKeys {
 impl SrtpCrypto {
     /// Create a new SRTP crypto context
     pub fn new(suite: SrtpCryptoSuite, master_key: SrtpCryptoKey) -> Result<Self> {
+        suite.validate()?;
         // Validate key length
         if master_key.key().len() != suite.key_length {
             return Err(Error::SrtpError(format!(
                 "Key length mismatch: expected {} but got {}",
                 suite.key_length,
                 master_key.key().len()
+            )));
+        }
+        if master_key.salt().len() != 14 {
+            return Err(Error::SrtpError(format!(
+                "SRTP master salt must be exactly 14 bytes, got {}",
+                master_key.salt().len()
             )));
         }
 
@@ -161,6 +168,10 @@ impl SrtpCrypto {
         crypto.derive_keys()?;
 
         Ok(crypto)
+    }
+
+    pub(crate) fn suite(&self) -> &SrtpCryptoSuite {
+        &self.suite
     }
 
     /// Derive session keys from master key
@@ -261,9 +272,12 @@ impl SrtpCrypto {
             .as_ref()
             .ok_or_else(|| Error::SrtpError("Session keys not derived".to_string()))?;
 
-        // Extract header and payload
+        // Serialize once to validate RTP padding and obtain the complete RTP
+        // payload region. RFC 3711 encrypts RTP padding together with the
+        // media payload; the padding count is therefore ciphertext on wire.
         let header = packet.header.clone();
-        let payload = packet.payload.clone();
+        let serialized = packet.serialize()?;
+        let header_size = packet.header.size();
 
         // Create an IV for encryption
         let ssrc = packet.header.ssrc;
@@ -282,8 +296,8 @@ impl SrtpCrypto {
             }
         };
 
-        // Create a mutable copy of the payload for encryption
-        let mut encrypted_payload = BytesMut::from(&payload[..]);
+        // Encrypt the media payload and any RFC 3550 padding as one region.
+        let mut encrypted_payload = BytesMut::from(&serialized[header_size..]);
 
         // Encrypt the payload
         match self.suite.encryption {
@@ -297,13 +311,22 @@ impl SrtpCrypto {
             }
         }
 
-        // Create a new packet with the encrypted payload
-        let encrypted_packet = RtpPacket::new(header, encrypted_payload.freeze());
+        // `padding_size == 0` marks that the protected payload already
+        // contains encrypted padding. The RTP P bit remains on wire.
+        let encrypted_packet = RtpPacket {
+            header,
+            payload: encrypted_payload.freeze(),
+            padding_size: 0,
+        };
 
         // Calculate authentication tag if authentication is enabled
         let auth_tag = if self.suite.authentication != SrtpAuthenticationAlgorithm::Null {
             // Serialize the encrypted packet for authentication
-            let encrypted_serialized = encrypted_packet.serialize()?;
+            let mut encrypted_serialized = BytesMut::with_capacity(encrypted_packet.size());
+            encrypted_packet
+                .header
+                .serialize(&mut encrypted_serialized)?;
+            encrypted_serialized.extend_from_slice(&encrypted_packet.payload);
 
             // Calculate the authentication tag
             let auth_tag = self.calculate_auth_tag(&encrypted_serialized, roc)?;
@@ -395,21 +418,25 @@ impl SrtpCrypto {
             // Verify the authentication tag
             let is_valid = authenticator.verify_auth_tag(packet_data, auth_tag, roc)?;
             if !is_valid {
-                return Err(Error::SrtpError("Authentication failed".to_string()));
+                return Err(Error::AuthenticationFailed(
+                    "SRTP authentication tag mismatch".to_string(),
+                ));
             }
         }
 
-        // Parse the RTP header first (it's not encrypted)
-        let packet = RtpPacket::parse(packet_data)?;
-
         if self.suite.encryption == SrtpEncryptionAlgorithm::Null {
-            // If only authentication is enabled, return the parsed packet
-            return Ok(packet);
+            // If only authentication is enabled, RTP padding remains in the
+            // clear and the ordinary parser can validate and strip it.
+            return RtpPacket::parse(packet_data);
         }
 
+        // Parse only the clear RTP header. The encrypted payload's final byte
+        // cannot be interpreted as an RTP padding count until after decryption.
+        let (header, header_size) = crate::packet::RtpHeader::parse_without_consuming(packet_data)?;
+
         // Create an IV for decryption
-        let ssrc = packet.header.ssrc;
-        let sequence = packet.header.sequence_number as u64;
+        let ssrc = header.ssrc;
+        let sequence = header.sequence_number as u64;
         let packet_index = (roc as u64) << 16 | sequence;
 
         // Create an IV using salt and packet info
@@ -424,8 +451,9 @@ impl SrtpCrypto {
             }
         };
 
-        // Create a mutable copy of the payload for decryption
-        let mut decrypted_payload = BytesMut::from(&packet.payload[..]);
+        // Decrypt the complete RTP payload region, including encrypted RTP
+        // padding when the P bit is set.
+        let mut decrypted_payload = BytesMut::from(&packet_data[header_size..]);
 
         // Decrypt the payload
         match self.suite.encryption {
@@ -439,29 +467,74 @@ impl SrtpCrypto {
             }
         }
 
-        // Create a new packet with the decrypted payload
-        let decrypted_packet = RtpPacket::new(packet.header, decrypted_payload.freeze());
+        let decrypted_payload = decrypted_payload.freeze();
+        let padding_size = if header.padding {
+            let Some(&padding_size) = decrypted_payload.last() else {
+                return Err(Error::InvalidPacket(
+                    "decrypted RTP padding flag is set but no padding is present".to_string(),
+                ));
+            };
+            if padding_size == 0 || usize::from(padding_size) > decrypted_payload.len() {
+                return Err(Error::InvalidPacket(format!(
+                    "invalid decrypted RTP padding length {padding_size} for {} payload octets",
+                    decrypted_payload.len()
+                )));
+            }
+            padding_size
+        } else {
+            0
+        };
+        let payload_end = decrypted_payload.len() - usize::from(padding_size);
 
-        Ok(decrypted_packet)
+        Ok(RtpPacket {
+            header,
+            payload: decrypted_payload.slice(..payload_end),
+            padding_size,
+        })
     }
 
-    /// Encrypt an RTCP packet.
+    /// Legacy stateless SRTCP encryption entry point.
+    ///
+    /// SRTCP requires a monotonically increasing per-SSRC index. Reusing the
+    /// historical implicit index zero would reuse an AES-CTR IV, so callers
+    /// must protect RTCP through [`super::SrtpContext`].
+    pub fn encrypt_rtcp(&self, _data: &[u8]) -> Result<(Bytes, Option<Vec<u8>>)> {
+        Err(Error::UnsupportedFeature(
+            "stateless SRTCP encryption is unsafe; use SrtpContext::protect_rtcp".to_string(),
+        ))
+    }
+
+    /// Encrypt an RTCP packet with an explicit 31-bit SRTCP index.
     ///
     /// `index` is the 31-bit SRTCP index for this packet (RFC 3711 §3.4) —
     /// the caller (`SrtpContext`) owns incrementing it per SSRC across
     /// sends; this function just writes whatever it's given into the
     /// trailing E-bit/index word and uses it to build the IV.
-    pub fn encrypt_rtcp(&self, data: &[u8], index: u32) -> Result<(Bytes, Option<Vec<u8>>)> {
+    pub(crate) fn encrypt_rtcp_with_index(
+        &self,
+        data: &[u8],
+        index: u32,
+    ) -> Result<(Bytes, Option<Vec<u8>>)> {
+        if index > 0x7fff_ffff {
+            return Err(Error::SrtpError(
+                "SRTCP index exceeds the 31-bit wire field".to_string(),
+            ));
+        }
+        if data.len() < 8 {
+            return Err(Error::SrtpError("RTCP packet too short".to_string()));
+        }
+        let ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+
         if self.suite.encryption == SrtpEncryptionAlgorithm::Null {
-            // Null encryption, just return the original data
-            return if self.suite.authentication == SrtpAuthenticationAlgorithm::Null {
-                // No authentication either
-                Ok((Bytes::copy_from_slice(data), None))
+            let mut result = BytesMut::with_capacity(data.len() + 4);
+            result.extend_from_slice(data);
+            result.put_u32(index);
+            let auth_tag = if self.suite.authentication == SrtpAuthenticationAlgorithm::Null {
+                None
             } else {
-                // Only authentication
-                let auth_tag = self.calculate_rtcp_auth_tag(data)?;
-                Ok((Bytes::copy_from_slice(data), Some(auth_tag)))
+                Some(self.calculate_rtcp_auth_tag(&result)?)
             };
+            return Ok((result.freeze(), auth_tag));
         }
 
         // Get session keys
@@ -473,14 +546,9 @@ impl SrtpCrypto {
         // Everything after the first 8-byte header of the (possibly
         // compound) RTCP packet is encrypted (RFC 3711 §3.4); the sender's
         // SSRC used for the IV comes from that same first header.
-        if data.len() <= 8 {
-            return Err(Error::SrtpError("RTCP packet too short".to_string()));
-        }
-
         // Extract header and payload
         let header = &data[0..8];
         let payload = &data[8..];
-        let ssrc = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
 
         // Create a mutable buffer for our result
         let mut result = BytesMut::with_capacity(data.len() + 4); // Space for index (4)
@@ -550,7 +618,11 @@ impl SrtpCrypto {
             .ok_or_else(|| Error::SrtpError("Session keys not derived".to_string()))?;
 
         // Create HMAC-SHA1 instance
-        let tag = hmac_sha1(data, &session_keys.rtcp_auth_key, self.suite.tag_length)?;
+        let tag = hmac_sha1(
+            data,
+            &session_keys.rtcp_auth_key,
+            self.suite.srtcp_tag_length(),
+        )?;
 
         Ok(tag)
     }
@@ -597,15 +669,18 @@ impl SrtpCrypto {
         Ok((ssrc, index, e_flag))
     }
 
-    /// Decrypt an SRTCP packet
-    pub fn decrypt_rtcp(&self, data: &[u8]) -> Result<Bytes> {
-        if self.suite.encryption == SrtpEncryptionAlgorithm::Null
-            && self.suite.authentication == SrtpAuthenticationAlgorithm::Null
-        {
-            // Null encryption and authentication, just return the original data
-            return Ok(Bytes::copy_from_slice(data));
-        }
+    /// Legacy stateless SRTCP decryption entry point.
+    ///
+    /// Replay validation and atomic receive-state updates live in
+    /// [`super::SrtpContext`], so bypassing that context is rejected.
+    pub fn decrypt_rtcp(&self, _data: &[u8]) -> Result<Bytes> {
+        Err(Error::UnsupportedFeature(
+            "stateless SRTCP decryption is unsafe; use SrtpContext::unprotect_rtcp".to_string(),
+        ))
+    }
 
+    /// Decrypt an SRTCP packet and return its SSRC and 31-bit packet index.
+    pub(crate) fn decrypt_rtcp_with_index(&self, data: &[u8]) -> Result<(Bytes, u32, u32)> {
         // Get session keys
         let session_keys = self
             .session_keys
@@ -616,7 +691,7 @@ impl SrtpCrypto {
         let min_len = 8
             + 4
             + (if self.suite.authentication != SrtpAuthenticationAlgorithm::Null {
-                self.suite.tag_length
+                self.suite.srtcp_tag_length()
             } else {
                 0
             });
@@ -629,7 +704,7 @@ impl SrtpCrypto {
         }
 
         // Calculate authentication tag position
-        let auth_tag_pos = data.len() - self.suite.tag_length;
+        let auth_tag_pos = data.len() - self.suite.srtcp_tag_length();
 
         // Verify authentication tag if authentication is enabled
         if self.suite.authentication != SrtpAuthenticationAlgorithm::Null {
@@ -652,7 +727,9 @@ impl SrtpCrypto {
             }
 
             if result != 0 {
-                return Err(Error::SrtpError("SRTCP authentication failed".to_string()));
+                return Err(Error::AuthenticationFailed(
+                    "SRTCP authentication tag mismatch".to_string(),
+                ));
             }
         }
 
@@ -667,13 +744,22 @@ impl SrtpCrypto {
         let index_value = u32::from_be_bytes(index_bytes);
         let e_flag = (index_value & 0x80000000) != 0;
         let index = index_value & 0x7FFFFFFF;
+        let ssrc = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
 
-        // If E flag is not set, packet is not encrypted
+        // An authenticated E=0 packet is valid only for an explicitly
+        // unencrypted SRTCP policy. Every constructible 0.3.5 suite uses
+        // AES-CM, so accepting it here would silently downgrade ciphertext to
+        // cleartext even though its HMAC is valid.
         if !e_flag {
+            if self.suite.encryption != SrtpEncryptionAlgorithm::Null {
+                return Err(Error::AuthenticationFailed(
+                    "encrypted SRTCP policy requires the E flag".to_string(),
+                ));
+            }
             // Remove the index and auth tag
             let mut result = BytesMut::with_capacity(index_pos);
             result.extend_from_slice(&data[0..index_pos]);
-            return Ok(result.freeze());
+            return Ok((result.freeze(), ssrc, index));
         }
 
         // Extract header and payload
@@ -688,10 +774,6 @@ impl SrtpCrypto {
 
         // Create a mutable copy of the payload for decryption
         let mut decrypted_payload = BytesMut::from(payload);
-
-        // The sender's SSRC used for the IV comes from the (unencrypted)
-        // first 8-byte RTCP header, bytes 4-7.
-        let ssrc = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
 
         let iv = match self.suite.encryption {
             SrtpEncryptionAlgorithm::AesCm => {
@@ -719,7 +801,7 @@ impl SrtpCrypto {
         // Add decrypted payload to result
         result.extend_from_slice(&decrypted_payload);
 
-        Ok(result.freeze())
+        Ok((result.freeze(), ssrc, index))
     }
 }
 
@@ -838,32 +920,48 @@ mod tests {
     }
 
     #[test]
-    fn test_null_encryption() {
-        // Create a key
+    fn null_encryption_suite_fails_closed() {
         let key = SrtpCryptoKey::new(vec![0; 16], vec![0; 14]);
-
-        // Use a modified SRTP_NULL_NULL with correct key length for testing
         let null_suite = SrtpCryptoSuite {
             encryption: SrtpEncryptionAlgorithm::Null,
             authentication: SrtpAuthenticationAlgorithm::Null,
-            key_length: 16, // Changed from 0 to 16 to match our test key
+            key_length: 16,
             tag_length: 0,
         };
+        assert!(matches!(
+            SrtpCrypto::new(null_suite, key),
+            Err(Error::UnsupportedFeature(_))
+        ));
+    }
 
-        // Create crypto context with null encryption
-        let crypto = SrtpCrypto::new(null_suite, key).unwrap();
+    #[test]
+    fn legacy_stateless_srtcp_entry_points_fail_closed() {
+        let crypto = SrtpCrypto::new(
+            super::super::SRTP_AES128_CM_SHA1_80,
+            SrtpCryptoKey::new(vec![0x11; 16], vec![0x22; 14]),
+        )
+        .unwrap();
+        let rtcp = [0x80, 201, 0, 1, 0x12, 0x34, 0x56, 0x78];
 
-        // Create a test packet
+        // Stateless SRTCP entry points must fail closed
+        assert!(matches!(
+            crypto.encrypt_rtcp(&rtcp),
+            Err(Error::UnsupportedFeature(_))
+        ));
+        assert!(matches!(
+            crypto.decrypt_rtcp(&rtcp),
+            Err(Error::UnsupportedFeature(_))
+        ));
+
+        // RTP null encryption round-trip (AES128_CM_SHA1_80 crypto with roc=0)
         let header = crate::packet::RtpHeader::new(96, 1000, 12345, 0xabcdef01);
         let payload = Bytes::from_static(b"test payload");
         let packet = RtpPacket::new(header, payload);
 
-        // Encrypt and verify it returns the same packet (null encryption)
         let encrypted_result = crypto.encrypt_rtp(&packet, 0);
         assert!(encrypted_result.is_ok());
         let (encrypted, _auth_tag) = encrypted_result.unwrap();
 
-        // Packets should be equal with null encryption
         assert_eq!(encrypted.header.payload_type, packet.header.payload_type);
         assert_eq!(
             encrypted.header.sequence_number,
@@ -871,7 +969,6 @@ mod tests {
         );
         assert_eq!(encrypted.header.timestamp, packet.header.timestamp);
         assert_eq!(encrypted.header.ssrc, packet.header.ssrc);
-        assert_eq!(encrypted.payload, packet.payload);
     }
 
     #[test]

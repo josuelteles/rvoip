@@ -1163,7 +1163,7 @@ fn inbound_ack_has_one_exact_causal_owner() {
         &core_source,
         "async fn process_global_transaction_event(&self",
     ));
-    assert!(ingress.contains("elseifmatches!(&event,TransactionEvent::AckReceived{..})"));
+    assert!(ingress.contains("elseifmatches!(&event,TransactionEvent::AckRequest{..})"));
     assert!(
         !ingress.contains("find_dialog_for_request(request).await"),
         "ACK ingress must not reconstruct a missing exact transaction binding from dialog tags"
@@ -1276,7 +1276,8 @@ fn typed_dialog_ingress_and_in_dialog_tracker_are_generation_fenced() {
         &handler,
         "async fn publish_and_release_session",
     ));
-    assert!(terminal.contains("get_session_snapshot_exact(&handle)"));
+    assert!(terminal.contains("has_exact_terminal_fact(&handle)"));
+    assert!(!terminal.contains("get_session_snapshot_exact("));
     assert!(!terminal.contains("lifecycle_handle("));
 
     let flow = compact(function_source(
@@ -1411,7 +1412,7 @@ fn session_handle_audio_keeps_exact_generation_authority_off_the_raw_hot_path() 
         "pub(crate) async fn send_audio_frame_exact",
     ));
     assert!(send.contains("media_for_handle_exact(handle)"));
-    assert!(send.contains("encode_and_send_audio_frame(&exact.dialog_id"));
+    assert!(send.contains("encode_and_send_audio(&exact.dialog_id,audio_frame)"));
     assert!(!send.contains("current_media("));
     assert!(!send.contains("media_is_still_exact("));
     assert!(!send.contains("session_id:&SessionId"));

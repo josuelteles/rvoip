@@ -18,6 +18,7 @@ pub mod handlers;
 pub mod invariants;
 pub mod registrar;
 pub mod ringing_uas;
+pub mod sdp;
 pub mod traces;
 
 pub use auth_uas::{boot_auth_uas, AuthUas, CapturedAuthRequest, ChallengeReply};
@@ -34,12 +35,14 @@ pub use invariants::{
 };
 pub use registrar::{boot_mock_registrar, CapturedRegister, MockRegistrar, RegistrarReply};
 pub use ringing_uas::{boot_ringing_uas, CapturedRequest, RingingUas};
+pub use sdp::{attach_pcmu_sdp_answer, fixture_media_port};
 pub use traces::{
     assert_header_on_wire, receiver_config, wait_for_inbound_method, SMOKE_HEADER_NAME,
     SMOKE_HEADER_VALUE,
 };
 
 const ISOLATED_EXAMPLE_TARGET: &str = "rvoip-sip-integration-examples";
+const PREBUILT_EXAMPLE_DIR_ENV: &str = "RVOIP_SIP_PREBUILT_EXAMPLE_DIR";
 
 /// Reserve a UDP port the kernel says is free right now.
 ///
@@ -95,10 +98,30 @@ pub fn isolated_example_target_dir() -> PathBuf {
     outer_target_dir.join(ISOLATED_EXAMPLE_TARGET)
 }
 
+fn prebuilt_example_dir() -> Option<PathBuf> {
+    env::var_os(PREBUILT_EXAMPLE_DIR_ENV).map(PathBuf::from)
+}
+
+fn example_path(directory: &Path, name: &str) -> PathBuf {
+    directory.join(format!("{name}{}", env::consts::EXE_SUFFIX))
+}
+
 /// Build the named process-fixture examples without contending on the outer
 /// `cargo test` target lock.
 pub fn build_examples(names: &[&str]) {
     assert!(!names.is_empty(), "at least one example must be requested");
+
+    if let Some(directory) = prebuilt_example_dir() {
+        for name in names {
+            let binary = example_path(&directory, name);
+            assert!(
+                binary.is_file(),
+                "prebuilt example binary is missing: {}",
+                binary.display()
+            );
+        }
+        return;
+    }
 
     let target_dir = isolated_example_target_dir();
     let mut command = Command::new(cargo_bin());
@@ -122,10 +145,9 @@ pub fn build_examples(names: &[&str]) {
 
 /// Resolve one example produced by [`build_examples`] for direct execution.
 pub fn example_binary(name: &str) -> PathBuf {
-    let binary = isolated_example_target_dir()
-        .join("debug")
-        .join("examples")
-        .join(format!("{name}{}", env::consts::EXE_SUFFIX));
+    let directory = prebuilt_example_dir()
+        .unwrap_or_else(|| isolated_example_target_dir().join("debug").join("examples"));
+    let binary = example_path(&directory, name);
     assert!(
         binary.is_file(),
         "built example binary is missing: {}",

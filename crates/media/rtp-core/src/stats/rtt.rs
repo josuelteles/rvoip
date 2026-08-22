@@ -227,8 +227,8 @@ mod tests {
         // Record an SR sent with an arbitrary NTP timestamp.
         let ssrc = 0x12345678;
         let ntp = NtpTimestamp {
-            seconds: 0xabcd0000,
-            fraction: 0x12345678,
+            seconds: 0xabcd1234,
+            fraction: 0x5678ef01,
         };
         estimator.record_sr_sent(ssrc, ntp);
 
@@ -256,6 +256,26 @@ mod tests {
         assert!(stats.rtt_ms > 0.0);
         assert!(stats.min_rtt_ms > 0.0);
         assert!(stats.max_rtt_ms > 0.0);
+    }
+
+    #[test]
+    fn test_lsr_requires_all_middle_ntp_bits() {
+        let mut estimator = RttEstimator::new();
+        let ssrc = 0x12345678;
+        estimator.record_sr_sent(
+            ssrc,
+            NtpTimestamp {
+                seconds: 0xaaaa1234,
+                fraction: 0x5678bbbb,
+            },
+        );
+
+        assert!(estimator
+            .process_receiver_report(ssrc, 0x12345678, 0)
+            .is_some());
+        assert!(estimator
+            .process_receiver_report(ssrc, 0x12340000, 0)
+            .is_none());
     }
 
     #[test]

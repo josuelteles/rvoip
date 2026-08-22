@@ -39,6 +39,7 @@ BETA_RELEASE_REPORT_HELPER="$SCRIPT_DIR/beta_release_report.py"
 BETA_RELEASE_POLICY="$CRATE_DIR/config/beta-release-policy.yaml"
 DOCKER_PEER_SNAPSHOT_HELPER="$SCRIPT_DIR/docker_peer_snapshot.py"
 PERF_REGRESSION_BASELINE_HELPER="$SCRIPT_DIR/perf_regression_baseline.py"
+PROXY_INTEROP_BETA_GATE="$WORKSPACE_ROOT/crates/sip/sip-proxy/tests/interop/scripts/beta_gate.sh"
 PERF_RESULTS_DIR="$WORKSPACE_ROOT/target/perf-results"
 PERF_RESULTS_ARCHIVE_ROOT="$WORKSPACE_ROOT/target/perf-results-archive"
 PERF_RESULTS_CAPTURE_MARKER="$ARTIFACT_DIR/environment/perf-results-capture.md"
@@ -143,6 +144,7 @@ Environment:
                                   YAML file are supplied for attestation.
   BETA_RUN_PBX=1                 Run examples/pbx/run.sh when PBX configs are present.
   BETA_RUN_LOCAL_PBX=1           Manage ~/Developer/asterisk and ~/Developer/freeswitch sequentially.
+  BETA_RUN_PROXY_PBX=1           Run the Kamailio/OpenSIPS+rtpengine labs (infra/release-runners/pbx). Default: skip.
   BETA_RESTORE_LOCAL_PBX=0       Do not restore the PBX container that was running before the gate.
   BETA_PBX_API                   PBX API subset: endpoint|stream_peer|callback|all. Defaults to all.
   BETA_PBX_SCENARIO              PBX scenario subset. Defaults to all.
@@ -189,6 +191,11 @@ Environment:
   BETA_BURST_MATRIX              Burst scenario list for full matrix, or "all".
   RVOIP_PERF_MIN_SUCCESS_PCT     SIPp pass threshold. Defaults to 99.9.
   BETA_RUN_STRICT_UA=0           Disable the baresip strict-UA gate; fails with --require-external.
+  PROXY_INTEROP_HOST_ADDRESS     Host address reachable from the pinned proxy-peer containers.
+                                  The full and interop gates always run both Kamailio and
+                                  OpenSIPS, in both adjacency orders, over UDP, TCP, and
+                                  verified TLS. Missing Docker, SIPp, packet capture, a peer,
+                                  an order, or a required transport is a hard failure.
   BETA_RUN_LONG_SOAK=0           Disable the ignored soak test; fails with --require-external.
   BETA_PERF_REGRESSION_FAIL=1    Make a regression vs the reviewed immutable baseline a hard gate failure. Default 0 (report-only + perf-audit.md).
   BETA_PERF_REGRESSION_BASELINE_ROOT
@@ -223,7 +230,7 @@ Environment:
                                   Include mimalloc snapshots in memory diagnostics. Defaults to 0.
   RVOIP_PERF_MEMORY_DIAG_INTERVAL_SECS
                                   Memory diagnostic interval. Defaults to 5.
-  RVOIP_PERF_MIMALLOC_COLLECT_AT Optional diagnostic mi_collect(true): off|phase|drain|both.
+  RVOIP_PERF_MIMALLOC_COLLECT_AT Optional diagnostic mi_collect(true): off|phase|drain|both|settled|all.
                                   Defaults to off in the beta gate.
   RVOIP_PERF_SYSTEM_ALLOCATOR=1  Build perf soak with the system allocator instead of mimalloc.
   RVOIP_PERF_DHAT=1              Build split soak with DHAT heap profiling allocator.
@@ -632,7 +639,7 @@ capture_command() {
 
 redacted_env() {
   env | LC_ALL=C sort | awk -F= '
-    /^(BETA_|PBX_|RVOIP_|SIPP_|ASTERISK_|FREESWITCH_|SIP_|TLS_)/ {
+    /^(BETA_|PBX_|PROXY_|RVOIP_|SIPP_|ASTERISK_|FREESWITCH_|SIP_|TLS_)/ {
       key=$1
       value=substr($0, length($1) + 2)
       redacted=key
@@ -785,8 +792,8 @@ copy_local_pbx_config_evidence() {
       redact_file "$dir/$file" "$out/$file"
     fi
   done
-  if [ -d "$dir/.git" ]; then
-    capture_command "$out/git-rev.txt" git -C "$dir" rev-parse --short HEAD
+  if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    capture_command "$out/git-rev.txt" git -C "$dir" rev-parse HEAD
     capture_command "$out/git-status.txt" git -C "$dir" status --short
   fi
 }
@@ -868,6 +875,12 @@ write_environment_report() {
 - beta_require_configured_state_table_evidence: \`${BETA_REQUIRE_CONFIGURED_STATE_TABLE_EVIDENCE:-0}\`
 - beta_run_pbx: \`${BETA_RUN_PBX:-0}\`
 - beta_run_local_pbx: \`${BETA_RUN_LOCAL_PBX:-0}\`
+- beta_proxy_interop_peers: \`kamailio opensips\`
+- beta_proxy_interop_orders: \`rvoip-first peer-first\`
+- beta_proxy_interop_transports: \`udp tcp tls\`
+- beta_proxy_interop_retention_drain_seconds: \`130\`
+- beta_proxy_interop_require_clean_source: \`1\`
+- beta_proxy_interop_require_unchanged_source: \`1\`
 - beta_perf_regression_fail: \`${BETA_PERF_REGRESSION_FAIL:-0}\`
 - beta_perf_regression_baseline_id: \`${perf_regression_baseline_id}\`
 - beta_perf_regression_baseline_manifest_sha256: \`${perf_regression_baseline_manifest_sha256}\`
@@ -985,6 +998,12 @@ write_summary_gate_table_header() {
 - beta_run_sipp: \`${BETA_RUN_SIPP:-1}\`
 - beta_sipp_diagnostics: \`${BETA_SIPP_DIAGNOSTICS:-0}\`
 - beta_run_strict_ua: \`${BETA_RUN_STRICT_UA:-1}\`
+- beta_proxy_interop_peers: \`kamailio opensips\`
+- beta_proxy_interop_orders: \`rvoip-first peer-first\`
+- beta_proxy_interop_transports: \`udp tcp tls\`
+- beta_proxy_interop_retention_drain_seconds: \`130\`
+- beta_proxy_interop_require_clean_source: \`1\`
+- beta_proxy_interop_require_unchanged_source: \`1\`
 - beta_run_long_soak: \`${BETA_RUN_LONG_SOAK:-1}\`
 - rvoip_perf_soak_duration_secs: \`${RVOIP_PERF_SOAK_DURATION_SECS:-3600}\`
 - rvoip_perf_soak_active_calls: \`${RVOIP_PERF_SOAK_ACTIVE_CALLS:-500}\`
@@ -1435,6 +1454,45 @@ run_local_pbx_gate() {
   PBX_RESTORE_ARMED=0
 }
 
+run_local_proxy_pbx_gate() {
+  # Kamailio and OpenSIPS registrar-proxy labs with rtpengine media relay
+  # (infra/release-runners/pbx/{kamailio,opensips}). Opt-in: the labs pull
+  # proxy + rtpengine images and bind host-network SIP/RTP ports, which not
+  # every beta environment can do. The lab up.sh scripts gate readiness on
+  # the registrar answering AND rtpengine being enabled, and write the env
+  # files the harness sources.
+  local lifecycle="$WORKSPACE_ROOT/infra/release-runners/interop-lifecycle.sh"
+  local pbx_output_root="$ARTIFACT_DIR/pbx"
+  local proxy_scenario="${BETA_PROXY_PBX_SCENARIO:-all}"
+  local proxy_api="${BETA_PROXY_PBX_API:-endpoint}"
+
+  if [ ! -f "$lifecycle" ]; then
+    skip_gate "proxy PBX matrix" "interop-lifecycle.sh not found at $lifecycle."
+    return
+  fi
+
+  mkdir -p "$pbx_output_root"
+  local provider
+  local label
+  for provider in kamailio opensips; do
+    case "$provider" in
+      kamailio) label="Kamailio" ;;
+      opensips) label="OpenSIPS" ;;
+      *) label="$provider" ;;
+    esac
+    if run_gate "local ${label} lab up" bash "$lifecycle" "${provider}-up"; then
+      capture_docker_snapshot "after-${provider}-up"
+      run_gate_continue "local ${label} PBX matrix" \
+        env PBX_OUT_ROOT="$pbx_output_root" \
+        PBX_REPORT_APPEND=1 \
+        "$CRATE_DIR/examples/pbx/run.sh" \
+        --pbx "$provider" --api "$proxy_api" --scenario "$proxy_scenario"
+      capture_docker_snapshot "after-${provider}-matrix"
+    fi
+    run_gate_continue "local ${label} lab down" bash "$lifecycle" "${provider}-down"
+  done
+}
+
 start_managed_sipp_target() {
   local host="${BETA_SIPP_TARGET_HOST:-127.0.0.1}"
   local port="${BETA_SIPP_TARGET_PORT:-35060}"
@@ -1608,12 +1666,29 @@ run_sipp_standalone_gate() {
   fi
 }
 
-run_proxy_descope_audit() {
-  run_gate_continue "Kamailio/OpenSIPS proxy de-scope audit" bash -c \
-    "set -euo pipefail
-     rg -q 'Kamailio/OpenSIPS.*planned validation targets, not release' crates/sip/rvoip-sip/README.md
-     rg -q 'Kamailio/OpenSIPS plus RTPengine.*Investigation' crates/sip/rvoip-sip/docs/TOPOLOGY_PROFILES.md
-     rg -q 'Kamailio/OpenSIPS.*Investigation only' crates/sip/rvoip-sip/docs/INTEROP_CI_PLAN.md"
+run_proxy_interop_gate() {
+  # This release gate is deliberately not optional and never becomes SKIP.
+  # Its stable entry point owns prerequisite checks and must fail closed until
+  # the complete real-peer matrix (including verified TLS) is implemented.
+  run_gate_continue "Kamailio/OpenSIPS stateful-proxy interoperability matrix" \
+    env \
+      PROXY_INTEROP_ARTIFACT_DIR="$ARTIFACT_DIR/proxy-interop" \
+      PROXY_INTEROP_PEERS="kamailio opensips" \
+      PROXY_INTEROP_ORDERS="rvoip-first peer-first" \
+      PROXY_INTEROP_TRANSPORTS="udp tcp tls" \
+      PROXY_INTEROP_RETENTION_DRAIN_SECONDS=130 \
+      PROXY_INTEROP_FAIL_FAST=1 \
+      PROXY_INTEROP_REQUIRE_CLEAN_SOURCE=1 \
+      PROXY_INTEROP_REQUIRE_UNCHANGED_SOURCE=1 \
+      PROXY_INTEROP_REQUIRE_PREEXISTING_STATE=1 \
+      bash -c '
+        set -euo pipefail
+        "$1"
+        python3 "$2" validate-proxy-interop --report-root "$3"
+      ' _ \
+        "$PROXY_INTEROP_BETA_GATE" \
+        "$BETA_RELEASE_REPORT_HELPER" \
+        "$ARTIFACT_DIR"
 }
 
 run_dependency_audit() {
@@ -1804,7 +1879,8 @@ run_local_gates() {
     crates/sip/rvoip-sip/scripts/test_perf_2k_baseline.py \
     crates/sip/rvoip-sip/scripts/test_perf_regression_baseline.py \
     crates/sip/rvoip-sip/scripts/test_perf_cargo_artifact.py \
-    crates/sip/rvoip-sip/scripts/test_docker_peer_snapshot.py
+    crates/sip/rvoip-sip/scripts/test_docker_peer_snapshot.py \
+    crates/sip/sip-proxy/tests/interop/scripts/test_state_snapshot.py
   run_gate_continue "public API compatibility" "$SCRIPT_DIR/check_public_api.sh"
   run_gate_continue "rvoip-sip all-target check" cargo check -p rvoip-sip --all-targets --features generated-validation,dev-insecure-tls
   run_gate_continue "claimed lower-crate check" cargo check \
@@ -1861,6 +1937,12 @@ run_interop_gates() {
     skip_gate "PBX interop matrix" "Set BETA_RUN_LOCAL_PBX=1 for ~/Developer PBX lifecycle management, or BETA_RUN_PBX=1 after starting PBX containers yourself."
   fi
 
+  if [ "${BETA_RUN_PROXY_PBX:-0}" = "1" ]; then
+    run_local_proxy_pbx_gate
+  else
+    skip_gate "proxy PBX matrix" "Set BETA_RUN_PROXY_PBX=1 to run the Kamailio/OpenSIPS+rtpengine labs (registration, basic_call, AMR passthrough)."
+  fi
+
   run_sipp_standalone_gate
 
   if [ "${BETA_RUN_STRICT_UA:-1}" = "0" ]; then
@@ -1871,7 +1953,7 @@ run_interop_gates() {
       "$CRATE_DIR/tests/interop/baresip/run_strict_ua.sh"
   fi
 
-  run_proxy_descope_audit
+  run_proxy_interop_gate
 }
 
 run_perf_regression_audit() {
@@ -2153,6 +2235,12 @@ env \
     --derived "beta_state_table_sha256=$selected_state_table_sha256" \
     --derived "beta_profile_matrix=$(perf_profile_matrix)" \
     --derived "beta_perf_features=$(perf_features)" \
+    --derived "beta_proxy_interop_peers=kamailio opensips" \
+    --derived "beta_proxy_interop_orders=rvoip-first peer-first" \
+    --derived "beta_proxy_interop_transports=udp tcp tls" \
+    --derived "beta_proxy_interop_retention_drain_seconds=130" \
+    --derived "beta_proxy_interop_require_clean_source=1" \
+    --derived "beta_proxy_interop_require_unchanged_source=1" \
     --derived "beta_perf_regression_baseline_id=$perf_regression_baseline_id" \
     --derived "beta_perf_regression_baseline_manifest_sha256=$perf_regression_baseline_manifest_sha256"
 write_summary_gate_table_header

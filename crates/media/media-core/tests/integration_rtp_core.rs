@@ -6,8 +6,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-#[cfg(feature = "g729")]
-use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
 
 // Import rtp-core types
@@ -17,8 +15,6 @@ use rvoip_rtp_core::{
 
 // Import media-core types
 use codec_core::codecs::g711::G711Variant;
-#[cfg(feature = "g729")]
-use rvoip_media_core::processing::format::FormatConverter;
 use rvoip_media_core::{
     codec::audio::g711::G711Codec,
     codec::{mapping::CodecMapper, AudioCodec},
@@ -43,6 +39,10 @@ async fn create_test_rtp_client() -> Box<dyn MediaTransportClient> {
     let remote_addr: SocketAddr = "127.0.0.1:5006".parse().unwrap();
 
     let config = ClientConfigBuilder::sip()
+        // This test exercises plain RTP. The SIP preset intentionally carries
+        // an unprovisioned secure-policy marker in 0.3.5 and must be resolved
+        // explicitly instead of silently downgrading to plaintext.
+        .with_no_security()
         .remote_address(remote_addr)
         .default_payload_type(0)
         .clock_rate(8000)
@@ -299,8 +299,7 @@ async fn test_transcoding_over_rtp() {
     // Test that transcoding works in the context of RTP transport
 
     use rvoip_media_core::codec::Transcoder;
-    let format_converter = Arc::new(RwLock::new(FormatConverter::new()));
-    let mut transcoder = Transcoder::new(format_converter);
+    let mut transcoder = Transcoder::new();
 
     // Create G.711 PCMU test data
     let pcmu_data = vec![0xFF; 80]; // 10ms of PCMU silence

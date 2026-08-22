@@ -2,7 +2,222 @@
 
 ## Unreleased
 
-No changes yet.
+## 0.3.8 — 2026-08-14
+
+This coordinated 44-crate patch release brings AMR-NB and AMR-WB into the
+codec set end to end — negotiation, transport, transcoding, and release
+evidence — adds record-routed proxy interop to the qualification matrix, and
+repairs SIPS dialog and opus-bridge edge cases found on the way.
+
+### AMR codecs
+
+- Add AMR-NB and AMR-WB with IF1 and IF2 interface formats, VAD1/VAD2 and DTX
+  reaching the wire, receive-side interleaving reassembly, max-red redundancy
+  scheduling with dedup, and CMR damping — bit-exact against the fetched
+  TS 26.073/26.101/26.201 material, with no 3GPP sources in the repository.
+- Negotiate and obey the SDP mode-set, prove every mode in a live call, and
+  attest each rate in the release evidence; long-run soaks cover both
+  variants.
+- Admit dynamic codecs into the media graph by their negotiated payload type
+  (`CodecInfo` now carries it), re-frame packet times AMR cannot accept
+  (10 ms joins and 30 ms splits), and label emitted frames so the UCTP pumps
+  stop stamping Opus's number on everything else.
+- Prove AMR crosses SRTP in process and a QUIC datagram in both directions.
+
+### SIP, proxies, and interop
+
+- Generate a secure fallback Contact for every RFC 3261 §12.1.1 trigger, so
+  secure dialogs answer with `sips:` at the TLS-advertised address while
+  explicit Contact and plain-SIP behavior are preserved (issue #176). This
+  also repairs rvoip-to-rvoip SIPS setup: `Dialog::from_2xx_response` refuses
+  a secure dialog whose Contact is not `sips:`, which the old plain fallback
+  tripped.
+- Learn the UAC route set from the dialog-forming 2xx's Record-Route
+  (reversed per §12.1.2), so in-dialog requests stop bypassing
+  record-routing proxies; the UAS side reads it from the request.
+- Add Kamailio and OpenSIPS registrar-proxy labs with TLS and SRTP through
+  rtpengine, opt-in AMR-NB transcoding (the AMR-WB transcode failure is
+  attributed to rtpengine), and a per-rate sweep bound to the gate catalog.
+- Expose the profiled egress registration's coordinator for
+  observation-only event subscriptions; the composite adapter remains the
+  sole signaling and lifecycle owner.
+- `Config` gains `with_amr_dtx`, `with_amr_auto_cmr`, and
+  `with_amr_mode_set` builders (private fields — `Config`'s constructible
+  shape stays frozen). DTX and auto-CMR are local media policy; only the
+  RFC 4867 `mode-set` is negotiated.
+- `CodecInfo` carries the payload type a transport negotiated
+  (`payload_type: Option<u8>`). Code constructing `CodecInfo` literals adds
+  one field on upgrade; `None` preserves the name-table behavior.
+
+### Media graph and bridges
+
+- Keep opus↔opus bridges passthrough when the two legs numbered opus
+  differently: the payload type is a per-leg SDP artifact, so the bypass
+  compares name, rate, and channels, and passthrough restamps the sink's
+  payload type on egress.
+- Make a barge-in flush empty the re-framing accumulator as well as the sink
+  queues, so no pre-interruption audio or dead-timeline timestamp survives
+  into the first post-flush frame.
+- Reach the opus and all-codecs feature sets from the rvoip facade.
+
+### Qualification
+
+`0.3.8` requires a fresh `remote-release` qualification bound to the updated
+gate catalog, which adds the AMR per-rate sweep, the proxy-PBX media family,
+and the AMR fuzz targets. Because the aggregate is bound to the catalog hash,
+no `0.3.7` evidence qualifies this release.
+
+## 0.3.7 — 2026-08-06
+
+This coordinated 44-crate patch release hardens voice-AI and WebRTC media under
+backpressure, exposes inbound SIP auth/context on the app facade, and repairs
+SIP/WebRTC edge cases that dropped audio, DTMF, or late tracks.
+
+### Vapi and media reliability
+
+- Bound inbound/outbound audio queues so bursts and uplink stalls no longer kill
+  the session; keep the RTP clock advancing across underruns and re-converge
+  jitter depth on renegotiation.
+- Adaptive jitter target, working inbound catch-up, and a symmetric outbound
+  drain valve; flush stale playout audio on barge-in.
+- Move WebSocket writes off the media loop, isolate control from media
+  backpressure, and attribute media logs and health telemetry per call
+  (`VapiMediaHealth`, current depth vs high-water, catch-up blocked ticks).
+
+### WebRTC, Connect, and SIP
+
+- Preserve media and unbind under driver backpressure; tolerate WebRTC startup
+  backpressure without evicting Connect media routes or sinks.
+- Allow primary audio and DTMF when a peer never negotiates MID; attach late
+  remote audio tracks; bound per-peer UDP allocation; preserve remote codec
+  preference order.
+- Route wildcard contacts via the observed source address.
+- Surface listener auth and inbound context policy on `SipConfig`
+  (`tenant`, `trusted_trunk`, `capture_headers`) so facade apps can do
+  DID-based routing and trunk admission.
+
+### Release and workspace
+
+- Publish the exact qualified candidate, keep qualification checkout on `main`,
+  and allow signed ancestor release publication when attestation requires it.
+- Inherit remaining third-party and `rtc` dependency pins from the workspace so
+  version bumps stay single-source.
+
+### Qualification
+
+`0.3.7` requires a fresh, source-bound strict full-beta PASS. Historical
+`0.3.2` exception, `0.3.4` carry-forward, and prior `0.3.6` qualification
+evidence do not qualify it.
+
+## 0.3.6 — 2026-08-02
+
+This coordinated 44-crate patch release moves full release qualification onto
+ephemeral GCP workers, repairs remote gate false failures, and lands SIP/core
+correctness fixes needed for reliable attestation.
+
+### Release qualification
+
+- Run complete release qualification on ephemeral GCP workers with parallel
+  performance, soak, proxy-interop, and diagnostic profiles.
+- Cache exact performance build bundles, stream large artifacts from disk, and
+  reuse selective evidence only when digests match.
+- Reject failed candidates before deferred gates finish; accelerate long soaks;
+  harden burst RSS and FreeSWITCH/PBX readiness checks.
+- Automate active release metadata updates in `README.md`,
+  `BETA_RELEASE_CHECKLIST.md`, and `RELEASE_NOTES_NEXT.md`.
+
+### SIP, core, and security dependencies
+
+- Publish the established event only after ACK; consume non-2xx ACK at the write
+  boundary; tolerate legal final-response retransmission in soak evidence.
+- Preserve cross-crate event semantics and make filtered message pagination
+  deterministic.
+- Send browser DTMF on the negotiated audio source.
+- Upgrade jsonwebtoken, OpenTelemetry, and SIP terminal UI dependencies; remove
+  the legacy AWS rustls adapter.
+
+### Qualification
+
+`0.3.6` requires a fresh, source-bound strict full-beta PASS. Historical
+`0.3.2` exception and `0.3.4` carry-forward evidence do not qualify it.
+
+## 0.3.5 — 2026-07-30
+
+This coordinated 44-crate patch release hardens security and media state,
+completes transactional SIP renegotiation, exposes symmetric-RTP NAT policy on
+the high-level APIs, and makes Tokio the sole WebRTC runtime.
+
+### Security and media
+
+- Fail closed for placeholder AES-GCM profiles and unsupported DTLS
+  construction; incomplete profiles cannot be advertised or negotiated.
+- Correct RTP padding and RFC 8285 extensions, RTCP LSR/compound parsing, and
+  loss/jitter accounting across rollover, gaps, duplicates, and reordering.
+- Separate inbound/outbound and per-SSRC SRTP/SRTCP state, authenticate before
+  committing replay state, and cover the result with RFC vectors and pinned
+  libSRTP interoperability.
+- Generate directional SDES answer keys and accept safely unpadded AES-256 key
+  material in compatible mode with secret-safe diagnostics (issue #46).
+- Preserve the 0.3.x `Config`, `Event`, `SessionError`, state-table, and
+  negotiated-media shapes while exposing new auth, SDES, and renegotiation
+  details through bounded additive diagnostic/runtime APIs.
+
+### SIP, codecs, and WebRTC
+
+- Make hold/resume, re-INVITE, UPDATE, delayed offers, authentication retries,
+  retransmissions, rollback, and media application transactional and
+  exact-generation owned.
+- Expose `SipNatConfig` and `SymmetricRtpPolicy` through `EndpointBuilder` and
+  `StreamPeerBuilder` (issue #50).
+- Use the real Opus backend, make codec names ASCII case-insensitive, and stop
+  advertising unavailable Opus or G.722 implementations.
+- Remove Smol/async-std runtime support from WebRTC and correct the confirmed
+  Chromium audio/SSRC/simulcast SDP regression.
+- Preserve bounded, sharded, keyed/no-scan SIP lifecycle paths and make the
+  registrar and coordinated workspace pass strict release linting.
+
+### Qualification
+
+`0.3.5` requires a fresh, source-bound strict full-beta PASS. Historical
+`0.3.2` exception and `0.3.4` carry-forward evidence do not qualify it.
+
+## 0.3.4 — 2026-07-29
+
+This coordinated 44-crate patch release adds exact inbound-admission terminal
+notification, completes RFC 6026 INVITE Accepted lifecycles, and introduces a
+bounded RFC 3261 transaction-stateful proxy profile updated by RFC 4320 and
+RFC 6026.
+
+### Added
+
+- Exact-generation inbound admission termination notification for cancelled,
+  remotely ended, and failed source legs without polling.
+- Compact, sharded Timer M/L retention driven by the existing manager-owned
+  deadline queues rather than per-transaction runners and sleeper tasks.
+- Matched/unmatched proxy CANCEL handling, fork response contexts, multiple
+  and late 2xx forwarding, ACK ownership, Timer C, response aggregation, and
+  strict/loose routing coverage within the documented bounded profile.
+- Fail-closed Kamailio/OpenSIPS interoperability and four-peer beta-report
+  attestation tooling for future strict full-beta runs.
+- `rvoip-release-carry-forward-attestation-v1` release verification.
+
+### Fixed
+
+- Atomic, generation-protected transaction timer firing removes a saturated
+  command-channel race that could strand expired transactions.
+- Accepted transactions shed active runners, transports, command queues, and
+  active-only locks while preserving RFC retention and exact cleanup.
+- INVITE retransmission, late response, Via/route, RFC 3263 failover, and
+  stateful-proxy response behavior have focused regression coverage.
+
+### Qualification
+
+The owner approved `0.3.4` with a transparent carry-forward disposition. The
+full `0.3.4` beta, four-peer interoperability matrix, and long soaks were not
+rerun. Current evidence is the complete workspace release verification and one
+clean revision-bound canonical 2,000-CPS/65,000-call real-media PASS. The
+immutable `0.3.2` owner-approved exception remains historical background with
+strict status `NON-RC` and is not relabeled as a current beta PASS.
 
 ## 0.3.3 — 2026-07-29
 

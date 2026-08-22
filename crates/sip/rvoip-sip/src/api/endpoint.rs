@@ -32,7 +32,7 @@ use crate::api::performance::PerformanceConfig;
 use crate::api::stream_peer::{EventReceiver, PeerControl, StreamPeer};
 use crate::api::unified::{
     Config, MediaMode, Registration, RegistrationHandle, RegistrationInfo, RegistrationStatus,
-    SipTlsMode,
+    SdesBase64Mode, SipNatConfig, SipRuntimeConfig, SipTlsMode, SymmetricRtpPolicy,
 };
 use crate::auth::SipClientAuth;
 use crate::errors::{Result, SessionError};
@@ -202,6 +202,13 @@ impl Endpoint {
             self.registrar.clone(),
             self.transport,
         ))
+    }
+
+    /// Subscribe to bounded security and renegotiation diagnostics.
+    pub fn subscribe_diagnostics(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::api::events::DiagnosticEvent> {
+        self.peer.subscribe_diagnostics()
     }
 
     /// Split the endpoint into cloneable controls and an endpoint event stream.
@@ -392,6 +399,13 @@ impl EndpointControl {
             self.registrar.clone(),
             self.transport,
         ))
+    }
+
+    /// Subscribe to bounded security and renegotiation diagnostics.
+    pub fn subscribe_diagnostics(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::api::events::DiagnosticEvent> {
+        self.control.subscribe_diagnostics()
     }
 
     /// Resolve a dial target using this endpoint's account context.
@@ -1832,6 +1846,8 @@ pub struct EndpointBuilder {
     media_public_addr: Option<SocketAddr>,
     media_mode: Option<MediaMode>,
     stun_server: Option<String>,
+    nat: SipNatConfig,
+    sdes_base64_mode: SdesBase64Mode,
     outbound_proxy_uri: Option<String>,
     sip_instance: Option<String>,
     transport: EndpointTransport,
@@ -1884,6 +1900,8 @@ impl EndpointBuilder {
             media_public_addr: None,
             media_mode: None,
             stun_server: None,
+            nat: SipNatConfig::default(),
+            sdes_base64_mode: SdesBase64Mode::default(),
             outbound_proxy_uri: None,
             sip_instance: None,
             transport: EndpointTransport::Udp,
@@ -2150,6 +2168,7 @@ impl EndpointBuilder {
         if self.sip_trace.is_some() {
             configured.sip_trace = self.sip_trace;
         }
+        configured.nat = self.nat;
         Ok(configured)
     }
 
@@ -2221,6 +2240,26 @@ impl EndpointBuilder {
     /// Set a STUN server for best-effort media public-address discovery.
     pub fn stun_server(mut self, server: impl Into<String>) -> Self {
         self.stun_server = Some(server.into());
+        self
+    }
+
+    /// Set the complete SIP/RTP NAT policy for this endpoint.
+    pub fn nat(mut self, nat: SipNatConfig) -> Self {
+        self.nat = nat;
+        self
+    }
+
+    /// Set the bounded symmetric-RTP source learning and rebinding policy.
+    pub fn symmetric_rtp_policy(mut self, policy: SymmetricRtpPolicy) -> Self {
+        self.nat = self.nat.with_symmetric_rtp_policy(policy);
+        self
+    }
+
+    /// Select the inbound RFC 4568 SDES Base64 validation policy.
+    ///
+    /// Outbound SDP remains canonical in both modes.
+    pub fn sdes_base64_mode(mut self, mode: SdesBase64Mode) -> Self {
+        self.sdes_base64_mode = mode;
         self
     }
 
@@ -2424,7 +2463,7 @@ impl EndpointBuilder {
     /// Build and start the endpoint.
     pub async fn build(self) -> Result<Endpoint> {
         let parts = self.build_parts()?;
-        let peer = StreamPeer::with_config(parts.config).await?;
+        let peer = StreamPeer::with_config_and_runtime(parts.config, parts.runtime).await?;
         Ok(Endpoint {
             peer,
             registration: parts.registration,
@@ -2593,6 +2632,9 @@ impl EndpointBuilder {
 
         Ok(EndpointParts {
             config,
+            runtime: SipRuntimeConfig::default()
+                .with_nat(self.nat)
+                .with_sdes_base64_mode(self.sdes_base64_mode),
             registration,
             registrar,
             transport: self.transport,
@@ -2715,6 +2757,7 @@ impl Default for EndpointBuilder {
 
 struct EndpointParts {
     config: Config,
+    runtime: SipRuntimeConfig,
     registration: Option<Registration>,
     registrar: Option<String>,
     transport: EndpointTransport,
@@ -3448,5 +3491,42 @@ mod tests {
                 "endpoint audio roundtrip example must not reference lower-level API {banned}"
             );
         }
+    }
+
+    #[test]
+    fn endpoint_builder_threads_explicit_symmetric_rtp_policy() {
+        let policy = SymmetricRtpPolicy {
+            probation_packets: 5,
+            max_rebindings: 12,
+            ..SymmetricRtpPolicy::default()
+        };
+        let parts = EndpointBuilder::new()
+            .symmetric_rtp_policy(policy)
+            .build_parts()
+            .expect("build endpoint parts");
+        assert_eq!(parts.runtime.nat().symmetric_rtp, policy);
+
+        let nat = SipNatConfig::default().with_symmetric_rtp_policy(policy);
+        let configured = EndpointBuilder::new()
+            .nat(nat)
+            .config(EndpointConfig::default())
+            .expect("apply endpoint config")
+            .build_parts()
+            .expect("build configured endpoint parts");
+        assert_eq!(
+            configured.runtime.nat(),
+            nat,
+            "config() must retain explicit NAT policy"
+        );
+    }
+
+    #[test]
+    fn endpoint_builder_threads_strict_sdes_policy_without_changing_config_shape() {
+        let parts = EndpointBuilder::new()
+            .sdes_base64_mode(SdesBase64Mode::Strict)
+            .build_parts()
+            .expect("build endpoint parts");
+
+        assert_eq!(parts.runtime.sdes_base64_mode(), SdesBase64Mode::Strict);
     }
 }

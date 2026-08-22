@@ -13,21 +13,13 @@ use moq_transport::{
 };
 use tokio::time::timeout;
 
-mod common;
+mod support;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::test]
 async fn track_status_round_trips_on_independent_request_streams() -> anyhow::Result<()> {
-    let identity = common::localhost_server_identity()?;
-    let tls = tls::Args {
-        cert: vec![identity.cert],
-        key: vec![identity.key],
-        root: Vec::new(),
-        disable_verify: true,
-        ..Default::default()
-    }
-    .load()?;
+    let tls = support::localhost_server_tls(tls::ClientAuthMode::Disabled, &[])?;
     let endpoint = quic::Endpoint::new(quic::Config::new("127.0.0.1:0".parse()?, None, tls)?)?;
     let quic::Endpoint { client, server, .. } = endpoint;
     let mut server = server.context("test endpoint did not expose a server")?;

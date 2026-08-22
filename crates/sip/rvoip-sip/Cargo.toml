@@ -440,8 +440,8 @@ rcgen = "0.14"
 rustls = { workspace = true }
 clap = { workspace = true }
 cpal = "0.15"
-crossterm = "0.27"
-ratatui = "0.26"
+crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 criterion = { workspace = true }
 futures = { workspace = true }
 proptest = { workspace = true }
@@ -487,12 +487,18 @@ g729 = ["rvoip-media-core/g729"]
 dtls-srtp = ["rvoip-media-core/dtls-srtp", "rvoip-rtp-core/dtls-webrtc"]
 # Real ICE (RFC 8445) connectivity checks: a=ice-ufrag/a=ice-pwd/a=candidate
 # SDP handling and a live webrtc-ice agent bridged over the shared RTP
-# socket. Orthogonal to `dtls-srtp` — combine freely. Off by default.
+# socket. Orthogonal to `dtls-srtp`, combine freely. Off by default.
 ice = ["rvoip-media-core/ice", "rvoip-rtp-core/ice", "dep:rvoip-nat-core"]
+amr-nb = ["rvoip-media-core/amr-nb"]
+amr-wb = ["rvoip-media-core/amr-wb"]
+amr = ["amr-nb", "amr-wb"]
 # Optional native Opus media support for negotiated SIP legs. Bridgefu enables
 # this so SIP Opus is represented as Opus codec payload in MediaFrame rather
 # than being mis-decoded as G.711.
 opus = ["rvoip-media-core/opus"]
+# Deprecated compatibility alias; this selects the same real backend.
+opus-sim = ["opus"]
+all-codecs = ["g729", "opus", "amr"]
 # Heap profiling for `examples/profiling/dhat_*.rs`. Pulls in the dhat
 # global allocator and turns the gated examples into compilable
 # binaries. Off by default so `cargo build` / `cargo test` never see
@@ -703,22 +709,29 @@ required-features = ["perf-tests"]
 # Profiling-only optional deps. Off by default; enabled via the `dhat`
 # and `tokio-console` features. See `crates/sip/rvoip-sip/docs/PROFILING.md`.
 [dependencies.dhat]
-version = "0.3"
+workspace = true
 optional = true
 
 [dependencies.console-subscriber]
-version = "0.4"
+workspace = true
 optional = true
-
-# perf-tests optional deps. Off by default; enabled via the `perf-tests`
-# feature. These live in `[dependencies]` (not `[dev-dependencies]`)
-# because Cargo does not allow `optional = true` on dev-dependencies —
-# same idiom as `dhat` and `console-subscriber` above. They are pulled
-# in only when the feature is enabled, so default builds are untouched.
 [dependencies.hdrhistogram]
-version = "7.5"
+workspace = true
 optional = true
 
 [dependencies.sysinfo]
-version = "0.31"
+workspace = true
 optional = true
+
+# Struct-literal construction is not this crate's supported API: `Config` is
+# built through its constructors and `with_*` builders (its new fields are
+# private), and `internals::NegotiatedConfig` is an internals type whose one
+# external literal lives in this repo's own guard tests. cargo-semver-checks
+# cannot scope lints per struct, so the two literal-construction lints report
+# as warnings instead of failing the gate; every other breaking class —
+# removals, retypes, renames — still fails. New public fields on non-internals
+# config types remain forbidden by review policy even though the tool can no
+# longer enforce it alone.
+[package.metadata.cargo-semver-checks.lints]
+constructible_struct_adds_field = "warn"
+constructible_struct_adds_private_field = "warn"

@@ -5,7 +5,7 @@
 
 **Rust-native real-time communications across SIP, WebRTC, QUIC, WebTransport, WebSocket, MoQ, voice AI, and enterprise integrations.**
 
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license)
 [![rvoip](https://img.shields.io/crates/v/rvoip.svg?label=rvoip)](https://crates.io/crates/rvoip)
 [![rvoip-sip](https://img.shields.io/crates/v/rvoip-sip.svg?label=rvoip-sip)](https://crates.io/crates/rvoip-sip)
@@ -19,16 +19,17 @@
 ---
 
 > [!IMPORTANT]
-> **Unified `0.3.3` release.** All 44 publishable workspace crates ship on the
-> same version. The SIP product is the release-gated beta surface. WebRTC,
+> **Unified `0.3.8` release train.** All 44 publishable workspace crates ship on
+> the same version. Publication requires a fresh, strict full-beta run bound to
+> the exact release source: no skipped gates, no carry-forward qualification,
+> and passing workspace, security, four-peer interoperability, performance,
+> resiliency, and long-soak evidence. The generated beta report is authoritative
+> for the exact tested versions and results. The SIP product is the
+> release-gated beta surface. WebRTC,
 > UCTP, MoQ, the cross-transport APIs, Amazon Connect, and extension crates are
 > available today as developer-preview surfaces unless their own documentation
 > states a narrower qualification. Available does not mean API-stable or
 > production-certified; breaking changes remain possible before `1.0`.
-> The 0.3.3 vCon delta does not rerun or relabel the SIP beta checkpoint. Its
-> unchanged-subsystem background remains the immutable [0.3.2 performance
-> exception](crates/sip/rvoip-sip/docs/BETA_RELEASE_EXCEPTION.md), whose strict
-> automated qualification remains NON-RC.
 > The same unified release includes all 14 optional extension crates and the
 > new native `rvoip-vapi` bidirectional raw-audio WebSocket transport.
 
@@ -54,25 +55,29 @@ them.
 
 - **Beta-qualified** — covered by the SIP release gate and its bounded
   interoperability, security, standards, performance, and soak evidence.
-- **Available — developer preview** — implemented and included in `0.3.2`,
-  but API-unstable or outside the SIP beta attestation.
+- **Available — developer preview** — implemented and available in the
+  workspace, but API-unstable or outside the SIP beta attestation.
 - **Planned** — not implemented; listed only in the [roadmap](#roadmap).
 
 ## SIP interoperability
 
 The 0.3.2 full release run passed all 16 selected PBX and interoperability
-gates. The table distinguishes peers that were actually exercised from proxy
-targets that were only audited and deliberately excluded from the release
-claim.
+gates. The table distinguishes peers that were exercised by that release run
+from proxy targets that it audited and deliberately excluded.
 
-| Peer/tool | 0.3.2 status | Executed scope |
+Both proxies have since been exercised in the AMR interop lab. That is lab
+evidence, labelled as such: it does not join the 0.3.2 release claim, and it
+does not meet the four-peer attestation boundary described
+[below](#sip-interoperability-attestation).
+
+| Peer/tool | Status | Executed scope |
 | --- | --- | --- |
-| **Asterisk** | **Interop matrix passed** | `Endpoint`, `StreamPeer`, and `CallbackPeer`; registration, basic call, G.729A/G.729AB, hold/resume, ring-cancel, RFC 4733 DTMF, rejection, and blind transfer over UDP and TLS |
-| **FreeSWITCH** | **Interop matrix passed** | The same API, scenario, codec, and UDP/TLS matrix as Asterisk |
-| **SIPp** | **Standalone matrix passed** | 30, 100, 300, 1,000, and 2,000 CPS; every configured call completed |
-| **baresip** | **Strict-UA check passed** | External user-agent call against the rvoip SIP listener |
-| **Kamailio** | **Not release-tested** | Named proxy/RTPengine investigation track; the 0.3.2 gate records a de-scope audit, not a Kamailio interoperability claim |
-| **OpenSIPS** | **Not release-tested** | Named proxy/RTPengine investigation track; the 0.3.2 gate records a de-scope audit, not an OpenSIPS interoperability claim |
+| **Asterisk** | **0.3.2 interop matrix passed** | `Endpoint`, `StreamPeer`, and `CallbackPeer`; registration, basic call, G.729A/G.729AB, hold/resume, ring-cancel, RFC 4733 DTMF, rejection, and blind transfer over UDP and TLS |
+| **FreeSWITCH** | **0.3.2 interop matrix passed** | The same API, scenario, codec, and UDP/TLS matrix as Asterisk |
+| **SIPp** | **0.3.2 standalone matrix passed** | 30, 100, 300, 1,000, and 2,000 CPS; every configured call completed |
+| **baresip** | **0.3.2 strict-UA check passed** | External user-agent call against the rvoip SIP listener |
+| **Kamailio** | **Lab-tested; not release-gated** | Registrar-proxy with an rtpengine media relay: registration, calls, AMR in all four framings relayed verbatim, DTMF, and SDES-SRTP, over UDP and TLS. No TCP, no second adjacency order, and not bound into the release attestation |
+| **OpenSIPS** | **Lab-tested; not release-gated** | The same lab scope over UDP only — no TLS image yet |
 
 See the [0.3.2 complete gate
 record](crates/sip/rvoip-sip/docs/BETA_GATE_EXCEPTION.md) and
@@ -115,7 +120,7 @@ Add the SIP product:
 
 ```toml
 [dependencies]
-rvoip-sip = "0.3.3"
+rvoip-sip = "0.3.8"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -197,6 +202,7 @@ voice AI, and cross-transport integrations:
 | RTP/RTCP and G.711 | **Beta-qualified** | PCMU/PCMA media delivery, RTCP receiver reports, telephone-event DTMF, hold/resume, and bridging | [`rvoip-media-core`](crates/media/media-core) |
 | SDES-SRTP | **Beta-qualified** | Tested AES-CM/HMAC profiles with negotiated encrypted media | [`07-secure-call-srtp`](examples/07-secure-call-srtp) |
 | G.729A/G.729AB | **Available — developer preview** | Fully integrated optional path: PT 18 SDP/Annex B negotiation, RTP encode/decode, G.711 transcoding, and Asterisk/FreeSWITCH matrix coverage; excluded only from the general SIP full-media performance claim | [0.3.2 gate record](crates/sip/rvoip-sip/docs/BETA_GATE_EXCEPTION.md) |
+| AMR-NB and AMR-WB | **Available — developer preview** | Both variants behind `amr-nb`/`amr-wb`: encoders and decoders bit-exact against the 3GPP reference implementations over the committed fixtures and the normative sequences, RFC 4867 octet-aligned and bandwidth-efficient framing checked against Wireshark's dissector, DTX, CMR and mode negotiation, every mode exercised in a live call, SDES-SRTP, and live calls through Asterisk, FreeSWITCH, Kamailio and OpenSIPS; outside the SIP beta attestation | [AMR status](crates/media/codec-core/docs/AMR_IMPLEMENTATION_STATUS.md) |
 | Opus and G.722 paths | **Available — developer preview** | Feature-gated codec/media support; not part of the bounded SIP beta media claim | [`rvoip-media-core`](crates/media/media-core) |
 | OS audio devices | **Available — developer preview** | Microphone/speaker bridge, drift-free pacing, resampling, jitter buffering, mute-as-silence, and VU metering | [`02-softphone-audio`](examples/02-softphone-audio) |
 | Conference mixing | **Available — developer preview** | Lower-level N-way/N-1 mixing and conference monitoring primitives; not an integrated SIP beta conference product | [Media README](crates/media/media-core/README.md) |
@@ -221,7 +227,7 @@ RTP-over-QUIC has shipped.
 
 ## Extensions
 
-All 14 extension crates ship at `0.3.3`. They are first-class workspace
+All 14 extension crates ship at `0.3.8`. They are first-class workspace
 capabilities, but remain optional so protocol crates depend on provider
 contracts rather than deployment-specific services.
 
@@ -243,22 +249,22 @@ The supporting contracts live in
 The facade exposes the conversation-model extensions together:
 
 ```toml
-rvoip = { version = "0.3.3", features = ["voip-3"] }
+rvoip = { version = "0.3.8", features = ["voip-3"] }
 ```
 
 `voip-3` enables SIP, WebRTC, UCTP, vCon, the identity provider surface, and
 the AI harness. Vapi and STIR/SHAKEN have separate facade features:
 
 ```toml
-rvoip = { version = "0.3.3", features = ["sip", "vapi", "sip-stir-shaken"] }
+rvoip = { version = "0.3.8", features = ["sip", "vapi", "sip-stir-shaken"] }
 ```
 
 Deployment-specific extensions are direct dependencies:
 
 ```toml
-rvoip-keycloak = "0.3.3"
-rvoip-redis = "0.3.3"
-rvoip-audit = "0.3.3"
+rvoip-keycloak = "0.3.8"
+rvoip-redis = "0.3.8"
+rvoip-audit = "0.3.8"
 ```
 
 The facade's `full` feature does **not** enable every workspace extension,
@@ -340,6 +346,35 @@ product's implementation:
 - [Next release notes](crates/sip/rvoip-sip/docs/RELEASE_NOTES_NEXT.md) —
   unified release identity, source compatibility notes, and attestation
   provenance.
+
+The `0.3.8` release requires a fresh strict full-beta report bound to one clean,
+unchanged release source fingerprint. The gate admits no skipped checks and
+includes the workspace, SIP/media, public API, security, PBX, SIPp, strict-UA,
+proxy interoperability, performance, resiliency, and long-soak scopes. The
+historical `0.3.4` carry-forward receipt remains immutable release history; it
+does not qualify `0.3.8`.
+
+### SIP interoperability attestation
+
+The strict full-beta gate requires an explicit PASS attestation for all four
+independently managed peers below. The report generator binds every row to the
+tested source tree, exact peer identity and configuration, selected matrix,
+and hashed evidence; it refuses to produce a strict release-candidate report
+if a required peer is missing, skipped, ambiguous, unpinned, or failing. This
+four-peer matrix is mandatory for the `0.3.8` strict release gate.
+
+| Peer | Attested boundary | Required release evidence |
+| --- | --- | --- |
+| **Asterisk** | PBX/B2BUA call control and RTP media | Provider-specific all-PASS rows from the recorded API, scenario, codec, and security matrix, plus the exact local revision and configuration fingerprint |
+| **FreeSWITCH** | PBX/B2BUA call control and RTP media | Provider-specific all-PASS rows from the recorded API, scenario, codec, and security matrix, plus the exact local revision and configuration fingerprint |
+| **Kamailio** | RFC 3261 transaction-stateful proxy interoperability | Digest-pinned peer, both hop orders, UDP/TCP/TLS, packet assertions, verified TLS evidence, and post-retention cleanup |
+| **OpenSIPS** | RFC 3261 transaction-stateful proxy interoperability | Digest-pinned peer, both hop orders, UDP/TCP/TLS, packet assertions, verified TLS evidence, and post-retention cleanup |
+
+The generated [beta release report](crates/sip/rvoip-sip/docs/BETA_RELEASE_REPORT.md)
+is the authority for the exact versions, row counts, scenarios, hashes, and
+PASS status of a particular candidate. This is bounded interoperability
+evidence, not a claim of compatibility with every version, module,
+configuration, transport, codec, or SIP extension.
 
 Developer-preview products document their own supported scope and gaps in
 their crate READMEs. A published crate or Cargo feature is evidence of

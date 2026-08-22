@@ -24,17 +24,83 @@
 #![allow(dead_code)]
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "linux"))]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::task::JoinHandle;
 
-#[derive(Debug, Clone, Serialize)]
+#[cfg(target_os = "linux")]
+fn linux_proc_constants() -> Option<(u64, u64)> {
+    const AT_PAGESZ: usize = 6;
+    const AT_CLKTCK: usize = 17;
+    let bytes = std::fs::read("/proc/self/auxv").ok()?;
+    let word = std::mem::size_of::<usize>();
+    let mut page_size = None;
+    let mut clock_ticks = None;
+    for pair in bytes.chunks_exact(word * 2) {
+        let (key, value) = pair.split_at(word);
+        let key = usize::from_ne_bytes(key.try_into().ok()?);
+        let value = usize::from_ne_bytes(value.try_into().ok()?);
+        match key {
+            AT_PAGESZ => page_size = Some(value as u64),
+            AT_CLKTCK => clock_ticks = Some(value as u64),
+            0 => break,
+            _ => {}
+        }
+    }
+    Some((page_size?, clock_ticks?))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_sample(
+    started: Instant,
+    page_size: u64,
+    clock_ticks: u64,
+    previous_cpu: &mut Option<(u64, f64)>,
+) -> Option<ResourceSample> {
+    // Reading procfs avoids sysinfo's process-table refresh allocations from
+    // becoming part of the in-process RSS curve being measured.
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_whitespace();
+    // fields starts at proc(5) field 3 (`state`); utime/stime are 14/15.
+    let total_ticks = fields.nth(11)?.parse::<u64>().ok()? + fields.next()?.parse::<u64>().ok()?;
+    let t_secs = started.elapsed().as_secs_f64();
+    let cpu_pct = if clock_ticks > 0 {
+        previous_cpu
+            .map(|(prior_ticks, prior_secs)| {
+                let elapsed = t_secs - prior_secs;
+                if elapsed > 0.0 {
+                    ((total_ticks.saturating_sub(prior_ticks) as f64
+                        / clock_ticks as f64
+                        / elapsed)
+                        * 100.0) as f32
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    *previous_cpu = Some((total_ticks, t_secs));
+    Some(ResourceSample {
+        t_secs,
+        rss_mb: resident_pages as f64 * page_size as f64 / (1024.0 * 1024.0),
+        cpu_pct,
+    })
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResourceSample {
     /// Seconds since the sampler started.
     pub t_secs: f64,
@@ -193,23 +259,43 @@ impl ResourceSampler {
     }
 
     /// Start sampling and append each sample to `path` as JSONL while the
-    /// test is running. The in-memory series remains available for summary
-    /// math, but callers can clear it before writing the final report.
+    /// test is running. File-backed samplers deliberately do not grow an
+    /// in-memory vector during the measured interval: `Vec` capacity changes
+    /// can fault allocator pages and manufacture an RSS slope. The complete
+    /// series is loaded only after sampling stops and remains available in the
+    /// returned summary.
     pub fn start_with_output(interval: Duration, path: PathBuf) -> Self {
         Self::start_inner(interval, Some(path))
     }
 
     fn start_inner(interval: Duration, samples_path: Option<PathBuf>) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "resource sample interval must be non-zero"
+        );
         let samples: Arc<Mutex<Vec<ResourceSample>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let samples_task = Arc::clone(&samples);
         let stop_task = Arc::clone(&stop);
         let started = Instant::now();
+        #[cfg(not(target_os = "linux"))]
         let pid = Pid::from_u32(std::process::id());
         let task_samples_path = samples_path.clone();
 
-        let task = tokio::spawn(async move {
+        // Keep procfs reads and JSONL writes on one dedicated OS thread. A
+        // movable async task can resume on a different Tokio worker after
+        // every tick; under mimalloc that touches another thread-local heap
+        // and can make the observer itself look like sustained process RSS
+        // growth. `spawn_blocking` gives this long-lived sampler one stable
+        // worker while retaining the existing async join handle.
+        let task = tokio::task::spawn_blocking(move || {
+            #[cfg(not(target_os = "linux"))]
             let mut sys = System::new();
+            #[cfg(target_os = "linux")]
+            let mut previous_cpu = None;
+            #[cfg(target_os = "linux")]
+            let (page_size, clock_ticks) =
+                linux_proc_constants().expect("read Linux procfs sampling constants");
             let mut writer = task_samples_path.map(|path| {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).expect("create resource sample dir");
@@ -217,28 +303,25 @@ impl ResourceSampler {
                 BufWriter::new(File::create(path).expect("create resource sample JSONL"))
             });
             loop {
-                // Refresh CPU + memory for our PID. sysinfo's cpu_usage
-                // is "delta since last refresh of this process", so the
-                // first reading after `new()` is essentially 0; we
-                // still record it (it gets averaged out by subsequent
-                // samples).
-                sys.refresh_processes_specifics(
-                    ProcessesToUpdate::Some(&[pid]),
-                    ProcessRefreshKind::new().with_memory().with_cpu(),
-                );
-                if let Some(proc_) = sys.process(pid) {
-                    let rss_mb = proc_.memory() as f64 / (1024.0 * 1024.0);
-                    let cpu_pct = proc_.cpu_usage();
-                    let t_secs = started.elapsed().as_secs_f64();
-                    let sample = ResourceSample {
-                        t_secs,
-                        rss_mb,
-                        cpu_pct,
-                    };
-                    samples_task
-                        .lock()
-                        .expect("sampler lock")
-                        .push(sample.clone());
+                // Refresh CPU + memory for our PID. Both backends report the
+                // first CPU reading as 0 because there is no preceding sample;
+                // it is retained and excluded from the final CPU average.
+                #[cfg(target_os = "linux")]
+                let sample =
+                    linux_process_sample(started, page_size, clock_ticks, &mut previous_cpu);
+                #[cfg(not(target_os = "linux"))]
+                let sample = {
+                    sys.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&[pid]),
+                        ProcessRefreshKind::new().with_memory().with_cpu(),
+                    );
+                    sys.process(pid).map(|proc_| ResourceSample {
+                        t_secs: started.elapsed().as_secs_f64(),
+                        rss_mb: proc_.memory() as f64 / (1024.0 * 1024.0),
+                        cpu_pct: proc_.cpu_usage(),
+                    })
+                };
+                if let Some(sample) = sample {
                     if let Some(writer) = writer.as_mut() {
                         serde_json::to_writer(&mut *writer, &sample)
                             .expect("write resource sample JSONL");
@@ -246,12 +329,14 @@ impl ResourceSampler {
                             .write_all(b"\n")
                             .expect("write resource sample newline");
                         writer.flush().expect("flush resource sample JSONL");
+                    } else {
+                        samples_task.lock().expect("sampler lock").push(sample);
                     }
                 }
                 if stop_task.load(Ordering::Relaxed) {
                     break;
                 }
-                tokio::time::sleep(interval).await;
+                std::thread::sleep(interval);
             }
         });
 
@@ -290,7 +375,10 @@ impl ResourceSampler {
         if let Some(t) = self.task.take() {
             let _ = t.await;
         }
-        let samples = std::mem::take(&mut *self.samples.lock().expect("sampler lock"));
+        let samples = self.samples_path.as_ref().map_or_else(
+            || std::mem::take(&mut *self.samples.lock().expect("sampler lock")),
+            |path| load_resource_samples(path),
+        );
         let sample_count = samples.len();
 
         let baseline_rss_mb = samples.first().map(|s| s.rss_mb).unwrap_or(0.0);
@@ -340,6 +428,31 @@ impl ResourceSampler {
             samples,
         }
     }
+}
+
+fn load_resource_samples(path: &Path) -> Vec<ResourceSample> {
+    let file = File::open(path)
+        .unwrap_or_else(|error| panic!("open resource sample JSONL {}: {error}", path.display()));
+    BufReader::new(file)
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let line = line.unwrap_or_else(|error| {
+                panic!(
+                    "read resource sample JSONL {} line {}: {error}",
+                    path.display(),
+                    index + 1
+                )
+            });
+            serde_json::from_str(&line).unwrap_or_else(|error| {
+                panic!(
+                    "parse resource sample JSONL {} line {}: {error}",
+                    path.display(),
+                    index + 1
+                )
+            })
+        })
+        .collect()
 }
 
 fn summarize_window(
@@ -485,7 +598,7 @@ fn robust_endpoint_summary(samples: &[ResourceSample]) -> Option<RobustEndpointS
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     let midpoint = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[midpoint - 1] + values[midpoint]) / 2.0
     } else {
         values[midpoint]
@@ -566,6 +679,73 @@ fn linear_slope_mb_per_sec(samples: &[ResourceSample]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn file_backed_sampler_does_not_grow_history_during_measurement() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rvoip-resource-samples-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let sampler = ResourceSampler::start_with_output(Duration::from_millis(1), path.clone());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            sampler.samples.lock().expect("sampler lock").is_empty(),
+            "file-backed sampling must not reallocate an in-memory history"
+        );
+
+        let summary = sampler.stop().await;
+        assert!(summary.sample_count >= 1);
+        assert_eq!(summary.samples.len(), summary.sample_count);
+        assert_eq!(summary.samples_path.as_deref(), Some(path.as_path()));
+        std::fs::remove_file(path).expect("remove resource sample test output");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sampler_progress_is_independent_of_the_application_runtime() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rvoip-dedicated-resource-samples-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let sampler = ResourceSampler::start_with_output(Duration::from_millis(10), path.clone());
+
+        // Deliberately occupy the only Tokio worker. The resource sampler must
+        // continue collecting on its dedicated blocking worker.
+        std::thread::sleep(Duration::from_millis(80));
+
+        let summary = sampler.stop().await;
+        assert!(
+            summary.sample_count >= 3,
+            "dedicated sampler stalled with the application runtime: {} samples",
+            summary.sample_count
+        );
+        std::fs::remove_file(path).expect("remove dedicated sampler test output");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_sampler_reads_current_process_without_process_table_refresh() {
+        let started = Instant::now();
+        let mut previous_cpu = None;
+        let (page_size, clock_ticks) = linux_proc_constants().expect("procfs constants");
+        let first = linux_process_sample(started, page_size, clock_ticks, &mut previous_cpu)
+            .expect("first procfs sample");
+        std::thread::sleep(Duration::from_millis(2));
+        let second = linux_process_sample(started, page_size, clock_ticks, &mut previous_cpu)
+            .expect("second procfs sample");
+
+        assert!(first.rss_mb > 0.0);
+        assert!(second.rss_mb > 0.0);
+        assert!(second.t_secs >= first.t_secs);
+        assert!(second.cpu_pct.is_finite());
+    }
 
     fn sample(t_secs: f64, rss_mb: f64) -> ResourceSample {
         ResourceSample {

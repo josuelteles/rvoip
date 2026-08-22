@@ -25,7 +25,8 @@ use crate::transaction::client::builders::ByeBuilder;
 use crate::transaction::dialog::{request_builder_from_dialog_template, DialogRequestTemplate};
 use crate::transaction::{TransactionEvent, TransactionKey, TransactionState};
 use rvoip_infra_common::events::cross_crate::OutboundRequestOutcome;
-use rvoip_sip_core::{HeaderName, Host, Method, Request, Response, TypedHeader};
+use rvoip_sip_core::types::uri::Scheme;
+use rvoip_sip_core::{HeaderName, Host, Method, Request, Response, TypedHeader, Uri};
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -34,6 +35,47 @@ use tracing::{debug, error, info, warn};
 
 fn safe_operation_failure(operation: &'static str, error_class: &'static str) -> String {
     format!("operation={operation}; error_class={error_class}")
+}
+
+fn safe_uri_scheme_class(uri: &Uri) -> &'static str {
+    match uri.scheme() {
+        Scheme::Sip => "sip",
+        Scheme::Sips => "sips",
+        Scheme::Tel => "tel",
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+        Scheme::Custom(_) => "custom",
+    }
+}
+
+fn safe_uri_transport_class(uri: &Uri) -> &'static str {
+    match uri.transport() {
+        Some(value) if value.eq_ignore_ascii_case("udp") => "udp",
+        Some(value) if value.eq_ignore_ascii_case("tcp") => "tcp",
+        Some(value) if value.eq_ignore_ascii_case("tls") => "tls",
+        Some(value) if value.eq_ignore_ascii_case("ws") => "ws",
+        Some(value) if value.eq_ignore_ascii_case("wss") => "wss",
+        Some(_) => "other",
+        None => "unspecified",
+    }
+}
+
+#[cfg(test)]
+mod safe_uri_diagnostic_tests {
+    use super::{safe_uri_scheme_class, safe_uri_transport_class};
+
+    #[test]
+    fn distinguishes_sips_from_sip_over_tls_without_exposing_the_uri() {
+        let sip_tls: rvoip_sip_core::Uri = "sip:private-user@private.example;transport=tls"
+            .parse()
+            .unwrap();
+        let sips: rvoip_sip_core::Uri = "sips:private-user@private.example".parse().unwrap();
+
+        assert_eq!(safe_uri_scheme_class(&sip_tls), "sip");
+        assert_eq!(safe_uri_transport_class(&sip_tls), "tls");
+        assert_eq!(safe_uri_scheme_class(&sips), "sips");
+        assert_eq!(safe_uri_transport_class(&sips), "unspecified");
+    }
 }
 
 fn safe_method_operation_failure(
@@ -2530,7 +2572,23 @@ impl DialogManager {
                         "Outbound request contains an unusable Route header",
                     )
                 })?;
-            let candidates = self.resolve_uri_to_candidates(&next_hop).await;
+            let mut candidates = self.resolve_uri_to_candidates(&next_hop).await;
+
+            // When an inbound peer supplied an unspecified Contact, dialog
+            // setup retained the exact validated packet source. Use that
+            // source only for a direct dialog (never across a Route set), and
+            // preserve the Contact-derived URI on the wire as Request-URI.
+            // Reusing the resolved candidate's transport also preserves UDP,
+            // TCP, or TLS selection without inventing transport state here.
+            if template.route_set.is_empty() {
+                if let (Some(observed_source), Some(candidate)) =
+                    (dialog.last_known_remote_addr, candidates.first_mut())
+                {
+                    candidate.addr = observed_source;
+                    candidate.expires = None;
+                    candidates.truncate(1);
+                }
+            }
 
             if candidates.is_empty() {
                 return Err(crate::errors::DialogError::routing_error(
@@ -6460,9 +6518,21 @@ impl DialogManager {
                 Ok(()) // Most timer events don't require dialog-level action
             }
 
-            TransactionEvent::AckReceived { request, .. } => {
+            TransactionEvent::AckRequest { request, .. } => {
                 self.handle_ack_received_event(dialog_id, transaction_id, request)
                     .await
+            }
+
+            TransactionEvent::AckReceived { .. } => {
+                // Non-2xx ACK is transaction-owned and only confirms receipt
+                // of a failed final response. It must not start UAS media or
+                // emit the session-layer 2xx ACK notification.
+                debug!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                    %dialog_id,
+                    "Observed transaction-owned non-2xx ACK"
+                );
+                Ok(())
             }
 
             TransactionEvent::CancelReceived { .. } => {
@@ -6566,9 +6636,14 @@ impl DialogManager {
                         .and_then(|contact| extract_uri_from_contact(contact).ok())
                     {
                         Some(remote_target) => {
+                            let contact_scheme = safe_uri_scheme_class(&remote_target);
+                            let contact_transport = safe_uri_transport_class(&remote_target);
                             if !dialog.update_remote_target(remote_target) {
                                 warn!(
                                     dialog=%dialog_id,
+                                    contact_scheme,
+                                    contact_transport,
+                                    required_scheme = "sips",
                                     "Rejected insecure Contact target refresh for secure dialog"
                                 );
                             }
@@ -6592,6 +6667,22 @@ impl DialogManager {
                 match dialog.state {
                     crate::dialog::DialogState::Initial | crate::dialog::DialogState::Early => {
                         dialog.state = crate::dialog::DialogState::Confirmed;
+
+                        // RFC 3261 §12.1.2: the UAC route set comes from the
+                        // dialog-forming 2xx's Record-Route, reversed, URI
+                        // parameters preserved. Overlays any RFC 3608
+                        // Service-Route preload; a 2xx without Record-Route
+                        // keeps that preload. Deliberately NOT re-learned on
+                        // re-INVITE 2xxs (§12.2 fixes the set for the
+                        // dialog's lifetime — see the Confirmed arm below).
+                        // Without this, BYE and every other in-dialog request
+                        // bypasses record-routing proxies and goes straight
+                        // to the peer Contact.
+                        let learned =
+                            crate::dialog::dialog_impl::route_set_from_response_for_uac(&response);
+                        if !learned.is_empty() {
+                            dialog.route_set = learned;
+                        }
 
                         // CRITICAL FIX: Update dialog lookup now that we have both tags
                         if let Some(tuple) = dialog.dialog_id_tuple() {
@@ -6654,8 +6745,17 @@ impl DialogManager {
             .await;
         }
 
-        // Handle specific successful response types
         let session_id_for_diag = self.get_session_id(dialog_id);
+        // SDP-bearing INVITE 2xx responses owned by session-core are ACKed
+        // only after that layer validates and applies the exact answer (or
+        // creates the delayed-offer ACK answer). Bodyless refresh responses
+        // and standalone dialog users retain automatic ACK behavior.
+        let deferred_session_ack = session_id_for_diag.is_some()
+            && transaction_id.method() == &rvoip_sip_core::Method::Invite
+            && response.status().is_success()
+            && !response.body().is_empty();
+
+        // Handle specific successful response types
         match response.status_code() {
             status if (200..300).contains(&status) => {
                 // Every 2xx to INVITE is ACKed by the UAC core (RFC 3261
@@ -6665,41 +6765,42 @@ impl DialogManager {
                     if let Some(session_id) = session_id_for_diag.as_deref() {
                         crate::diagnostics::record_call_timing_uac_invite_2xx_response(session_id);
                     }
-                    info!(
-                        status,
-                        dialog=%dialog_id,
-                        "Received successful INVITE response; sending automatic ACK"
-                    );
+                    info!(status, dialog=%dialog_id, deferred_session_ack, "Received successful INVITE response");
 
-                    // Send ACK using transaction-core's send_ack_for_2xx method
-                    crate::diagnostics::record_uac_invite_2xx_ack_attempt();
-                    if let Some(session_id) = session_id_for_diag.as_deref() {
-                        crate::diagnostics::record_call_timing_uac_ack_attempt(session_id);
-                    }
-                    match self
-                        .transaction_manager
-                        .send_ack_for_2xx(transaction_id, &response)
-                        .await
-                    {
-                        Ok(_) => {
-                            crate::diagnostics::record_uac_invite_2xx_ack_success();
-                            if let Some(session_id) = session_id_for_diag.as_deref() {
-                                crate::diagnostics::record_call_timing_uac_ack_success(session_id);
-                            }
-                            info!(status, "Successfully sent automatic ACK for INVITE 2xx");
+                    if !deferred_session_ack {
+                        crate::diagnostics::record_uac_invite_2xx_ack_attempt();
+                        if let Some(session_id) = session_id_for_diag.as_deref() {
+                            crate::diagnostics::record_call_timing_uac_ack_attempt(session_id);
                         }
-                        Err(e) => {
-                            crate::diagnostics::record_uac_invite_2xx_ack_failure();
-                            if let Some(session_id) = session_id_for_diag.as_deref() {
-                                crate::diagnostics::record_call_timing_uac_ack_failure(session_id);
+                        match self
+                            .transaction_manager
+                            .send_ack_for_2xx(transaction_id, &response)
+                            .await
+                        {
+                            Ok(_) => {
+                                crate::diagnostics::record_uac_invite_2xx_ack_success();
+                                if let Some(session_id) = session_id_for_diag.as_deref() {
+                                    crate::diagnostics::record_call_timing_uac_ack_success(
+                                        session_id,
+                                    );
+                                }
+                                info!(status, "Successfully sent automatic ACK for INVITE 2xx");
                             }
-                            warn!(error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&e), status, "Failed to send automatic ACK for INVITE 2xx");
-                            return Err(crate::errors::DialogError::TransactionError {
-                                message: safe_operation_failure(
-                                    "automatic_invite_2xx_ack",
-                                    "transaction_error",
-                                ),
-                            });
+                            Err(e) => {
+                                crate::diagnostics::record_uac_invite_2xx_ack_failure();
+                                if let Some(session_id) = session_id_for_diag.as_deref() {
+                                    crate::diagnostics::record_call_timing_uac_ack_failure(
+                                        session_id,
+                                    );
+                                }
+                                warn!(error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&e), status, "Failed to send automatic ACK for INVITE 2xx");
+                                return Err(crate::errors::DialogError::TransactionError {
+                                    message: safe_operation_failure(
+                                        "automatic_invite_2xx_ack",
+                                        "transaction_error",
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -6734,6 +6835,15 @@ impl DialogManager {
                 request_uri: None,
             })
             .await?;
+        }
+
+        if deferred_session_ack {
+            crate::diagnostics::record_uac_invite_2xx_ack_attempt();
+            crate::diagnostics::record_uac_invite_2xx_ack_success();
+            if let Some(session_id) = session_id_for_diag.as_deref() {
+                crate::diagnostics::record_call_timing_uac_ack_attempt(session_id);
+                crate::diagnostics::record_call_timing_uac_ack_success(session_id);
+            }
         }
 
         // Commit immediately after the mandatory ACK write and acknowledged
@@ -7463,9 +7573,9 @@ impl DialogManager {
                         return Ok(cancel_transaction);
                     }
                     Ok(Err(
-                        crate::transaction::manager::CancelInviteTransactionFailure::ZeroWire(
-                            _error,
-                        ),
+                        crate::transaction::manager::CancelInviteTransactionFailure::ZeroWire {
+                            ..
+                        },
                     )) => {
                         plan.cancel_dispatch_state = InviteCancelDispatchState::Idle;
                         plan.cancel_transaction = None;

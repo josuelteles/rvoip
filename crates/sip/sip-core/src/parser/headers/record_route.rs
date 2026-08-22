@@ -6,7 +6,6 @@
 use nom::{combinator::map, sequence::pair};
 
 // Import from base parser modules
-// For reference
 use crate::parser::address::name_addr;
 use crate::parser::common::comma_separated_list1;
 use crate::parser::common_params::{generic_param, semicolon_separated_params0};
@@ -180,6 +179,29 @@ mod tests {
             Param::Other(name, _) if name == "ftag"
         ));
         assert_eq!(record_route.to_string(), raw);
+    }
+
+    #[test]
+    fn test_record_route_uri_and_header_params_round_trip_separately() {
+        use std::str::FromStr;
+
+        let input = "<sip:proxy.example.com:5060;transport=udp;lr>;x-edge=primary";
+        let record_route = RecordRouteHeader::from_str(input).unwrap();
+        let record_route_entry = &record_route.0[0];
+        let entry = &record_route_entry.0;
+
+        assert!(entry
+            .uri
+            .parameters
+            .contains(&Param::Transport("udp".to_string())));
+        assert!(entry.uri.parameters.contains(&Param::Lr));
+        assert!(record_route_entry.is_loose_routing());
+        assert!(record_route_entry.has_param("x-edge"));
+        assert_eq!(
+            entry.params,
+            vec![Param::Other("x-edge".to_string(), Some("primary".into()))]
+        );
+        assert_eq!(record_route.to_string(), input);
     }
 
     #[test]

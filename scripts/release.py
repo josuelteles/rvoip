@@ -16,20 +16,30 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from typing import Any
 import urllib.error
 import urllib.request
 
 
 EXPECTED_PACKAGE_COUNT = 44
+RELEASE_LOCK_MANIFESTS = (Path("Cargo.toml"), Path("examples/Cargo.toml"))
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 USER_AGENT = "rvoip-unified-release/1.0"
 DEFAULT_POLL_SECONDS = 15
 DEFAULT_TIMEOUT_SECONDS = 900
+ACTIVE_RELEASE_METADATA_FILES = (
+    Path("README.md"),
+    Path("crates/sip/rvoip-sip/docs/BETA_RELEASE_CHECKLIST.md"),
+    Path("crates/sip/rvoip-sip/docs/RELEASE_NOTES_NEXT.md"),
+)
 VERIFICATION_RECEIPT_SCHEMA = "rvoip-unified-release-verification-v4"
+REMOTE_QUALIFICATION_SCHEMA = "rvoip-release-qualification-v1"
+REMOTE_GATE_CATALOG_SCHEMA = "rvoip-release-gate-catalog-v1"
 TARGETED_DELTA_ATTESTATION_SCHEMA = "rvoip-targeted-delta-attestation-v1"
 TARGETED_POSTGRES_EVIDENCE_SCHEMA = "rvoip-vcon-postgres-live-evidence-v1"
+CARRY_FORWARD_ATTESTATION_SCHEMA = "rvoip-release-carry-forward-attestation-v1"
 VCON_SCHEMA_COMMIT = "2342aba64bdb71d9e80ab6e274a3921e2b1c769e"
 TARGETED_DELTA_VERSION = "0.3.3"
 TARGETED_DELTA_BASE_TAG = "v0.3.2"
@@ -205,17 +215,42 @@ def ensure_clean(root: Path) -> None:
         raise ReleaseError(f"working tree must be clean:\n{status}")
 
 
-def ensure_release_state(root: Path, version: str, *, require_no_tag: bool) -> str:
+def ensure_release_state(
+    root: Path,
+    version: str,
+    *,
+    require_no_tag: bool,
+    qualified_head: str | None = None,
+) -> str:
     ensure_clean(root)
     branch = git_output(root, "branch", "--show-current")
     if branch != "main":
         raise ReleaseError(f"release commands require branch main, found {branch!r}")
     head = git_output(root, "rev-parse", "HEAD")
+    if qualified_head is not None:
+        if not COMMIT_SHA.fullmatch(qualified_head):
+            raise ReleaseError("qualified release HEAD must be a full commit SHA")
+        if qualified_head != head:
+            raise ReleaseError("qualified release HEAD does not match the checkout")
     remote = run(
         ["git", "ls-remote", "origin", "refs/heads/main"], cwd=root
     ).stdout.split()
-    if not remote or remote[0] != head:
+    if not remote:
+        raise ReleaseError("current origin/main could not be resolved")
+    remote_head = remote[0]
+    if remote_head != head and qualified_head != head:
         raise ReleaseError("HEAD must exactly match the current origin/main")
+    if remote_head != head:
+        run(["git", "fetch", "--no-tags", "origin", remote_head], cwd=root)
+        ancestor = run(
+            ["git", "merge-base", "--is-ancestor", head, remote_head],
+            cwd=root,
+            check=False,
+        )
+        if ancestor.returncode:
+            raise ReleaseError(
+                "qualified release HEAD must be an ancestor of current origin/main"
+            )
     tag = f"v{version}"
     if require_no_tag:
         local_tag = run(
@@ -237,6 +272,44 @@ def cargo_metadata(root: Path, *, locked: bool) -> dict[str, Any]:
     if locked:
         argv.append("--locked")
     return json.loads(run(argv, cwd=root).stdout)
+
+
+def release_lock_paths(root: Path) -> tuple[Path, ...]:
+    return tuple(root / manifest.parent / "Cargo.lock" for manifest in RELEASE_LOCK_MANIFESTS)
+
+
+def refresh_release_lockfiles(root: Path) -> None:
+    for manifest in RELEASE_LOCK_MANIFESTS:
+        manifest_path = root / manifest
+        if not manifest_path.is_file():
+            raise ReleaseError(f"release lock manifest is missing: {manifest}")
+        run(
+            [
+                "cargo",
+                "metadata",
+                "--manifest-path",
+                str(manifest),
+                "--format-version",
+                "1",
+            ],
+            cwd=root,
+        )
+
+
+def validate_release_lockfiles(root: Path) -> None:
+    for manifest in RELEASE_LOCK_MANIFESTS:
+        run(
+            [
+                "cargo",
+                "metadata",
+                "--manifest-path",
+                str(manifest),
+                "--format-version",
+                "1",
+                "--locked",
+            ],
+            cwd=root,
+        )
 
 
 def publishable_packages(metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -333,12 +406,15 @@ def update_workspace_dependency_versions(
         if not active or "=" not in line:
             continue
         name = line.split("=", 1)[0].strip()
-        if name not in package_names:
+        package_match = re.search(r'\bpackage\s*=\s*"([^"]+)"', line)
+        package_name = package_match.group(1) if package_match else name
+        if package_name not in package_names:
             continue
         pattern = re.compile(r'(version\s*=\s*")[^"]+(")')
         if not pattern.search(line):
             raise ReleaseError(
-                f"internal workspace dependency {name} lacks a registry version"
+                "internal workspace dependency "
+                f"{name}->{package_name} lacks a registry version"
             )
         lines[index] = pattern.sub(rf"\g<1>{version}\g<2>", line, count=1)
         seen.add(name)
@@ -456,6 +532,25 @@ def planned_version_edits(
             updated, internal_dependency_names, version
         )
         changes[manifest] = updated.encode()
+    return changes
+
+
+def planned_release_metadata_edits(
+    root: Path, current_version: str, version: str
+) -> dict[Path, bytes]:
+    """Update current-version references in the active release documents."""
+    changes: dict[Path, bytes] = {}
+    for relative_path in ACTIVE_RELEASE_METADATA_FILES:
+        path = root / relative_path
+        text = path.read_text(encoding="utf-8")
+        count = text.count(current_version)
+        if count == 0:
+            raise ReleaseError(
+                f"active release metadata in {relative_path} does not reference "
+                f"workspace version {current_version}"
+            )
+        updated = text.replace(current_version, version)
+        changes[path] = updated.encode()
     return changes
 
 
@@ -602,16 +697,22 @@ def prepare(root: Path, version: str) -> None:
         raise ReleaseError(
             f"cannot prepare an already-published version for: {existing}"
         )
+    root_manifest = root / "Cargo.toml"
+    current_version = tomllib.loads(root_manifest.read_text(encoding="utf-8"))[
+        "workspace"
+    ]["package"]["version"]
     edits = planned_version_edits(root, packages, version)
-    lock_path = root / "Cargo.lock"
+    edits.update(planned_release_metadata_edits(root, current_version, version))
+    lock_paths = release_lock_paths(root)
     originals = {
         path: path.read_bytes() if path.exists() else None
-        for path in [*edits, lock_path]
+        for path in [*edits, *lock_paths]
     }
     try:
         for path, payload in edits.items():
             write_atomic(path, payload)
-        run(["cargo", "metadata", "--format-version", "1"], cwd=root)
+        refresh_release_lockfiles(root)
+        validate_release_lockfiles(root)
         validate_workspace(root, version, locked=True)
         run(
             ["cargo", "check", "--workspace", "--all-targets", "--locked"],
@@ -626,7 +727,7 @@ def prepare(root: Path, version: str) -> None:
                 write_atomic(path, payload)
         raise
     print(f"prepared all {len(packages)} workspace packages at {version}")
-    print("review and commit the manifest and Cargo.lock changes before verification")
+    print("review and commit the manifest and lockfile changes before verification")
 
 
 class ReleaseLog:
@@ -1018,12 +1119,55 @@ def verify_beta_reporting(
     version: str,
     beta_report_root: str | None,
     beta_exception_attestation: str | None,
+    beta_carry_forward_attestation: str | None,
     log: ReleaseLog,
 ) -> dict[str, Any]:
-    if beta_report_root and beta_exception_attestation:
-        raise ReleaseError(
-            "--beta-report-root and --beta-exception-attestation are mutually exclusive"
+    supplied = [
+        value
+        for value in (
+            beta_report_root,
+            beta_exception_attestation,
+            beta_carry_forward_attestation,
         )
+        if value
+    ]
+    if len(supplied) > 1:
+        raise ReleaseError(
+            "strict, exception, and carry-forward beta inputs are mutually exclusive"
+        )
+    if beta_carry_forward_attestation:
+        attestation = Path(beta_carry_forward_attestation)
+        if not attestation.is_absolute():
+            attestation = root / attestation
+        verifier = root / "scripts/release_carry_forward_attestation.py"
+        command = [
+            sys.executable,
+            str(verifier),
+            "verify",
+            "--attestation",
+            str(attestation),
+            "--version",
+            version,
+        ]
+        log.command(command, root)
+        payload = load_json_object(attestation, "carry-forward attestation")
+        release = payload.get("release")
+        inherited = payload.get("inherited_beta_background")
+        current = payload.get("current_evidence")
+        if not isinstance(release, dict) or not isinstance(inherited, dict):
+            raise ReleaseError("carry-forward attestation lacks release metadata")
+        if not isinstance(current, dict):
+            raise ReleaseError("carry-forward attestation lacks current evidence")
+        return {
+            "mode": "owner-approved-carry-forward",
+            "disposition": release.get("disposition"),
+            "strict_automated_status": release.get("beta_suite"),
+            "current_workspace_verification": "PASS",
+            "inherited_beta_background": inherited,
+            "current_canonical_2k": current.get("canonical_2k"),
+            "attestation_path": relative_or_absolute(root, attestation),
+            "attestation_sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        }
     if beta_exception_attestation:
         attestation = Path(beta_exception_attestation)
         if not attestation.is_absolute():
@@ -1158,19 +1302,114 @@ def write_verification_receipt(
     log.event("verification-receipt", path=destination.relative_to(root).as_posix())
 
 
+def canonical_json_sha256(value: Any) -> str:
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def verify_remote_qualification(
+    root: Path,
+    version: str,
+    head: str,
+    qualification_path: str,
+    log: ReleaseLog,
+) -> dict[str, Any]:
+    path = Path(qualification_path)
+    if not path.is_absolute():
+        path = root / path
+    if not path.is_file():
+        raise ReleaseError(f"missing remote qualification aggregate: {path}")
+    aggregate = load_json_object(path, "remote qualification aggregate")
+    catalog_path = root / "scripts/release/gates.json"
+    catalog = load_json_object(catalog_path, "release gate catalog")
+    if catalog.get("schema") != REMOTE_GATE_CATALOG_SCHEMA:
+        raise ReleaseError("release gate catalog has an unsupported schema")
+    expected_gates = catalog.get("profiles", {}).get("remote-release")
+    coverage = catalog.get("remote_release_legacy_coverage", {})
+    accepted = aggregate.get("accepted_gates")
+    accepted_ids = (
+        [item.get("gate_id") for item in accepted]
+        if isinstance(accepted, list)
+        and all(isinstance(item, dict) for item in accepted)
+        else []
+    )
+    expected_catalog_hash = canonical_json_sha256(catalog)
+    valid = (
+        aggregate.get("schema") == REMOTE_QUALIFICATION_SCHEMA
+        and aggregate.get("status") == "PASS"
+        and aggregate.get("failures") == []
+        and aggregate.get("candidate_sha") == head
+        and aggregate.get("profile") == "remote-release"
+        and aggregate.get("catalog_sha256") == expected_catalog_hash
+        and isinstance(expected_gates, list)
+        and len(expected_gates) > 44
+        and coverage.get("required_legacy_count") == 108
+        and coverage.get("profile_legacy_count") == 108
+        and coverage.get("unautomated_legacy_ids") == []
+        and aggregate.get("gate_count") == len(expected_gates)
+        and len(accepted_ids) == len(expected_gates)
+        and len(set(accepted_ids)) == len(accepted_ids)
+        and set(accepted_ids) == set(expected_gates)
+        and aggregate.get("fresh_count", 0) >= 4
+        and aggregate.get("fresh_count", 0) + aggregate.get("reused_count", 0)
+        == len(expected_gates)
+    )
+    if not valid:
+        raise ReleaseError(
+            "remote qualification does not bind the complete remote-release "
+            "profile to this release commit"
+        )
+    aggregate_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    log.event(
+        "remote-qualification",
+        path=relative_or_absolute(root, path),
+        sha256=aggregate_sha256,
+        gate_count=len(expected_gates),
+        fresh_count=aggregate["fresh_count"],
+        reused_count=aggregate["reused_count"],
+    )
+    return {
+        "mode": "remote-release",
+        "disposition": "RELEASE-CANDIDATE",
+        "strict_automated_status": "PASS",
+        "version": version,
+        "git_commit": head,
+        "aggregate_path": relative_or_absolute(root, path),
+        "aggregate_sha256": aggregate_sha256,
+        "catalog_sha256": expected_catalog_hash,
+        "gate_count": len(expected_gates),
+        "fresh_count": aggregate["fresh_count"],
+        "reused_count": aggregate["reused_count"],
+    }
+
+
 def verify(
     root: Path,
     version: str,
     beta_report_root: str | None,
     beta_exception_attestation: str | None,
+    beta_carry_forward_attestation: str | None,
     targeted_delta_attestation: str | None,
+    remote_qualification: str | None,
+    qualified_head: str | None = None,
 ) -> None:
-    head = ensure_release_state(root, version, require_no_tag=True)
+    if qualified_head is not None and remote_qualification is None:
+        raise ReleaseError(
+            "--qualified-head requires an exact --remote-qualification aggregate"
+        )
+    head = ensure_release_state(
+        root,
+        version,
+        require_no_tag=True,
+        qualified_head=qualified_head,
+    )
     packages, ordered = validate_workspace(root, version, locked=True)
     log = ReleaseLog(root, version, "verify")
     log.event("start", operation="verify", version=version, git_commit=head)
     if targeted_delta_attestation and (
-        beta_report_root or beta_exception_attestation
+        beta_report_root
+        or beta_exception_attestation
+        or beta_carry_forward_attestation
     ):
         raise ReleaseError(
             "--targeted-delta-attestation is mutually exclusive with beta "
@@ -1185,7 +1424,24 @@ def verify(
         "--locked",
     ]
     named_commands: list[tuple[str, list[str]]]
-    if targeted_delta_attestation:
+    if remote_qualification:
+        beta_qualification = verify_remote_qualification(
+            root, version, head, remote_qualification, log
+        )
+        named_commands = []
+        verification_scope = {
+            "mode": "remote-release",
+            "workspace_manifest": "PASS",
+            "workspace_compile": "PASS-REMOTE",
+            "workspace_tests": "PASS-REMOTE",
+            "workspace_doctests": "PASS-REMOTE",
+            "beta_suite": "REPLACED-BY-REMOTE-GATES",
+            "targeted_commands": [],
+            "postgresql_evidence": None,
+            "package_file_manifests": "PASS",
+            "package_archives": "VERIFIED-WHEN-REGISTRY-RESOLVABLE",
+        }
+    elif targeted_delta_attestation:
         beta_qualification, named_commands = verify_targeted_delta_attestation(
             root,
             version,
@@ -1214,6 +1470,7 @@ def verify(
             version,
             beta_report_root,
             beta_exception_attestation,
+            beta_carry_forward_attestation,
             log,
         )
         named_commands = [
@@ -1244,7 +1501,12 @@ def verify(
             "beta_suite": (
                 "PASS"
                 if beta_qualification["mode"] == "strict"
-                else "OWNER-APPROVED-EXCEPTION"
+                else (
+                    "OWNER-APPROVED-CARRY-FORWARD"
+                    if beta_qualification["mode"]
+                    == "owner-approved-carry-forward"
+                    else "OWNER-APPROVED-EXCEPTION"
+                )
             ),
             "targeted_commands": [],
             "postgresql_evidence": None,
@@ -1322,20 +1584,80 @@ def read_verification_receipt(
     common_scope = (
         isinstance(scope, dict)
         and scope.get("workspace_manifest") == "PASS"
-        and scope.get("workspace_compile") == "PASS"
+        and scope.get("workspace_compile") in {"PASS", "PASS-REMOTE"}
         and scope.get("package_file_manifests") == "PASS"
         and scope.get("package_archives")
         == "VERIFIED-WHEN-REGISTRY-RESOLVABLE"
     )
     full_scope = (
         scope_mode == "full"
-        and qualification_mode in {"strict", "owner-approved-exception"}
+        and qualification_mode
+        in {
+            "strict",
+            "owner-approved-exception",
+            "owner-approved-carry-forward",
+        }
         and scope.get("workspace_tests") == "PASS"
         and scope.get("workspace_doctests") == "PASS"
-        and scope.get("beta_suite") in {"PASS", "OWNER-APPROVED-EXCEPTION"}
+        and scope.get("beta_suite")
+        in {
+            "PASS",
+            "OWNER-APPROVED-EXCEPTION",
+            "OWNER-APPROVED-CARRY-FORWARD",
+        }
         and scope.get("targeted_commands") == []
         and scope.get("postgresql_evidence") is None
     ) if isinstance(scope, dict) else False
+    carry_forward_qualification = (
+        qualification_mode == "owner-approved-carry-forward"
+        and qualification.get("disposition")
+        == "OWNER-APPROVED-CARRY-FORWARD"
+        and qualification.get("strict_automated_status") == "NOT-RERUN"
+        and qualification.get("current_workspace_verification") == "PASS"
+        and isinstance(qualification.get("inherited_beta_background"), dict)
+        and qualification["inherited_beta_background"].get("version") == "0.3.2"
+        and qualification["inherited_beta_background"].get("disposition")
+        == "APPROVED-WITH-EXCEPTION"
+        and qualification["inherited_beta_background"].get(
+            "strict_automated_status"
+        )
+        == "NON-RC"
+        and isinstance(qualification.get("current_canonical_2k"), dict)
+        and qualification["current_canonical_2k"].get("status") == "PASS"
+        and isinstance(qualification.get("attestation_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", qualification["attestation_sha256"]
+        )
+        is not None
+    ) if isinstance(qualification, dict) else False
+    carry_forward_attestation_current = True
+    if qualification_mode == "owner-approved-carry-forward":
+        carry_forward_attestation_current = False
+        attestation_value = qualification.get("attestation_path")
+        if isinstance(attestation_value, str) and attestation_value:
+            attestation = Path(attestation_value)
+            if not attestation.is_absolute():
+                attestation = root / attestation
+            if (
+                attestation.is_file()
+                and hashlib.sha256(attestation.read_bytes()).hexdigest()
+                == qualification.get("attestation_sha256")
+            ):
+                verifier = root / "scripts/release_carry_forward_attestation.py"
+                verified = run(
+                    [
+                        sys.executable,
+                        str(verifier),
+                        "verify",
+                        "--attestation",
+                        str(attestation),
+                        "--version",
+                        version,
+                    ],
+                    cwd=root,
+                    check=False,
+                )
+                carry_forward_attestation_current = verified.returncode == 0
     targeted_commands = (
         scope.get("targeted_commands") if isinstance(scope, dict) else None
     )
@@ -1404,6 +1726,37 @@ def read_verification_receipt(
         is not None
         and qualification.get("postgresql") == postgres_evidence
     ) if isinstance(scope, dict) and isinstance(qualification, dict) else False
+    remote_aggregate_current = False
+    if qualification_mode == "remote-release" and isinstance(qualification, dict):
+        aggregate_value = qualification.get("aggregate_path")
+        if isinstance(aggregate_value, str) and aggregate_value:
+            aggregate_path = Path(aggregate_value)
+            if not aggregate_path.is_absolute():
+                aggregate_path = root / aggregate_path
+            remote_aggregate_current = (
+                aggregate_path.is_file()
+                and hashlib.sha256(aggregate_path.read_bytes()).hexdigest()
+                == qualification.get("aggregate_sha256")
+            )
+    remote_scope = (
+        scope_mode == "remote-release"
+        and qualification_mode == "remote-release"
+        and qualification.get("disposition") == "RELEASE-CANDIDATE"
+        and qualification.get("strict_automated_status") == "PASS"
+        and qualification.get("git_commit") == head
+        and isinstance(qualification.get("gate_count"), int)
+        and qualification.get("gate_count", 0) > 44
+        and qualification.get("fresh_count", 0) >= 4
+        and qualification.get("fresh_count", 0)
+        + qualification.get("reused_count", 0)
+        == qualification.get("gate_count")
+        and remote_aggregate_current
+        and scope.get("workspace_tests") == "PASS-REMOTE"
+        and scope.get("workspace_doctests") == "PASS-REMOTE"
+        and scope.get("beta_suite") == "REPLACED-BY-REMOTE-GATES"
+        and scope.get("targeted_commands") == []
+        and scope.get("postgresql_evidence") is None
+    ) if isinstance(scope, dict) and isinstance(qualification, dict) else False
     expected = (
         receipt.get("schema") == VERIFICATION_RECEIPT_SCHEMA
         and receipt.get("version") == version
@@ -1415,7 +1768,14 @@ def read_verification_receipt(
         and isinstance(package_hashes, dict)
         and set(package_hashes) <= set(ordered)
         and common_scope
-        and (full_scope or targeted_scope)
+        and (full_scope or targeted_scope or remote_scope)
+        and (
+            qualification_mode != "owner-approved-carry-forward"
+            or (
+                carry_forward_qualification
+                and carry_forward_attestation_current
+            )
+        )
     )
     if not expected:
         raise ReleaseError("verification receipt does not match this release commit")
@@ -1473,10 +1833,26 @@ def publish(
     version: str,
     *,
     execute: bool,
+    qualified_head: str | None = None,
 ) -> None:
-    head = ensure_release_state(root, version, require_no_tag=True)
+    head = ensure_release_state(
+        root,
+        version,
+        require_no_tag=True,
+        qualified_head=qualified_head,
+    )
     packages, ordered = validate_workspace(root, version, locked=True)
     receipt = read_verification_receipt(root, version, head, ordered)
+    if qualified_head is not None:
+        qualification = receipt.get("beta_qualification")
+        if (
+            not isinstance(qualification, dict)
+            or qualification.get("mode") != "remote-release"
+            or qualification.get("git_commit") != qualified_head
+        ):
+            raise ReleaseError(
+                "qualified ancestor publication requires matching remote-release evidence"
+            )
     verified_hashes = receipt.get("package_sha256")
     verified_file_hashes = receipt.get("package_file_manifest_sha256")
     if (
@@ -1612,6 +1988,15 @@ def parser() -> argparse.ArgumentParser:
     for name in ("prepare", "verify", "publish"):
         command = commands.add_parser(name)
         command.add_argument("--version", required=True)
+        if name in ("verify", "publish"):
+            command.add_argument(
+                "--qualified-head",
+                default=os.environ.get("RVOIP_RELEASE_QUALIFIED_HEAD"),
+                help=(
+                    "allow an attested ancestor of origin/main as the exact "
+                    "release checkout"
+                ),
+            )
         if name == "verify":
             report_group = command.add_mutually_exclusive_group()
             report_group.add_argument(
@@ -1623,8 +2008,16 @@ def parser() -> argparse.ArgumentParser:
                 default=os.environ.get("RVOIP_BETA_EXCEPTION_ATTESTATION"),
             )
             report_group.add_argument(
+                "--beta-carry-forward-attestation",
+                default=os.environ.get("RVOIP_BETA_CARRY_FORWARD_ATTESTATION"),
+            )
+            report_group.add_argument(
                 "--targeted-delta-attestation",
                 default=os.environ.get("RVOIP_TARGETED_DELTA_ATTESTATION"),
+            )
+            report_group.add_argument(
+                "--remote-qualification",
+                default=os.environ.get("RVOIP_REMOTE_QUALIFICATION"),
             )
         if name == "publish":
             command.add_argument(
@@ -1651,10 +2044,18 @@ def main(argv: list[str] | None = None) -> int:
                     version,
                     args.beta_report_root,
                     args.beta_exception_attestation,
+                    args.beta_carry_forward_attestation,
                     args.targeted_delta_attestation,
+                    args.remote_qualification,
+                    args.qualified_head,
                 )
             elif args.command == "publish":
-                publish(root, version, execute=args.execute)
+                publish(
+                    root,
+                    version,
+                    execute=args.execute,
+                    qualified_head=args.qualified_head,
+                )
     except ReleaseError as error:
         print(f"release: FAIL: {error}", file=sys.stderr)
         return 1

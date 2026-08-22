@@ -76,10 +76,12 @@ fn retention_diagnostics_aggregate_planner_state_and_transaction_tombstones() {
 
 #[test]
 fn retention_drain_horizon_covers_invite_state_ttl_with_margin() {
-    assert!(
-        support::soak::DEFAULT_RETENTION_DRAIN_WAIT_SECS
-            > support::soak::RETAINED_INVITE_STATE_TTL_SECS
-    );
+    const {
+        assert!(
+            support::soak::DEFAULT_RETENTION_DRAIN_WAIT_SECS
+                > support::soak::RETAINED_INVITE_STATE_TTL_SECS
+        );
+    }
     assert_eq!(
         support::soak::retention_drain_wait_for_configured(Some(1)),
         Duration::from_secs(support::soak::MIN_RETENTION_DRAIN_WAIT_SECS as u64)
@@ -143,10 +145,13 @@ async fn perf_soak_caller() {
     } else {
         None
     };
-    let retention_sampler = support::soak::EndpointRetentionSampler::start(
+    let retention_periodic_limit =
+        support::soak::long_soak_retention_periodic_limit(settings.duration_secs);
+    let retention_sampler = support::soak::EndpointRetentionSampler::start_with_periodic_limit(
         "caller",
         Arc::clone(&caller),
         support::soak::RETENTION_DIAGNOSTIC_SAMPLE_INTERVAL,
+        retention_periodic_limit,
     );
     let memory_sampler =
         MemoryDiagnosticSampler::start("caller", &settings, memory_diagnostic_interval());
@@ -178,8 +183,8 @@ async fn perf_soak_caller() {
         Some(sampler) => sampler.stop().await,
         None => ResourceSummary::empty(),
     };
-    let rss_gate_policy = if settings.duration_secs >= 600 {
-        RssGatePolicy::ActiveTail600
+    let rss_gate_policy = if settings.duration_secs >= support::soak::LONG_SOAK_ACTIVE_WINDOW_SECS {
+        RssGatePolicy::ActiveTail1200
     } else {
         RssGatePolicy::PostDrainOrTail
     };
@@ -379,10 +384,14 @@ async fn perf_soak_caller() {
     drop(caller);
 
     let mut gate_failures = Vec::new();
-    if settings.duration_secs >= 600 && !rss.active_tail_window_complete {
+    if settings.duration_secs >= support::soak::LONG_SOAK_ACTIVE_WINDOW_SECS
+        && !rss.active_tail_window_complete
+    {
         gate_failures.push(format!(
-            "caller active RSS gate window incomplete: measured {:.2}s with {} samples; required 600s",
-            rss.active_tail_window_secs, rss.active_tail_sample_count
+            "caller active RSS gate window incomplete: measured {:.2}s with {} samples; required {}s",
+            rss.active_tail_window_secs,
+            rss.active_tail_sample_count,
+            support::soak::LONG_SOAK_ACTIVE_WINDOW_SECS,
         ));
     }
     if rss.gate_growth_mb_per_hr > rss_gate.effective_mb_per_hr {

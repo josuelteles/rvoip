@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +13,7 @@ use rvoip_sip::api::unified::{AudioSource, Config, UnifiedCoordinator};
 use serde_json::{json, Value};
 use tokio::task::{JoinHandle, JoinSet};
 
-use super::{LatencyHistogram, ResourceSample, ResourceSummary};
+use super::{LatencyHistogram, ResourceSample, ResourceSampler, ResourceSummary};
 
 pub const DEFAULT_PERF_APP_EVENT_CHANNEL_CAPACITY: usize =
     Config::DEFAULT_APP_EVENT_CHANNEL_CAPACITY;
@@ -27,8 +27,13 @@ pub const MIN_RETENTION_DRAIN_WAIT_SECS: usize =
 pub const DEFAULT_RETENTION_DRAIN_WAIT_SECS: usize = MIN_RETENTION_DRAIN_WAIT_SECS;
 pub const BURST_RSS_DIAGNOSTIC_SETTLE_SECS: usize = 5;
 pub const BURST_RSS_QUIET_TAIL_SECS: usize = 60;
+pub const BURST_SETTLED_RSS_SAMPLE_INTERVAL_SECS: u64 = 5;
+pub const BURST_RSS_QUIESCENCE_WINDOW_SECS: u64 = 60;
+pub const BURST_RSS_QUIESCENCE_MAX_PROBES: usize = 5;
+pub const RSS_WINDOW_COVERAGE_TOLERANCE_SECS: f64 = 0.5;
 pub const MIN_BURST_RETENTION_DRAIN_WAIT_SECS: usize =
     MIN_RETENTION_DRAIN_WAIT_SECS + BURST_RSS_DIAGNOSTIC_SETTLE_SECS + BURST_RSS_QUIET_TAIL_SECS;
+pub const LONG_SOAK_ACTIVE_WINDOW_SECS: u64 = 1_200;
 /// Full endpoint-retention snapshots walk and serialize every owned runtime
 /// index. Keep that diagnostic off the 5-second RSS sampling hot path so the
 /// leak gate does not measure allocator page growth caused by its own report.
@@ -97,6 +102,173 @@ pub fn resource_sampling_diagnostics(role: &str, in_process_enabled: bool) -> se
         "disable_env": DISABLE_IN_PROCESS_RESOURCE_SAMPLER_ENV,
         "external_diagnostics_dir": std::env::var(EXTERNAL_RESOURCE_DIAGNOSTICS_DIR_ENV).ok(),
     })
+}
+
+/// Stop allocator-heavy structural diagnostics before the complete active-tail
+/// window used by a long-soak RSS gate.
+pub fn long_soak_retention_periodic_limit(duration_secs: u64) -> Option<Duration> {
+    (duration_secs >= LONG_SOAK_ACTIVE_WINDOW_SECS)
+        .then(|| Duration::from_secs(duration_secs.saturating_sub(LONG_SOAK_ACTIVE_WINDOW_SECS)))
+}
+
+/// Stop burst structural diagnostics after the offered load and its longest
+/// possible call have completed. An exact final snapshot is still captured
+/// after the authoritative settled-RSS window.
+pub fn burst_retention_periodic_limit(
+    active_duration_secs: u64,
+    maximum_hold: Duration,
+) -> Duration {
+    Duration::from_secs(active_duration_secs).saturating_add(maximum_hold)
+}
+
+#[derive(Debug)]
+pub struct BurstRssQuiescence {
+    pub attempted: bool,
+    pub achieved: bool,
+    pub max_growth_mb_per_hr: f64,
+    pub probes: Vec<Value>,
+}
+
+impl BurstRssQuiescence {
+    pub fn not_sampled(max_growth_mb_per_hr: f64) -> Self {
+        Self {
+            attempted: false,
+            achieved: false,
+            max_growth_mb_per_hr,
+            probes: Vec::new(),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "attempted": self.attempted,
+            "achieved": self.achieved,
+            "max_growth_mb_per_hr": round2(self.max_growth_mb_per_hr),
+            "probe_window_secs": BURST_RSS_QUIESCENCE_WINDOW_SECS,
+            "max_probes": BURST_RSS_QUIESCENCE_MAX_PROBES,
+            "probes": self.probes.clone(),
+        })
+    }
+}
+
+pub fn rss_window_meets_minimum(observed_secs: f64, minimum_secs: f64) -> bool {
+    observed_secs.is_finite()
+        && minimum_secs.is_finite()
+        && observed_secs + RSS_WINDOW_COVERAGE_TOLERANCE_SECS >= minimum_secs
+}
+
+pub fn burst_rss_probe_is_quiescent(
+    observed_secs: f64,
+    minimum_secs: f64,
+    growth_mb_per_hr: f64,
+    max_growth_mb_per_hr: f64,
+) -> bool {
+    growth_mb_per_hr.is_finite()
+        && max_growth_mb_per_hr.is_finite()
+        && rss_window_meets_minimum(observed_secs, minimum_secs)
+        && growth_mb_per_hr <= max_growth_mb_per_hr
+}
+
+/// Require the process to demonstrate a quiet RSS interval before opening the
+/// independent authoritative gate window. This is a bounded precondition, not
+/// a retry of the gate: a process that keeps growing exhausts the probes and
+/// fails without receiving a new authoritative window.
+pub async fn wait_for_burst_rss_quiescence(
+    role: &'static str,
+    max_growth_mb_per_hr: f64,
+) -> BurstRssQuiescence {
+    assert!(
+        max_growth_mb_per_hr.is_finite() && max_growth_mb_per_hr >= 0.0,
+        "burst RSS quiescence limit must be finite and non-negative"
+    );
+
+    let minimum_window_secs = BURST_RSS_QUIESCENCE_WINDOW_SECS as f64;
+    let observation = Duration::from_secs(
+        BURST_RSS_QUIESCENCE_WINDOW_SECS.saturating_add(BURST_SETTLED_RSS_SAMPLE_INTERVAL_SECS),
+    );
+    let mut probes = Vec::with_capacity(BURST_RSS_QUIESCENCE_MAX_PROBES);
+
+    for attempt in 1..=BURST_RSS_QUIESCENCE_MAX_PROBES {
+        let sample_kind = format!("rss_quiescence_probe_{attempt}");
+        let sampler = ResourceSampler::start_with_output(
+            Duration::from_secs(BURST_SETTLED_RSS_SAMPLE_INTERVAL_SECS),
+            diagnostic_sample_path(role, &sample_kind),
+        );
+        tokio::time::sleep(observation).await;
+        let mut resources = sampler.stop().await;
+        let metrics = rss_result_metrics(
+            &resources,
+            0.0,
+            0.0,
+            observation.as_secs_f64(),
+            RssGatePolicy::SettledFull,
+        );
+        let quiescent = burst_rss_probe_is_quiescent(
+            metrics.post_drain_window_secs,
+            minimum_window_secs,
+            metrics.gate_growth_mb_per_hr,
+            max_growth_mb_per_hr,
+        );
+        probes.push(json!({
+            "attempt": attempt,
+            "observation_secs": round2(observation.as_secs_f64()),
+            "sample_count": resources.sample_count,
+            "samples_path": resources.samples_path.as_ref().map(|path| path.display().to_string()),
+            "baseline_rss_mb": round2(resources.baseline_rss_mb),
+            "peak_rss_mb": round2(resources.peak_rss_mb),
+            "window_secs": round2(metrics.post_drain_window_secs),
+            "growth_mb_per_hr": round2(metrics.gate_growth_mb_per_hr),
+            "complete": rss_window_meets_minimum(
+                metrics.post_drain_window_secs,
+                minimum_window_secs,
+            ),
+            "quiescent": quiescent,
+        }));
+        resources.samples.clear();
+        if quiescent {
+            return BurstRssQuiescence {
+                attempted: true,
+                achieved: true,
+                max_growth_mb_per_hr,
+                probes,
+            };
+        }
+    }
+
+    BurstRssQuiescence {
+        attempted: true,
+        achieved: false,
+        max_growth_mb_per_hr,
+        probes,
+    }
+}
+
+/// Measure RSS after teardown and after periodic structural diagnostics have
+/// stopped. The exact final structural-retention capture must happen after
+/// this function returns so its allocations cannot contaminate the
+/// authoritative quiescent-runtime slope.
+pub async fn sample_settled_rss_window(
+    role: &'static str,
+    minimum_window_secs: f64,
+) -> (ResourceSummary, Duration) {
+    let minimum_window_secs = minimum_window_secs.ceil().max(1.0) as u64;
+    let observation = Duration::from_secs(
+        minimum_window_secs.saturating_add(BURST_SETTLED_RSS_SAMPLE_INTERVAL_SECS),
+    );
+    let sampler = ResourceSampler::start_with_output(
+        Duration::from_secs(BURST_SETTLED_RSS_SAMPLE_INTERVAL_SECS),
+        diagnostic_sample_path(role, "settled_resource"),
+    );
+    let memory_sampler = MemoryDiagnosticSampler::start_settled(
+        role,
+        Duration::from_secs(BURST_SETTLED_RSS_SAMPLE_INTERVAL_SECS),
+    );
+    tokio::time::sleep(observation).await;
+    let resources = sampler.stop().await;
+    if let Some(memory_sampler) = memory_sampler {
+        let _ = memory_sampler.stop().await;
+    }
+    (resources, observation)
 }
 
 pub fn media_receive_diagnostics() -> serde_json::Value {
@@ -1116,6 +1288,7 @@ pub fn burst_retention_drain_wait_for_configured(configured_secs: Option<usize>)
     Duration::from_secs(seconds.try_into().unwrap_or(u64::MAX))
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit inputs keep the soak load shape visible at call sites.
 pub async fn run_caller_load(
     caller: Arc<UnifiedCoordinator>,
     from: String,
@@ -1409,6 +1582,9 @@ async fn force_teardown_remaining_sessions(
 pub struct EndpointRetentionSampler {
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: JoinHandle<EndpointRetentionSeries>,
+    role: &'static str,
+    endpoint: Arc<UnifiedCoordinator>,
+    started: std::time::Instant,
 }
 
 pub struct MemoryDiagnosticSampler {
@@ -1442,31 +1618,73 @@ impl EndpointRetentionSampler {
         endpoint: Arc<UnifiedCoordinator>,
         interval: Duration,
     ) -> Self {
+        Self::start_with_periodic_limit(role, endpoint, interval, None)
+    }
+
+    /// Start structural sampling with an optional wall-clock limit. Long soak
+    /// tests stop these allocator-heavy snapshots before the authoritative
+    /// final-twenty-minute RSS window while continuing lightweight RSS sampling.
+    pub fn start_with_periodic_limit(
+        role: &'static str,
+        endpoint: Arc<UnifiedCoordinator>,
+        interval: Duration,
+        periodic_limit: Option<Duration>,
+    ) -> Self {
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
         let samples_path = diagnostic_sample_path(role, "retention");
+        let started = std::time::Instant::now();
+        let sampled_endpoint = Arc::clone(&endpoint);
         let task = tokio::spawn(async move {
-            let started = std::time::Instant::now();
             let mut series = EndpointRetentionSeries::new(samples_path);
             let mut writer = series.open_writer();
             loop {
                 let sample =
-                    capture_endpoint_retention_sample(role, "periodic", started, &endpoint).await;
+                    capture_endpoint_retention_sample(role, "periodic", started, &sampled_endpoint)
+                        .await;
                 series.record(role, sample, &mut writer);
-                tokio::select! {
-                    _ = tokio::time::sleep(interval) => {}
-                    _ = stop_rx.changed() => break,
+                if let Some(limit) = periodic_limit {
+                    let remaining = limit.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval.min(remaining)) => {}
+                        _ = stop_rx.changed() => break,
+                    }
+                } else {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => {}
+                        _ = stop_rx.changed() => break,
+                    }
                 }
             }
-            let sample =
-                capture_endpoint_retention_sample(role, "after_drain", started, &endpoint).await;
-            series.record(role, sample, &mut writer);
             writer.flush().expect("flush retention diagnostics JSONL");
             series
         });
-        Self { stop_tx, task }
+        Self {
+            stop_tx,
+            task,
+            role,
+            endpoint,
+            started,
+        }
     }
 
     pub async fn stop(self) -> EndpointRetentionSeries {
+        let role = self.role;
+        let endpoint = Arc::clone(&self.endpoint);
+        let started = self.started;
+        let mut series = self.stop_periodic().await;
+        let sample =
+            capture_endpoint_retention_sample(role, "after_drain", started, &endpoint).await;
+        series.record_sample(role, sample);
+        series
+    }
+
+    /// Stop periodic structural diagnostics without taking the final snapshot.
+    /// Burst tests use this at the active-load boundary so diagnostic walks do
+    /// not perturb the subsequent authoritative RSS drain window.
+    pub async fn stop_periodic(self) -> EndpointRetentionSeries {
         let _ = self.stop_tx.send(true);
         self.task.await.unwrap_or_else(|_| {
             EndpointRetentionSeries::new(diagnostic_sample_path("unknown", "retention"))
@@ -1481,6 +1699,11 @@ impl MemoryDiagnosticSampler {
         _settings: &SoakLoadSettings,
         _interval: Duration,
     ) -> Option<Self> {
+        None
+    }
+
+    #[cfg(not(feature = "perf-infra-memory-diagnostics"))]
+    pub fn start_settled(_role: &'static str, _interval: Duration) -> Option<Self> {
         None
     }
 
@@ -1557,6 +1780,65 @@ impl MemoryDiagnosticSampler {
         Some(Self { stop_tx, task })
     }
 
+    /// Capture allocator/process telemetry across the authoritative settled
+    /// RSS window. This sidecar is opt-in and never runs in ordinary release
+    /// qualification, so diagnostic allocation cannot affect normal scores.
+    #[cfg(feature = "perf-infra-memory-diagnostics")]
+    pub fn start_settled(role: &'static str, interval: Duration) -> Option<Self> {
+        if !memory_diagnostics_enabled() {
+            return None;
+        }
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let samples_path = diagnostic_sample_path(role, "settled_memory_diag");
+        let allocator_diagnostics_enabled = read_bool_env(ALLOCATOR_DIAGNOSTICS_ENV);
+        let collect_at = MimallocCollectAt::from_env();
+        let task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut series = MemoryDiagnosticSeries::new(
+                samples_path,
+                allocator_diagnostics_enabled,
+                collect_at.as_str().to_string(),
+            );
+            let mut writer = series.open_writer();
+            if collect_at.includes_settled() {
+                rvoip_infra_common::memory_diagnostics::collect_allocator(true);
+                series.collect_count += 1;
+                let sample = capture_memory_diagnostic_sample(
+                    role,
+                    "settled_collect",
+                    started,
+                    allocator_diagnostics_enabled,
+                );
+                series.record(sample, &mut writer);
+            }
+            loop {
+                let sample = capture_memory_diagnostic_sample(
+                    role,
+                    "settled_periodic",
+                    started,
+                    allocator_diagnostics_enabled,
+                );
+                series.record(sample, &mut writer);
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = stop_rx.changed() => break,
+                }
+            }
+            let sample = capture_memory_diagnostic_sample(
+                role,
+                "settled_final",
+                started,
+                allocator_diagnostics_enabled,
+            );
+            series.record(sample, &mut writer);
+            writer
+                .flush()
+                .expect("flush settled memory diagnostics JSONL");
+            series
+        });
+        Some(Self { stop_tx, task })
+    }
+
     pub async fn stop(self) -> MemoryDiagnosticSeries {
         let _ = self.stop_tx.send(true);
         self.task.await.unwrap_or_else(|_| {
@@ -1611,6 +1893,8 @@ enum MimallocCollectAt {
     Phase,
     Drain,
     Both,
+    Settled,
+    All,
 }
 
 impl MimallocCollectAt {
@@ -1624,7 +1908,11 @@ impl MimallocCollectAt {
             "phase" => Self::Phase,
             "drain" => Self::Drain,
             "both" => Self::Both,
-            other => panic!("{MIMALLOC_COLLECT_AT_ENV} must be off|phase|drain|both, got {other}"),
+            "settled" => Self::Settled,
+            "all" => Self::All,
+            other => panic!(
+                "{MIMALLOC_COLLECT_AT_ENV} must be off|phase|drain|both|settled|all, got {other}"
+            ),
         }
     }
 
@@ -1634,15 +1922,21 @@ impl MimallocCollectAt {
             Self::Phase => "phase",
             Self::Drain => "drain",
             Self::Both => "both",
+            Self::Settled => "settled",
+            Self::All => "all",
         }
     }
 
     fn includes_phase(self) -> bool {
-        matches!(self, Self::Phase | Self::Both)
+        matches!(self, Self::Phase | Self::Both | Self::All)
     }
 
     fn includes_drain(self) -> bool {
-        matches!(self, Self::Drain | Self::Both)
+        matches!(self, Self::Drain | Self::Both | Self::All)
+    }
+
+    fn includes_settled(self) -> bool {
+        matches!(self, Self::Settled | Self::All)
     }
 }
 
@@ -1781,6 +2075,20 @@ impl EndpointRetentionSeries {
         BufWriter::new(
             File::create(&self.samples_path).expect("create retention diagnostics JSONL"),
         )
+    }
+
+    pub fn record_sample(&mut self, role: &'static str, sample: serde_json::Value) {
+        if let Some(parent) = self.samples_path.parent() {
+            std::fs::create_dir_all(parent).expect("create retention diagnostics dir");
+        }
+        let mut writer = BufWriter::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.samples_path)
+                .expect("append retention diagnostics JSONL"),
+        );
+        self.record(role, sample, &mut writer);
     }
 
     fn record(
@@ -2078,13 +2386,16 @@ pub struct RssResultMetrics {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RssGatePolicy {
-    /// Long-soak authority: qualify the final ten minutes under load and fail
+    /// Long-soak authority: qualify the final twenty minutes under load and fail
     /// separately if that complete window was not captured.
-    ActiveTail600,
-    /// Short/burst authority: require the full scenario-specific post-drain
-    /// coverage, then qualify its settled final 60 seconds. The full-window
-    /// slope remains diagnostic so bounded cleanup settling stays visible.
+    ActiveTail1200,
+    /// Compatibility policy for short monolithic soak invocations whose RSS
+    /// series includes both active load and the declared post-drain period.
     PostDrainOrTail,
+    /// Short/burst authority: require a complete observation captured after
+    /// teardown and structural retention checks, then qualify the complete
+    /// settled window with a robust pairwise-slope estimator.
+    SettledFull,
 }
 
 pub fn rss_result_metrics(
@@ -2094,13 +2405,13 @@ pub fn rss_result_metrics(
     drain_secs: f64,
     gate_policy: RssGatePolicy,
 ) -> RssResultMetrics {
-    const LONG_SOAK_ACTIVE_WINDOW_SECS: f64 = 600.0;
-    const LONG_SOAK_MIN_ACTIVE_COVERAGE_SECS: f64 = 590.0;
-    const LONG_SOAK_MIN_ACTIVE_SAMPLES: usize = 110;
+    const LONG_SOAK_MIN_ACTIVE_COVERAGE_SECS: f64 = 1190.0;
+    const LONG_SOAK_MIN_ACTIVE_SAMPLES: usize = 230;
 
     let full_growth_mb_per_hr = resources.rss_growth_mb_per_min * 60.0;
     let sustained_growth_mb_per_hr = resources.rss_tail_growth_mb_per_min * 60.0;
-    let active_tail_start_secs = (active_load_end_secs - LONG_SOAK_ACTIVE_WINDOW_SECS).max(0.0);
+    let active_tail_start_secs =
+        (active_load_end_secs - LONG_SOAK_ACTIVE_WINDOW_SECS as f64).max(0.0);
     let active_tail_samples: Vec<ResourceSample> = resources
         .samples
         .iter()
@@ -2110,17 +2421,17 @@ pub fn rss_result_metrics(
         .cloned()
         .collect();
     let active_tail_endpoint = rss_endpoint_median_growth_mb_per_hr(&active_tail_samples);
-    let active_tail_growth_mb_per_hr = active_tail_endpoint.as_ref().map_or_else(
-        || rss_growth_mb_per_min(&active_tail_samples) * 60.0,
-        |estimate| estimate.growth_mb_per_hr,
-    );
+    let active_tail_theil_sen = rss_theil_sen_growth_mb_per_hr(&active_tail_samples);
+    let active_tail_growth_mb_per_hr =
+        active_tail_theil_sen.unwrap_or_else(|| rss_growth_mb_per_min(&active_tail_samples) * 60.0);
     let active_tail_window_secs = match (active_tail_samples.first(), active_tail_samples.last()) {
         (Some(first), Some(last)) => (last.t_secs - first.t_secs).max(0.0),
         _ => 0.0,
     };
-    let active_tail_window_complete = active_load_end_secs >= LONG_SOAK_ACTIVE_WINDOW_SECS
+    let active_tail_window_complete = active_load_end_secs >= LONG_SOAK_ACTIVE_WINDOW_SECS as f64
         && active_tail_window_secs >= LONG_SOAK_MIN_ACTIVE_COVERAGE_SECS
         && active_tail_samples.len() >= LONG_SOAK_MIN_ACTIVE_SAMPLES
+        && active_tail_theil_sen.is_some()
         && active_tail_endpoint.is_some();
     let post_drain_samples: Vec<ResourceSample> = resources
         .samples
@@ -2132,28 +2443,34 @@ pub fn rss_result_metrics(
         .cloned()
         .collect();
     let post_drain_growth_mb_per_hr = rss_growth_mb_per_min(&post_drain_samples) * 60.0;
+    let settled_theil_sen_growth_mb_per_hr = rss_theil_sen_growth_mb_per_hr(&post_drain_samples);
     let post_drain_window_secs = match (post_drain_samples.first(), post_drain_samples.last()) {
         (Some(first), Some(last)) => (last.t_secs - first.t_secs).max(0.0),
         _ => 0.0,
     };
     // A long soak must be qualified by sustained behavior under active load.
-    // A short scenario retains its complete post-drain evidence window, but
-    // its authoritative slope comes from the final 60 seconds after bounded
-    // cleanup settling. Because the sampler is stopped at the drain boundary,
-    // report allocations cannot contaminate this settled-runtime estimate.
+    // A short scenario retains and qualifies its complete post-drain evidence
+    // window. The Theil-Sen estimator keeps a bounded allocator step from
+    // being projected into a false hourly leak while preserving the exact
+    // slope for continuous growth. Because the sampler is stopped at the
+    // drain boundary, report allocations cannot contaminate this estimate.
     let (gate_growth_mb_per_hr, gate_window) = match gate_policy {
-        RssGatePolicy::ActiveTail600 => (
+        RssGatePolicy::ActiveTail1200 => (
             active_tail_growth_mb_per_hr,
             if active_tail_window_complete {
-                "active_tail_600s"
+                "active_tail_1200s"
             } else {
-                "active_tail_600s_incomplete"
+                "active_tail_1200s_incomplete"
             },
         ),
         RssGatePolicy::PostDrainOrTail if post_drain_samples.len() >= 2 => {
             (sustained_growth_mb_per_hr, "post_drain_tail_60s")
         }
         RssGatePolicy::PostDrainOrTail => (sustained_growth_mb_per_hr, "tail"),
+        RssGatePolicy::SettledFull => match settled_theil_sen_growth_mb_per_hr {
+            Some(growth) => (growth, "settled_full_theil_sen"),
+            None => (sustained_growth_mb_per_hr, "settled_full_incomplete"),
+        },
     };
     let windows = rss_window_summaries(
         &resources.samples,
@@ -2169,8 +2486,9 @@ pub fn rss_result_metrics(
         active_tail_sample_count: active_tail_samples.len(),
         active_tail_window_secs,
         active_tail_window_complete,
-        active_tail_estimator: if active_tail_endpoint.is_some() {
-            "median_first_last_sixth_capped_60s"
+        active_tail_estimator: if active_tail_theil_sen.is_some() && active_tail_endpoint.is_some()
+        {
+            "theil_sen_pairwise_slopes"
         } else {
             "unavailable_ols_diagnostic_only"
         },
@@ -2193,6 +2511,31 @@ pub fn rss_result_metrics(
         gate_window,
         windows,
     }
+}
+
+/// Robust slope across the complete selected RSS window.
+///
+/// The median of every pairwise slope (the Theil-Sen estimator) uses the
+/// entire evidence window, resists allocator/sample cycles, and
+/// still returns the exact rate for continuous linear growth. At the release
+/// sampler's 5-second cadence this is fewer than 30,000 slopes, so the
+/// quadratic calculation remains negligible.
+pub fn rss_theil_sen_growth_mb_per_hr(samples: &[ResourceSample]) -> Option<f64> {
+    const MIN_SAMPLES: usize = 3;
+
+    if samples.len() < MIN_SAMPLES {
+        return None;
+    }
+    let mut slopes = Vec::with_capacity(samples.len() * (samples.len() - 1) / 2);
+    for (index, first) in samples.iter().enumerate() {
+        for last in &samples[index + 1..] {
+            let elapsed_secs = last.t_secs - first.t_secs;
+            if elapsed_secs > 0.0 {
+                slopes.push((last.rss_mb - first.rss_mb) * 3600.0 / elapsed_secs);
+            }
+        }
+    }
+    (!slopes.is_empty()).then(|| median_f64(slopes))
 }
 
 /// Robust retained-RSS rate across the first and last minute of a selected
@@ -2250,7 +2593,7 @@ pub fn rss_endpoint_median_growth_mb_per_hr(
 fn median_f64(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     let midpoint = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[midpoint - 1] + values[midpoint]) / 2.0
     } else {
         values[midpoint]
@@ -2502,5 +2845,26 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
         0.0
     } else {
         numerator as f64 / denominator as f64
+    }
+}
+
+#[cfg(test)]
+mod rss_quiescence_tests {
+    use super::*;
+
+    #[test]
+    fn rss_window_coverage_tolerates_sampler_jitter_but_not_a_missing_sample() {
+        assert!(rss_window_meets_minimum(119.999_661_976, 120.0));
+        assert!(!rss_window_meets_minimum(119.4, 120.0));
+        assert!(!rss_window_meets_minimum(f64::NAN, 120.0));
+    }
+
+    #[test]
+    fn burst_quiescence_fails_closed_for_growth_or_unknown_evidence() {
+        assert!(burst_rss_probe_is_quiescent(60.0, 60.0, -3.0, 15.0));
+        assert!(burst_rss_probe_is_quiescent(59.999, 60.0, 15.0, 15.0));
+        assert!(!burst_rss_probe_is_quiescent(60.0, 60.0, 15.01, 15.0));
+        assert!(!burst_rss_probe_is_quiescent(55.0, 60.0, 0.0, 15.0));
+        assert!(!burst_rss_probe_is_quiescent(60.0, 60.0, f64::NAN, 15.0,));
     }
 }

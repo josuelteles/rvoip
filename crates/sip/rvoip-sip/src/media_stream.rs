@@ -114,19 +114,32 @@ impl SipPayloadCodec {
 
 fn codec_descriptor(
     config: &crate::session_store::state::NegotiatedConfig,
+    payload_type: u8,
 ) -> Result<(CodecInfo, u8), &'static str> {
-    let (name, payload_type) = if matches!(
+    let name = if matches!(
         config.codec.to_ascii_lowercase().as_str(),
         "pcmu" | "g.711-mu" | "g711-mu" | "g711-u"
     ) {
-        ("g.711-mu", 0)
+        if config.sample_rate != 8_000 || config.channels != 1 {
+            return Err("invalid-pcmu-shape");
+        }
+        "g.711-mu"
     } else if matches!(
         config.codec.to_ascii_lowercase().as_str(),
         "pcma" | "g.711-a" | "g711-a"
     ) {
-        ("g.711-a", 8)
+        if config.sample_rate != 8_000 || config.channels != 1 {
+            return Err("invalid-pcma-shape");
+        }
+        "g.711-a"
     } else if config.codec.eq_ignore_ascii_case("opus") {
-        ("opus", 111)
+        if !cfg!(feature = "opus") {
+            return Err("opus-feature-disabled");
+        }
+        if config.sample_rate != 48_000 || !matches!(config.channels, 1 | 2) {
+            return Err("invalid-opus-shape");
+        }
+        "opus"
     } else {
         return Err("unsupported-negotiated-codec");
     };
@@ -135,7 +148,15 @@ fn codec_descriptor(
             name: name.to_string(),
             clock_rate_hz: config.sample_rate,
             channels: config.channels,
-            fmtp: None,
+            // Carried, not dropped. `rvoip-core` keys its transcoding codec
+            // groups on this, so a hard-coded `None` puts every SIP leg in one
+            // group and silently discards whatever the peer negotiated.
+            fmtp: config.fmtp.clone(),
+            // The SIP leg is the one place that unambiguously knows this: it
+            // is the payload type the SDP answer settled on, already this
+            // function's own argument. Reporting it is what lets consumers
+            // downstream stop deriving a payload type from the codec name.
+            payload_type: Some(payload_type),
         },
         payload_type,
     ))
@@ -329,6 +350,10 @@ impl SipMediaStream {
             clock_rate_hz: G711_SAMPLE_RATE,
             channels: 1,
             fmtp: None,
+            // A dormant stream has negotiated nothing, and this descriptor is
+            // a placeholder replaced once it has. Reporting PCMU's 0 here
+            // would be reporting a negotiation that has not happened.
+            payload_type: None,
         };
         let (frames_in_tx, frames_in_rx) = mpsc::channel::<MediaFrame>(FRAME_CHANNEL_CAP);
         let (frames_out_tx, frames_out_rx) = mpsc::channel::<MediaFrame>(FRAME_CHANNEL_CAP);
@@ -756,7 +781,7 @@ async fn run_media_driver(
     // keeps the retained driver dormant across the INVITE/answer gap instead
     // of treating a normal pre-answer subscription miss as terminal failure.
     let negotiation_deadline = setup_deadline;
-    let negotiated = loop {
+    let (negotiated, payload_type) = loop {
         if *cancel_tx.borrow() {
             return;
         }
@@ -787,7 +812,7 @@ async fn run_media_driver(
             }
         }
     };
-    let (resolved_descriptor, payload_type) = match codec_descriptor(&negotiated) {
+    let (resolved_descriptor, payload_type) = match codec_descriptor(&negotiated, payload_type) {
         Ok(resolved) => resolved,
         Err(reason) => {
             tracing::warn!(
@@ -845,6 +870,7 @@ async fn run_media_driver(
         Arc::clone(&coordinator),
         session_id.clone(),
         decoder,
+        payload_type,
         channels,
         frames_out_rx,
     );
@@ -896,6 +922,7 @@ async fn run_outbound_pump(
     coordinator: Arc<UnifiedCoordinator>,
     session_id: SessionId,
     mut decoder: SipPayloadCodec,
+    payload_type: u8,
     channels: u8,
     mut frames_out_rx: mpsc::Receiver<MediaFrame>,
 ) -> &'static str {
@@ -908,6 +935,18 @@ async fn run_outbound_pump(
                     return "sip-dtmf-send-failed";
                 }
             }
+            continue;
+        }
+        if media_frame
+            .payload_type
+            .is_some_and(|actual| actual != payload_type)
+        {
+            tracing::trace!(
+                target: "rvoip_sip",
+                actual = ?media_frame.payload_type,
+                expected = payload_type,
+                "SipMediaStream: dropping unnegotiated payload type"
+            );
             continue;
         }
         let mut audio_frame = match decoder.decode(&media_frame.payload) {
@@ -1173,13 +1212,39 @@ mod negotiated_codec_tests {
             codec: codec.to_string(),
             sample_rate,
             channels,
+            fmtp: None,
         }
+    }
+
+    /// The negotiated fmtp reaches `CodecInfo` rather than being dropped.
+    ///
+    /// It was hard-coded to `None` here, which is the second of two
+    /// independent drop points on the same parameter. `rvoip-core` keys its
+    /// transcoding codec groups on this field, so every SIP leg landed in the
+    /// one `fmtp: None` group and whatever the peer negotiated — Opus's
+    /// `maxaveragebitrate`, and AMR's framing the moment AMR reaches here —
+    /// was silently discarded.
+    #[test]
+    fn the_negotiated_fmtp_reaches_the_codec_descriptor() {
+        let mut config = negotiated("PCMU", 8_000, 1);
+        config.fmtp = Some("annexb=no".to_string());
+        let (codec, _) = codec_descriptor(&config, 0).unwrap();
+        assert_eq!(codec.fmtp.as_deref(), Some("annexb=no"));
+
+        // Absent stays absent rather than becoming an empty string, because
+        // the two are different keys downstream.
+        let (plain, _) = codec_descriptor(&negotiated("PCMU", 8_000, 1), 0).unwrap();
+        assert_eq!(plain.fmtp, None);
+
+        // And two legs differing only in fmtp are different descriptors --
+        // the property the transcoding grouping depends on.
+        assert_ne!(codec, plain);
     }
 
     #[test]
     fn descriptor_uses_exact_negotiated_g711_variant() {
-        let (pcmu, pcmu_pt) = codec_descriptor(&negotiated("PCMU", 8_000, 1)).unwrap();
-        let (pcma, pcma_pt) = codec_descriptor(&negotiated("PCMA", 8_000, 1)).unwrap();
+        let (pcmu, pcmu_pt) = codec_descriptor(&negotiated("PCMU", 8_000, 1), 0).unwrap();
+        let (pcma, pcma_pt) = codec_descriptor(&negotiated("PCMA", 8_000, 1), 8).unwrap();
 
         assert_eq!(pcmu.name, "g.711-mu");
         assert_eq!(pcmu_pt, 0);
@@ -1205,25 +1270,34 @@ mod negotiated_codec_tests {
     #[test]
     fn opus_descriptor_and_codec_follow_sdp_clock_and_channels() {
         let config = negotiated("opus", 48_000, 2);
-        let (descriptor, payload_type) = codec_descriptor(&config).unwrap();
+        let (descriptor, payload_type) = codec_descriptor(&config, 96).unwrap();
         assert_eq!(descriptor.name, "opus");
         assert_eq!(descriptor.clock_rate_hz, 48_000);
         assert_eq!(descriptor.channels, 2);
-        assert_eq!(payload_type, 111);
+        assert_eq!(payload_type, 96);
         assert!(matches!(
             SipPayloadCodec::from_negotiated(&config),
             Ok(SipPayloadCodec::Opus(_))
         ));
+
+        let mut encoder = SipPayloadCodec::from_negotiated(&config).unwrap();
+        let mut decoder = SipPayloadCodec::from_negotiated(&config).unwrap();
+        let frame = rvoip_media_core::types::AudioFrame::new(vec![0; 960 * 2], 48_000, 2, 960);
+        let payload = encoder.encode(&frame).unwrap();
+        let decoded = decoder.decode(&payload).unwrap();
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.samples.len(), 960 * 2);
     }
 
     #[test]
     fn unsupported_negotiated_codec_fails_closed() {
         let config = negotiated("peer-controlled-unknown", 8_000, 1);
-        assert!(codec_descriptor(&config).is_err());
+        assert!(codec_descriptor(&config, 96).is_err());
         assert!(SipPayloadCodec::from_negotiated(&config).is_err());
 
         let internal_pcm = negotiated("pcm_s16le", 16_000, 1);
-        assert!(codec_descriptor(&internal_pcm).is_err());
+        assert!(codec_descriptor(&internal_pcm, 96).is_err());
         assert!(SipPayloadCodec::from_negotiated(&internal_pcm).is_err());
     }
 }

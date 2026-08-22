@@ -242,6 +242,125 @@ pub struct MediaSecurityState {
     pub contexts_installed: bool,
 }
 
+/// Detailed Digest retry observation emitted alongside the source-compatible
+/// [`Event::CallAuthRetrying`] event.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CallAuthRetryDetails {
+    /// Session identifier for the challenged outgoing call.
+    pub call_id: CallId,
+    /// 401 or 407.
+    pub status_code: u16,
+    /// Digest realm selected from the challenge.
+    pub realm: String,
+    /// Digest algorithm selected from the challenge alternatives.
+    pub algorithm: rvoip_auth_core::DigestAlgorithm,
+    /// Selected quality-of-protection mode, or `None` for legacy Digest.
+    pub qop: Option<String>,
+}
+
+impl std::fmt::Debug for CallAuthRetryDetails {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CallAuthRetryDetails")
+            .field("status_code", &self.status_code)
+            .field("realm_bytes", &self.realm.len())
+            .field("algorithm", &self.algorithm)
+            .field("qop", &self.qop)
+            .finish()
+    }
+}
+
+/// Secret-safe details for a failed mid-dialog or delayed-offer exchange.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenegotiationFailure {
+    /// Session identifier for the failed exchange.
+    pub call_id: CallId,
+    /// `INVITE`, `UPDATE`, or `ACK`.
+    pub method: String,
+    /// Bounded diagnostic category; SDP bodies are never included.
+    pub reason: String,
+}
+
+impl std::fmt::Debug for RenegotiationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RenegotiationFailure")
+            .field("method", &self.method)
+            .field("reason_bytes", &self.reason.len())
+            .finish()
+    }
+}
+
+/// Secret-safe details for an RFC 4568 SDES negotiation failure.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct SdesNegotiationFailure {
+    /// Session identifier for the failed exchange.
+    pub call_id: CallId,
+    /// Response envelope for the failed exchange. Answer failures retain the
+    /// received response; offer failures carry the locally authored 488
+    /// outcome and the rejected remote offer in the compatibility envelope.
+    pub response: crate::api::incoming::IncomingResponse,
+    /// Structured diagnostic that never contains key material.
+    pub diagnostic: crate::errors::SdesNegotiationDiagnostic,
+}
+
+impl std::fmt::Debug for SdesNegotiationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SdesNegotiationFailure")
+            .field("status_code", &self.response.status_code)
+            .field("response_has_sdp", &self.response.sdp.is_some())
+            .field("diagnostic", &self.diagnostic)
+            .finish()
+    }
+}
+
+/// Bounded, opt-in diagnostic stream for details that cannot be added to the
+/// exhaustive 0.3.x [`Event`] enum without breaking existing callers.
+#[derive(Clone)]
+#[non_exhaustive]
+pub enum DiagnosticEvent {
+    /// A Digest-authenticated retry was successfully dispatched.
+    CallAuthRetrying(CallAuthRetryDetails),
+    /// A mid-dialog or delayed-offer SDP exchange failed.
+    RenegotiationFailed(RenegotiationFailure),
+    /// An inbound RFC 4568 SDES offer or answer failed validation.
+    SdesNegotiationFailed(SdesNegotiationFailure),
+}
+
+impl DiagnosticEvent {
+    /// Return the session identifier associated with this diagnostic.
+    pub fn call_id(&self) -> &CallId {
+        match self {
+            Self::CallAuthRetrying(details) => &details.call_id,
+            Self::RenegotiationFailed(details) => &details.call_id,
+            Self::SdesNegotiationFailed(details) => &details.call_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for DiagnosticEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CallAuthRetrying(details) => formatter
+                .debug_tuple("CallAuthRetrying")
+                .field(details)
+                .finish(),
+            Self::RenegotiationFailed(details) => formatter
+                .debug_tuple("RenegotiationFailed")
+                .field(details)
+                .finish(),
+            Self::SdesNegotiationFailed(details) => formatter
+                .debug_tuple("SdesNegotiationFailed")
+                .field(details)
+                .finish(),
+        }
+    }
+}
+
 /// Typed session events delivered to applications.
 ///
 /// These events are published by the state machine and adapters when SIP,
@@ -283,6 +402,16 @@ pub enum Event {
         call_id: CallId,
         /// SDP answer received from the remote peer, if present.
         sdp: Option<String>,
+    },
+
+    /// The INVITE dialog reached the established state.
+    ///
+    /// This role-neutral lifecycle event is emitted for both outgoing and
+    /// incoming calls. On an incoming (UAS) call it is emitted only after the
+    /// caller's ACK commits the `Answering` to `Active` transition.
+    CallEstablished {
+        /// Session identifier for the established call.
+        call_id: CallId,
     },
 
     /// Provisional call progress response received for an outgoing call.
@@ -368,10 +497,10 @@ pub enum Event {
         reason: String,
     },
 
-    /// RFC 3261 §22.2 — server challenged our INVITE with 401/407 and we're
-    /// about to retry with a digest authorization header. Informational; no
-    /// action required from the app. If the retry fails (wrong credentials
-    /// or retry cap exceeded), `CallFailed` follows.
+    /// RFC 3261 §22.2 — a server challenged our INVITE with 401/407 and the
+    /// authenticated retry was successfully dispatched. Informational; no
+    /// action is required from the app. If the retry is subsequently rejected,
+    /// `CallFailed` follows.
     CallAuthRetrying {
         /// Session identifier for the challenged outgoing call.
         call_id: CallId,
@@ -823,6 +952,7 @@ impl std::fmt::Debug for Event {
                 .field("sdp_present", &sdp.is_some())
                 .field("sdp_bytes", &sdp.as_ref().map_or(0, String::len))
                 .finish(),
+            Self::CallEstablished { .. } => formatter.write_str("CallEstablished"),
             Self::CallProgress {
                 status_code,
                 reason,
@@ -1121,6 +1251,7 @@ impl Event {
             Event::IncomingCall { call_id, .. }
             | Event::IncomingCallAuthenticated { call_id, .. }
             | Event::CallAnswered { call_id, .. }
+            | Event::CallEstablished { call_id, .. }
             | Event::CallProgress { call_id, .. }
             | Event::CallEnded { call_id, .. }
             | Event::CallFailed { call_id, .. }
@@ -1188,6 +1319,7 @@ impl Event {
             Event::IncomingCall { .. }
                 | Event::IncomingCallAuthenticated { .. }
                 | Event::CallAnswered { .. }
+                | Event::CallEstablished { .. }
                 | Event::CallProgress { .. }
                 | Event::CallEnded { .. }
                 | Event::CallFailed { .. }
@@ -1271,6 +1403,49 @@ impl Event {
             } => Some(parsed.clone()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod security_diagnostic_tests {
+    use super::{DiagnosticEvent, SdesNegotiationFailure};
+    use crate::errors::{
+        SdesBase64Padding, SdesNegotiationDiagnostic, SdesNegotiationFailureClass,
+        SdesNegotiationStage,
+    };
+    use crate::state_table::types::SessionId;
+    use rvoip_sip_core::types::sdp::CryptoSuite;
+
+    #[test]
+    fn sdes_failure_debug_never_renders_response_sdp_or_key_material() {
+        let key_material = "SECRET_INLINE_KEY_MATERIAL==";
+        let event = DiagnosticEvent::SdesNegotiationFailed(SdesNegotiationFailure {
+            call_id: SessionId("sdes-failure".to_string()),
+            response: crate::api::incoming::IncomingResponse::synthetic(
+                SessionId("sdes-failure".to_string()),
+                200,
+                "OK".to_string(),
+                Some(format!(
+                    "v=0\r\na=crypto:1 AES_256_CM_HMAC_SHA1_80 inline:{key_material}\r\n"
+                )),
+            ),
+            diagnostic: SdesNegotiationDiagnostic {
+                stage: SdesNegotiationStage::RemoteAnswer,
+                failure_class: SdesNegotiationFailureClass::InvalidBase64,
+                tag: 1,
+                suite: CryptoSuite::AesCm256HmacSha1_80,
+                encoded_bytes: key_material.len(),
+                padding: SdesBase64Padding::Malformed,
+                expected_decoded_bytes: 46,
+                actual_decoded_bytes: None,
+            },
+        });
+
+        let debug = format!("{event:?}");
+        assert!(debug.contains("SdesNegotiationFailed"));
+        assert!(debug.contains("expected_decoded_bytes"));
+        assert!(!debug.contains(key_material));
+        assert!(!debug.contains("a=crypto"));
     }
 }
 

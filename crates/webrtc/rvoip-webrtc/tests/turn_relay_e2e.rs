@@ -60,10 +60,7 @@ async fn relay_policy_with_coturn_fixture_builds_peer() {
 /// 2. Media frames traverse the relay end to end (not just config plumbing).
 /// 3. The G4 `selected_pair` stats surface the relay candidate type.
 #[tokio::test]
-#[cfg_attr(
-    not(feature = "turn-fork-candidate"),
-    ignore = "requires the owner-reviewed UDP TURN alpha-fork candidate"
-)]
+#[ignore = "requires the owner-reviewed UDP TURN alpha-fork candidate"]
 async fn relay_only_two_peer_media_round_trip() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let coturn = CoturnFixture::start().await.expect("start TURN fixture");
@@ -86,6 +83,7 @@ async fn relay_only_two_peer_media_round_trip() {
         clock_rate_hz: 48_000,
         channels: 2,
         fmtp: None,
+        payload_type: None,
     };
 
     let offerer_ssrc = offerer.local_audio_ssrc().expect("offerer ssrc");

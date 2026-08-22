@@ -15,7 +15,8 @@ Vapi voice agents, and real ICE (RFC 8445) connectivity behind rvoip-sip's
 off-by-default `ice` feature and the alpha-tier `rvoip-nat-core` crate.
 
 Beta media defaults to **PCMU/PCMA**; the fully integrated optional
-**G.729A/G.729AB** path is developer preview and is not exercised here.
+**G.729A/G.729AB** and **AMR-NB/AMR-WB** paths are developer preview and are
+not exercised here.
 Transports are **UDP** (interop-tested) and **TCP/TLS** (supported), with
 **SDES-SRTP** in the qualified SIP media envelope. **Opus/G.722** are
 developer-preview additions. **DTLS-SRTP, ICE (RFC 8445, host +
@@ -54,12 +55,9 @@ for real ICE connectivity checks. The source of truth is
 
 - **Self-contained projects.** Each example is its own Cargo workspace and uses
   local rvoip crates from this checkout through `path`. The paired `version`
-  records that example's release baseline: unchanged SIP examples intentionally
-  remain on 0.3.2, while examples updated for the targeted 0.3.3 vCon delta use
-  0.3.3. The immutable 0.3.2 SIP beta evidence remains the unchanged-subsystem
-  baseline; the targeted delta is not a new beta qualification. When copying an
-  example into your own project, drop `path` and select the published version
-  you intend to use.
+  tracks the unified workspace train (`0.3.8`). When copying an example into
+  your own project, drop `path` and select the published version you intend to
+  use.
 - **`./run_demo.sh`** builds release binaries, boots every process with port
   readiness checks, prints the combined logs, and exits non-zero on failure.
   Logs land in each example's `logs/`.

@@ -121,7 +121,7 @@ impl SrtpAuthenticator {
 #[derive(Debug)]
 pub struct SrtpReplayProtection {
     /// Window size in packets
-    window_size: u64,
+    window_size: usize,
 
     /// Highest sequence number received
     highest_seq: u64,
@@ -141,8 +141,11 @@ pub struct SrtpReplayProtection {
 impl SrtpReplayProtection {
     /// Create a new replay protection context
     pub fn new(window_size: u64) -> Self {
-        let mut window = Vec::new();
-        window.resize(window_size as usize, false);
+        // A zero-sized replay window cannot remember even the packet that
+        // established it. Preserve the infallible constructor while treating
+        // zero as the smallest useful window.
+        let window_size = usize::try_from(window_size.max(1)).unwrap_or(usize::MAX);
+        let window = vec![false; window_size];
 
         Self {
             window_size,
@@ -169,7 +172,8 @@ impl SrtpReplayProtection {
         }
 
         // The window covers [highest_seq - window_size + 1, highest_seq]
-        let window_lower_bound = self.highest_seq.saturating_sub(self.window_size - 1);
+        let window_lower_bound =
+            self.highest_seq.saturating_sub(self.window_size.saturating_sub(1) as u64);
         if seq < window_lower_bound {
             return false;
         }
@@ -203,15 +207,13 @@ impl SrtpReplayProtection {
         if seq > self.highest_seq {
             let diff = seq - self.highest_seq;
 
-            if diff >= self.window_size {
-                for bit in self.window.iter_mut() {
-                    *bit = false;
-                }
+            if diff >= self.window_size as u64 {
+                self.window.fill(false);
             } else {
-                for i in 0..diff as usize {
-                    let idx = (self.window_size - diff + i as u64) % self.window_size;
-                    self.window[idx as usize] = false;
-                }
+                let shift = diff as usize;
+                let retained = self.window_size - shift;
+                self.window.copy_within(..retained, shift);
+                self.window[..shift].fill(false);
             }
 
             self.highest_seq = seq;
@@ -245,9 +247,7 @@ impl SrtpReplayProtection {
     pub fn reset(&mut self) {
         self.highest_seq = 0;
         self.has_received = false;
-        for i in 0..self.window.len() {
-            self.window[i] = false;
-        }
+        self.window.fill(false);
     }
 }
 
@@ -430,7 +430,7 @@ mod tests {
         replay.set_enabled(true);
         replay.reset();
 
-        // After reset, highest_seq should be 0
+        // After reset, highest_seq is back to the initial value.
         assert_eq!(replay.highest_seq, 0);
 
         // Should accept a new first packet
@@ -490,7 +490,7 @@ mod tests {
         replay.set_enabled(true);
         replay.reset();
 
-        // After reset, highest_seq should be 0
+        // After reset, highest_seq is back to the initial value.
         assert_eq!(replay.highest_seq, 0);
         println!("TEST: After reset, highest_seq=0");
 
@@ -498,5 +498,35 @@ mod tests {
         println!("TEST: Checking new packet after reset");
         assert!(replay.check(300).unwrap());
         println!("TEST: New packet accepted after reset");
+    }
+
+    #[test]
+    fn replay_bitmap_tracks_zero_advances_duplicates_and_age() {
+        let mut replay = SrtpReplayProtection::new(4);
+
+        assert!(replay.check(0).unwrap(), "packet index zero is valid");
+        assert!(!replay.check(0).unwrap(), "zero must not be a sentinel");
+
+        assert!(replay.check(1).unwrap());
+        assert!(
+            !replay.check(0).unwrap(),
+            "advancing the window must retain the preceding packet bit"
+        );
+
+        assert!(replay.check(3).unwrap());
+        assert!(replay.check(2).unwrap(), "unseen in-window packet is valid");
+        assert!(!replay.check(2).unwrap(), "in-window duplicate is rejected");
+
+        assert!(replay.check(4).unwrap());
+        assert!(
+            !replay.check(0).unwrap(),
+            "packet outside window is rejected"
+        );
+
+        let mut minimum_window = SrtpReplayProtection::new(0);
+        assert!(minimum_window.check(0).unwrap());
+        assert!(!minimum_window.check(0).unwrap());
+        assert!(minimum_window.check(1).unwrap());
+        assert!(!minimum_window.check(0).unwrap());
     }
 }

@@ -1,0 +1,875 @@
+name: Release qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Main commit to qualify, or same-repository branch head to diagnose
+        required: true
+        default: main
+        type: string
+      profile:
+        description: Preflight, exact-gate diagnosis, core dry run, or qualification
+        required: true
+        default: remote-core
+        type: choice
+        options:
+          - remote-preflight
+          - remote-diagnostic
+          - remote-core
+          - remote-release
+      diagnostic_gates:
+        description: Comma-separated exact release or preflight GCP gate IDs for remote-diagnostic
+        required: false
+        type: string
+      first_candidate:
+        description: Force every selected gate to run fresh
+        required: true
+        default: true
+        type: boolean
+      prior_run_id:
+        description: Optional comma-separated run IDs whose exact matching evidence may be reused
+        required: false
+        type: string
+      changed_since:
+        description: Optional prior candidate SHA for fail-closed changed-path validation
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  # Supersede the same qualification request, but allow disjoint diagnostic
+  # gate sets for one candidate to use independent GCP workers concurrently.
+  group: release-qualification-${{ inputs.profile }}-${{ inputs.candidate }}-${{ inputs.diagnostic_gates || 'all' }}
+  cancel-in-progress: ${{ inputs.profile == 'remote-preflight' || inputs.profile == 'remote-diagnostic' }}
+
+env:
+  RELEASE_ENVIRONMENT_ID: rvoip-release-v5-rust-1.91-nextest-0.9.140-prebuilt-perf-v2-lld-n2-cascade-lake
+  MIN_CPU_PLATFORM: Intel Cascade Lake
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  plan:
+    name: Plan exact-candidate gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      hosted_matrix: ${{ steps.plan.outputs.hosted_matrix }}
+      gcp_matrix: ${{ steps.plan.outputs.gcp_matrix }}
+      shard_count: ${{ steps.plan.outputs.shard_count }}
+      hosted_shard_count: ${{ steps.plan.outputs.hosted_shard_count }}
+      gcp_shard_count: ${{ steps.plan.outputs.gcp_shard_count }}
+      candidate_sha: ${{ steps.plan.outputs.candidate_sha }}
+      environment_id: ${{ steps.plan.outputs.environment_id }}
+      run_count: ${{ steps.plan.outputs.run_count }}
+      reuse_count: ${{ steps.plan.outputs.reuse_count }}
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.candidate }}
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.91.0
+
+      - name: Require protected main candidate or trusted diagnostic branch head
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [[ "$PROFILE" == remote-diagnostic ]]; then
+            candidate="$(git rev-parse HEAD)"
+            git ls-remote --heads origin \
+              | awk -v candidate="$candidate" '$1 == candidate { found = 1 } END { exit !found }' \
+              || {
+                echo "diagnostic candidates must be the exact head of a branch in this repository" >&2
+                exit 1
+              }
+          else
+            git merge-base --is-ancestor HEAD origin/main || {
+              echo "release candidates must be commits on origin/main" >&2
+              exit 1
+            }
+          fi
+
+      - name: Require complete structured release coverage
+        if: inputs.profile == 'remote-release'
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          coverage = json.loads(Path('scripts/release/gates.json').read_text())['remote_release_legacy_coverage']
+          missing = coverage['unautomated_legacy_ids']
+          if missing:
+              print('remote-release is fail-closed until every legacy gate has a structured replacement:', *missing, sep='\n- ')
+              raise SystemExit(1)
+          PY
+
+      - name: Download prior qualification evidence
+        if: inputs.profile != 'remote-preflight' && inputs.profile != 'remote-diagnostic' && inputs.prior_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIOR_RUN_IDS: ${{ inputs.prior_run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          IFS=, read -r -a run_ids <<< "$PRIOR_RUN_IDS"
+          if (( ${#run_ids[@]} > 5 )); then
+            echo "at most five prior evidence runs may be combined" >&2
+            exit 1
+          fi
+          for value in "${run_ids[@]}"; do
+            run_id="${value//[[:space:]]/}"
+            [[ "$run_id" =~ ^[1-9][0-9]*$ ]] || {
+              echo "invalid prior run ID: $value" >&2
+              exit 1
+            }
+            gh run download "$run_id" \
+              --repo "$REPOSITORY" \
+              --name release-gate-evidence \
+              --dir "target/prior-evidence/$run_id"
+          done
+
+      - name: Plan fresh and reusable gates
+        id: plan
+        shell: bash
+        env:
+          FIRST_CANDIDATE: ${{ inputs.first_candidate }}
+          PRIOR_RUN_ID: ${{ inputs.prior_run_id }}
+          CHANGED_SINCE: ${{ inputs.changed_since }}
+          DIAGNOSTIC_GATES: ${{ inputs.diagnostic_gates }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          args=(
+            --profile "$PROFILE"
+            --candidate HEAD
+            --environment-id "$RELEASE_ENVIRONMENT_ID"
+            --output target/release-plan/plan.json
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if test "$PROFILE" = remote-diagnostic; then
+            args+=(--only-gates "$DIAGNOSTIC_GATES")
+          fi
+          if test "$FIRST_CANDIDATE" = true \
+            || test "$PROFILE" = remote-preflight \
+            || test "$PROFILE" = remote-diagnostic; then
+            args+=(--first-candidate)
+          fi
+          if test "$PROFILE" != remote-preflight \
+            && test "$PROFILE" != remote-diagnostic \
+            && test -n "$PRIOR_RUN_ID"; then
+            args+=(--prior-evidence target/prior-evidence)
+          fi
+          if test "$PROFILE" != remote-preflight \
+            && test "$PROFILE" != remote-diagnostic \
+            && test -n "$CHANGED_SINCE"; then
+            args+=(--changed-since "$CHANGED_SINCE")
+          fi
+          python3 scripts/release/gates.py plan "${args[@]}"
+
+      - name: Summarize plan
+        run: |
+          {
+            echo "## Release qualification plan"
+            echo
+            echo "- Candidate: \`${{ steps.plan.outputs.candidate_sha }}\`"
+            echo "- Profile: \`${{ inputs.profile }}\`"
+            echo "- Fresh gates: ${{ steps.plan.outputs.run_count }}"
+            echo "- Reused gates: ${{ steps.plan.outputs.reuse_count }}"
+            echo "- Runner shards: ${{ steps.plan.outputs.shard_count }}"
+            if [[ '${{ inputs.profile }}' == remote-diagnostic ]]; then
+              echo "- Reusable for release: no"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload qualification plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-gate-plan
+          path: target/release-plan/plan.json
+          retention-days: 90
+          if-no-files-found: error
+
+  gate-hosted:
+    name: ${{ matrix.resource_class }} / ${{ matrix.id }}
+    if: needs.plan.outputs.hosted_shard_count != '0'
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.hosted_matrix) }}
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.candidate_sha }}
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.91.0
+          components: clippy,rustfmt
+
+      - name: Install nightly for bounded fuzz gates
+        if: matrix.needs_nightly
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: nightly
+
+      - name: Install cargo-fuzz
+        if: matrix.needs_nightly
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
+        with:
+          tool: cargo-fuzz@0.13.2
+
+      - name: Install cargo-deny
+        if: matrix.needs_cargo_deny
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Restore content-addressed Rust cache
+        if: matrix.hosted
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          shared-key: release-${{ matrix.id }}
+
+      - name: Install hosted-runner native dependencies
+        if: matrix.hosted
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libasound2-dev libopus-dev libssl-dev protobuf-compiler pkg-config cmake
+
+      - name: Install Chromium for the BridgeFu DTMF regression
+        if: matrix.needs_chromium
+        run: sudo apt-get install -y chromium
+
+      - name: Run gate shard
+        run: >-
+          python3 scripts/release/gates.py run-shard
+          --candidate '${{ needs.plan.outputs.candidate_sha }}'
+          --environment-id '${{ needs.plan.outputs.environment_id }}'
+          --gates '${{ matrix.gates_csv }}'
+          --output target/release-shard
+
+      - name: Upload shard evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-gate-shard-${{ matrix.id }}
+          path: target/release-shard/
+          retention-days: 90
+          if-no-files-found: warn
+
+  preflight-gcp:
+    name: Verify ephemeral GCP capacity
+    if: needs.plan.outputs.gcp_shard_count != '0'
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.RVOIP_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.RVOIP_GCP_PROVISIONER_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Require all compute and disk quota before creating workers
+        env:
+          CACHE_BUCKET: ${{ vars.RVOIP_GCP_CACHE_BUCKET }}
+          PROJECT: ${{ vars.RVOIP_GCP_PROJECT_ID }}
+          REGION: ${{ vars.RVOIP_GCP_REGION }}
+          GCP_MATRIX: ${{ needs.plan.outputs.gcp_matrix }}
+        run: |
+          set -euo pipefail
+          test -n "$CACHE_BUCKET"
+          gcloud compute project-info describe --project "$PROJECT" --format=json > global-quotas.json
+          gcloud compute regions describe "$REGION" --project "$PROJECT" --format=json > regional-quotas.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          workers = json.loads(os.environ["GCP_MATRIX"])["include"]
+          worker_vcpus = sum(int(item["machine_type"].rsplit("-", 1)[1]) for item in workers)
+          worker_instances = len(workers)
+          worker_disk_gb = sum(int(item["disk_size_gb"]) for item in workers)
+          has_performance = any(
+              item["resource_class"].startswith("gcp-performance") for item in workers
+          )
+          # The 32-vCPU builder runs first and is deleted before measurement
+          # workers are created, so capacity is the larger phase, not their sum.
+          vcpus = max(worker_vcpus, 32 if has_performance else 0)
+          instances = max(worker_instances, 1 if has_performance else 0)
+          disk_gb = max(worker_disk_gb, 200 if has_performance else 0)
+          global_quotas = {
+              row["metric"]: row
+              for row in json.loads(Path("global-quotas.json").read_text())["quotas"]
+          }
+          regional_quotas = {
+              row["metric"]: row
+              for row in json.loads(Path("regional-quotas.json").read_text())["quotas"]
+          }
+          required = {
+              "CPUS_ALL_REGIONS": (global_quotas, vcpus),
+              "CPUS": (regional_quotas, vcpus),
+              "N2_CPUS": (regional_quotas, vcpus),
+              "INSTANCES": (regional_quotas, instances),
+              "IN_USE_ADDRESSES": (regional_quotas, instances),
+              "DISKS_TOTAL_GB": (regional_quotas, disk_gb),
+              "SSD_TOTAL_GB": (regional_quotas, 200 if has_performance else 0),
+          }
+          failures = []
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a") as output:
+              output.write("## Ephemeral release capacity\n\n")
+              output.write(f"- Peak instances: {instances}\n- Peak N2 vCPUs: {vcpus}\n- Peak persistent disk: {disk_gb} GB\n\n")
+              output.write("| Quota | Required | Available |\n| --- | ---: | ---: |\n")
+              for metric, (source, needed) in required.items():
+                  quota = source.get(metric)
+                  available = -1 if quota is None else int(quota["limit"] - quota.get("usage", 0))
+                  output.write(f"| {metric} | {needed} | {available} |\n")
+                  if available < needed:
+                      failures.append(f"{metric}: requires {needed}, only {available} available")
+          if failures:
+              raise SystemExit("GCP capacity preflight failed:\n- " + "\n- ".join(failures))
+          PY
+
+  gate-gcp:
+    name: Run all ephemeral GCP release shards
+    if: needs.plan.outputs.gcp_shard_count != '0'
+    needs: [plan, preflight-gcp]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out controller definition
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.candidate_sha }}
+
+      - name: Authenticate to Google Cloud without a key
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.RVOIP_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.RVOIP_GCP_PROVISIONER_SERVICE_ACCOUNT }}
+
+      - name: Install Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Bind every worker to the exact candidate and gate shard
+        env:
+          CANDIDATE: ${{ needs.plan.outputs.candidate_sha }}
+          ENVIRONMENT_ID: ${{ needs.plan.outputs.environment_id }}
+          GCP_MATRIX: ${{ needs.plan.outputs.gcp_matrix }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/gcp-controller
+          printf '%s\n' "$GCP_MATRIX" > target/gcp-controller/matrix.json
+          python3 scripts/release/gcp_fanout.py prepare \
+            --matrix target/gcp-controller/matrix.json \
+            --candidate "$CANDIDATE" \
+            --environment-id "$ENVIRONMENT_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output target/gcp-controller/workers.json
+          {
+            echo "## Ephemeral GCP fanout"
+            echo
+            echo "- GitHub controller jobs: 1"
+            echo "- GCP workers: $(jq -r .worker_count target/gcp-controller/workers.json)"
+            echo "- N2 vCPUs: $(jq -r .required_vcpus target/gcp-controller/workers.json)"
+            echo "- Idle workers retained after the run: 0"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build selected performance executables once
+        id: prebuild
+        env:
+          CACHE_BUCKET: ${{ vars.RVOIP_GCP_CACHE_BUCKET }}
+          CANDIDATE: ${{ needs.plan.outputs.candidate_sha }}
+          ENVIRONMENT_ID: ${{ needs.plan.outputs.environment_id }}
+          PROJECT: ${{ vars.RVOIP_GCP_PROJECT_ID }}
+          ZONE: ${{ vars.RVOIP_GCP_ZONE }}
+          NETWORK: ${{ vars.RVOIP_GCP_NETWORK }}
+          SUBNET: ${{ vars.RVOIP_GCP_SUBNET }}
+          BUCKET: ${{ vars.RVOIP_GCP_EVIDENCE_BUCKET }}
+          RUNNER_SERVICE_ACCOUNT: ${{ vars.RVOIP_GCP_RUNNER_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/gcp-controller/prebuild
+          selected_gates="$(
+            jq -r '[.workers[] | select(.resource_class | startswith("gcp-performance")) | .gates[]] | unique | join(",")' \
+              target/gcp-controller/workers.json
+          )"
+          gates_csv="$(python3 scripts/release/prebuilt_performance.py select-gates \
+            --catalog scripts/release/gates.json --gates "$selected_gates")"
+          if [[ -z "$gates_csv" ]]; then
+            echo "bundle_uri=none" >> "$GITHUB_OUTPUT"
+            echo "bundle_sha256=none" >> "$GITHUB_OUTPUT"
+            echo "No performance binaries are required for this fanout." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          cache_started="$(date +%s)"
+          cache_key="$(python3 scripts/release/prebuilt_performance.py cache-key \
+            --candidate "$CANDIDATE" \
+            --environment-id "$ENVIRONMENT_ID" \
+            --gates "$gates_csv")"
+          cache_prefix="release-cache/performance-prebuilt-v1/${cache_key}"
+          cache_result_uri="gs://${BUCKET}/${cache_prefix}/prebuild-result.json"
+          cache_hit=false
+          if gcloud storage cp "$cache_result_uri" \
+            target/gcp-controller/prebuild/cached-result.json 2>/dev/null \
+            && python3 scripts/release/prebuilt_performance.py verify-result \
+              --result target/gcp-controller/prebuild/cached-result.json \
+              --candidate "$CANDIDATE" \
+              --environment-id "$ENVIRONMENT_ID" \
+              --gates "$gates_csv" \
+              --cache-key "$cache_key"; then
+            mv target/gcp-controller/prebuild/cached-result.json \
+              target/gcp-controller/prebuild/prebuild-result.json
+            cache_hit=true
+          else
+            rm -f target/gcp-controller/prebuild/cached-result.json
+          fi
+
+          builder="rvoip-rel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-prebuild"
+          prefix="release/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/prebuild"
+          if [[ "$cache_hit" != true ]]; then
+            gates_b64="$(printf '%s' "$gates_csv" | base64 -w0)"
+            environment_b64="$(printf '%s' "$ENVIRONMENT_ID" | base64 -w0)"
+            cleanup_builder() {
+              gcloud compute instances delete "$builder" \
+                --project "$PROJECT" --zone "$ZONE" --quiet >/dev/null 2>&1 || true
+            }
+            trap cleanup_builder EXIT
+
+            gcloud compute instances create "$builder" \
+              --project "$PROJECT" \
+              --zone "$ZONE" \
+              --machine-type n2-standard-32 \
+              --min-cpu-platform "$MIN_CPU_PLATFORM" \
+              --network "$NETWORK" \
+              --subnet "$SUBNET" \
+              --image-family ubuntu-2404-lts-amd64 \
+              --image-project ubuntu-os-cloud \
+              --boot-disk-type pd-balanced \
+              --boot-disk-size 200GB \
+              --boot-disk-auto-delete \
+              --service-account "$RUNNER_SERVICE_ACCOUNT" \
+              --scopes cloud-platform \
+              --shielded-secure-boot \
+              --shielded-vtpm \
+              --shielded-integrity-monitoring \
+              --labels rvoip-role=release-prebuild,managed-by=github-actions \
+              --metadata "rvoip-candidate=${CANDIDATE},rvoip-run-id=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT},rvoip-evidence-bucket=${BUCKET},rvoip-cache-bucket=${CACHE_BUCKET},rvoip-prefix=${prefix},rvoip-prebuild-cache-key=${cache_key},rvoip-gates-b64=${gates_b64},rvoip-environment-b64=${environment_b64}" \
+              --metadata-from-file startup-script=infra/release-runners/gcp-performance-prebuild-startup.sh \
+              > target/gcp-controller/prebuild/create.log
+
+            result_uri="gs://${BUCKET}/${prefix}/prebuild-result.json"
+            for attempt in $(seq 1 120); do
+              if gcloud storage cp "$result_uri" \
+                target/gcp-controller/prebuild/prebuild-result.json 2>/dev/null; then
+                break
+              fi
+              state="$(gcloud compute instances describe "$builder" \
+                --project "$PROJECT" --zone "$ZONE" --format='value(status)' || true)"
+              if [[ "$state" == TERMINATED ]]; then
+                echo "performance prebuilder stopped without an immutable result" >&2
+                break
+              fi
+              echo "Waiting for exact-candidate performance bundle (poll ${attempt}/120)"
+              sleep 20
+            done
+            gcloud storage cp "gs://${BUCKET}/${prefix}/prebuild.log" \
+              target/gcp-controller/prebuild/prebuild.log 2>/dev/null || true
+          fi
+          test -f target/gcp-controller/prebuild/prebuild-result.json
+          python3 scripts/release/prebuilt_performance.py verify-result \
+            --result target/gcp-controller/prebuild/prebuild-result.json \
+            --candidate "$CANDIDATE" \
+            --environment-id "$ENVIRONMENT_ID" \
+            --gates "$gates_csv" \
+            --cache-key "$cache_key" \
+            --github-output "$GITHUB_OUTPUT"
+          manifest_uri="$(jq -r .manifest_uri target/gcp-controller/prebuild/prebuild-result.json)"
+          manifest_sha="$(jq -r .manifest_sha256 target/gcp-controller/prebuild/prebuild-result.json)"
+          gcloud storage cp "$manifest_uri" \
+            target/gcp-controller/prebuild/performance-manifest.json
+          echo "${manifest_sha}  target/gcp-controller/prebuild/performance-manifest.json" \
+            | sha256sum --check --status
+          duration="$(jq -r .duration_seconds target/gcp-controller/prebuild/prebuild-result.json)"
+          count="$(jq -r '.selected_gate_ids | length' target/gcp-controller/prebuild/prebuild-result.json)"
+          {
+            echo
+            echo "### Shared exact-candidate performance build"
+            echo
+            echo "- Selected gates: ${count}"
+            if [[ "$cache_hit" == true ]]; then
+              echo "- Bundle source: verified exact-candidate GCS cache"
+              echo "- Cache lookup and verification: $(( $(date +%s) - cache_started ))s"
+              echo "- Original build and package duration avoided: ${duration}s"
+            else
+              echo "- Bundle source: ephemeral n2-standard-32 builder"
+              echo "- Build and package duration: ${duration}s"
+            fi
+            echo "- Builder retained after this step: no"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create every ephemeral release worker concurrently
+        env:
+          CANDIDATE: ${{ needs.plan.outputs.candidate_sha }}
+          CACHE_BUCKET: ${{ vars.RVOIP_GCP_CACHE_BUCKET }}
+          PROJECT: ${{ vars.RVOIP_GCP_PROJECT_ID }}
+          ZONE: ${{ vars.RVOIP_GCP_ZONE }}
+          NETWORK: ${{ vars.RVOIP_GCP_NETWORK }}
+          SUBNET: ${{ vars.RVOIP_GCP_SUBNET }}
+          BUCKET: ${{ vars.RVOIP_GCP_EVIDENCE_BUCKET }}
+          RUNNER_SERVICE_ACCOUNT: ${{ vars.RVOIP_GCP_RUNNER_SERVICE_ACCOUNT }}
+          PREBUILT_URI: ${{ steps.prebuild.outputs.bundle_uri }}
+          PREBUILT_SHA256: ${{ steps.prebuild.outputs.bundle_sha256 }}
+          EXTERNAL_MEMORY_DIAGNOSTICS: ${{ inputs.profile == 'remote-diagnostic' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/gcp-controller/create-logs
+          pids=()
+          while IFS= read -r descriptor; do
+            shard_id="$(jq -r .id <<< "$descriptor")"
+            worker="$(jq -r .name <<< "$descriptor")"
+            prefix="$(jq -r .prefix <<< "$descriptor")"
+            resource_class="$(jq -r .resource_class <<< "$descriptor")"
+            machine_type="$(jq -r .machine_type <<< "$descriptor")"
+            disk_type="$(jq -r .disk_type <<< "$descriptor")"
+            disk_size_gb="$(jq -r .disk_size_gb <<< "$descriptor")"
+            gates_b64="$(jq -r .gates_b64 <<< "$descriptor")"
+            environment_b64="$(jq -r .environment_b64 <<< "$descriptor")"
+            (
+              gcloud compute instances create "$worker" \
+                --project "$PROJECT" \
+                --zone "$ZONE" \
+                --machine-type "$machine_type" \
+                --min-cpu-platform "$MIN_CPU_PLATFORM" \
+                --network "$NETWORK" \
+                --subnet "$SUBNET" \
+                --image-family ubuntu-2404-lts-amd64 \
+                --image-project ubuntu-os-cloud \
+                --boot-disk-type "$disk_type" \
+                --boot-disk-size "${disk_size_gb}GB" \
+                --boot-disk-auto-delete \
+                --service-account "$RUNNER_SERVICE_ACCOUNT" \
+                --scopes cloud-platform \
+                --shielded-secure-boot \
+                --shielded-vtpm \
+                --shielded-integrity-monitoring \
+                --labels rvoip-role=release-gate,managed-by=github-actions \
+                --metadata "rvoip-candidate=${CANDIDATE},rvoip-run-id=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT},rvoip-shard-id=${shard_id},rvoip-resource-class=${resource_class},rvoip-evidence-bucket=${BUCKET},rvoip-cache-bucket=${CACHE_BUCKET},rvoip-prefix=${prefix},rvoip-gates-b64=${gates_b64},rvoip-environment-b64=${environment_b64},rvoip-prebuilt-uri=${PREBUILT_URI},rvoip-prebuilt-sha256=${PREBUILT_SHA256},rvoip-external-memory-diagnostics=${EXTERNAL_MEMORY_DIAGNOSTICS}" \
+                --metadata-from-file startup-script=infra/release-runners/gcp-release-startup.sh
+            ) > "target/gcp-controller/create-logs/${shard_id}.log" 2>&1 &
+            pids+=("$!")
+          done < <(jq -c '.workers[]' target/gcp-controller/workers.json)
+
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          if (( status != 0 )); then
+            tail -n 100 target/gcp-controller/create-logs/*.log
+            exit "$status"
+          fi
+
+      - name: Wait for every immutable worker result
+        env:
+          PROJECT: ${{ vars.RVOIP_GCP_PROJECT_ID }}
+          ZONE: ${{ vars.RVOIP_GCP_ZONE }}
+          BUCKET: ${{ vars.RVOIP_GCP_EVIDENCE_BUCKET }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/gcp-controller/downloads
+          expected="$(jq -r .worker_count target/gcp-controller/workers.json)"
+          object_root="gs://${BUCKET}/release/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          run_prefix="rvoip-rel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"
+          for attempt in $(seq 1 340); do
+            gcloud storage ls --recursive "${object_root}/" \
+              > target/gcp-controller/objects.txt 2>/dev/null || true
+            gcloud compute instances list \
+              --project "$PROJECT" \
+              --filter="name~'^${run_prefix}'" \
+              --format='csv[no-heading](name,status)' \
+              > target/gcp-controller/states.csv
+            completed=0
+            terminated_without_result=()
+            while IFS= read -r descriptor; do
+              shard_id="$(jq -r .id <<< "$descriptor")"
+              worker="$(jq -r .name <<< "$descriptor")"
+              prefix="$(jq -r .prefix <<< "$descriptor")"
+              directory="target/gcp-controller/downloads/${shard_id}"
+              result_uri="gs://${BUCKET}/${prefix}/result.json"
+              mkdir -p "$directory"
+              if [[ ! -f "${directory}/result.json" ]] \
+                && grep -Fqx "$result_uri" target/gcp-controller/objects.txt; then
+                gcloud storage cp "$result_uri" "${directory}/result.json"
+              fi
+              if [[ -f "${directory}/result.json" ]]; then
+                completed=$((completed + 1))
+                continue
+              fi
+              state="$(awk -F, -v worker="$worker" '$1 == worker { print $2 }' target/gcp-controller/states.csv)"
+              if [[ "$state" == TERMINATED ]]; then
+                # The result upload and instance-state update can cross between
+                # the two bulk polls. Check the exact object once more before
+                # treating a stopped worker as an evidence failure.
+                if gcloud storage cp "$result_uri" "${directory}/result.json" 2>/dev/null; then
+                  completed=$((completed + 1))
+                  continue
+                fi
+                terminated_without_result+=("$worker")
+              fi
+            done < <(jq -c '.workers[]' target/gcp-controller/workers.json)
+
+            # A candidate that has already failed the bounded performance,
+            # burst, or proxy lane cannot become releasable by finishing an
+            # hour-long soak.  Preserve all early results, then stop only the
+            # still-running deferred workers so fixes can be verified without
+            # waiting for proof that can no longer qualify this candidate.
+            cutoff_json="$(python3 scripts/release/gcp_fanout.py \
+              early-failure-decision \
+              --manifest target/gcp-controller/workers.json \
+              --downloads target/gcp-controller/downloads \
+              --states target/gcp-controller/states.csv)"
+            while IFS= read -r failed_shard; do
+              announcement="target/gcp-controller/downloads/${failed_shard}/failure-announced"
+              if [[ ! -f "$announcement" ]]; then
+                echo "::error title=GCP release gate failed::${failed_shard} reported or produced invalid failure evidence"
+                touch "$announcement"
+              fi
+            done < <(jq -r '.failed_shards[]' <<< "$cutoff_json")
+            mapfile -t deferred_running \
+              < <(jq -r '.deferred_running[]' <<< "$cutoff_json")
+            if [[ "$(jq -r .should_stop <<< "$cutoff_json")" == true \
+              && ! -f target/gcp-controller/early-failure-cutoff.txt ]]; then
+              early_expected="$(jq -r .early_expected <<< "$cutoff_json")"
+              early_settled="$(jq -r .early_settled <<< "$cutoff_json")"
+              observed_failures="$(jq '.failed_shards | length' <<< "$cutoff_json")"
+              printf '%s\n' "${deferred_running[@]}" \
+                > target/gcp-controller/early-failure-cutoff.txt
+              echo "::error title=Release candidate rejected early::Stopping ${#deferred_running[@]} deferred GCP workers after the bounded lane failed"
+              {
+                echo
+                echo "### Early failure cutoff"
+                echo
+                echo "- Bounded GCP workers settled: ${early_settled}/${early_expected}"
+                echo "- Observed failures: ${observed_failures}"
+                echo "- Deferred workers stopped: ${#deferred_running[@]}"
+                echo "- Completed evidence remains reusable when its exact digests match."
+              } >> "$GITHUB_STEP_SUMMARY"
+              gcloud compute instances stop "${deferred_running[@]}" \
+                --project "$PROJECT" --zone "$ZONE" --quiet || true
+            fi
+            settled=$((completed + ${#terminated_without_result[@]}))
+            if (( settled == expected )); then
+              if (( ${#terminated_without_result[@]} != 0 )); then
+                printf '%s\n' "${terminated_without_result[@]}" \
+                  > target/gcp-controller/terminated-without-result.txt
+                echo "GCP workers terminated without immutable results: ${terminated_without_result[*]}" >&2
+              fi
+              exit 0
+            fi
+            echo "GCP release evidence: ${completed} complete, ${#terminated_without_result[@]} failed without a result, ${expected} total (poll ${attempt}/340)"
+            sleep 30
+          done
+          echo "GCP release fanout exceeded its 170-minute evidence deadline" >&2
+          exit 1
+
+      - name: Download and verify every shard evidence bundle
+        if: always()
+        env:
+          BUCKET: ${{ vars.RVOIP_GCP_EVIDENCE_BUCKET }}
+        run: |
+          set -euo pipefail
+          pids=()
+          while IFS= read -r descriptor; do
+            shard_id="$(jq -r .id <<< "$descriptor")"
+            prefix="$(jq -r .prefix <<< "$descriptor")"
+            directory="target/gcp-controller/downloads/${shard_id}"
+            (
+              mkdir -p "$directory"
+              if [[ ! -f "${directory}/result.json" ]]; then
+                gcloud storage cp \
+                  "gs://${BUCKET}/${prefix}/result.json" \
+                  "${directory}/result.json" || true
+              fi
+              if [[ -f "${directory}/result.json" ]]; then
+                gcloud storage cp \
+                  "gs://${BUCKET}/${prefix}/release-shard.tar.gz" \
+                  "${directory}/release-shard.tar.gz"
+                gcloud storage cp \
+                  "gs://${BUCKET}/${prefix}/qualification.log" \
+                  "${directory}/qualification.log" || true
+              fi
+            ) > "target/gcp-controller/download-${shard_id}.log" 2>&1 &
+            pids+=("$!")
+          done < <(jq -c '.workers[]' target/gcp-controller/workers.json)
+
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          if (( status != 0 )); then
+            tail -n 100 target/gcp-controller/download-*.log
+          fi
+          python3 scripts/release/gcp_fanout.py verify \
+            --manifest target/gcp-controller/workers.json \
+            --downloads target/gcp-controller/downloads \
+            --output target/release-shard
+
+      - name: Delete all workers and attached disks
+        if: always()
+        env:
+          PROJECT: ${{ vars.RVOIP_GCP_PROJECT_ID }}
+          ZONE: ${{ vars.RVOIP_GCP_ZONE }}
+        run: |
+          set -euo pipefail
+          run_prefix="rvoip-rel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"
+          mapfile -t workers < <(
+            gcloud compute instances list \
+              --project "$PROJECT" \
+              --filter="labels.managed-by=github-actions AND name~'^${run_prefix}'" \
+              --format='value(name)'
+          )
+          if (( ${#workers[@]} != 0 )); then
+            gcloud compute instances delete "${workers[@]}" \
+              --project "$PROJECT" \
+              --zone "$ZONE" \
+              --quiet
+          fi
+
+      - name: Upload merged GCP shard evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-gate-shard-gcp-controller
+          path: target/release-shard/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload GCP controller diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-gcp-controller-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/gcp-controller/
+          retention-days: 30
+          if-no-files-found: warn
+
+  cleanup-gcp:
+    name: Delete every ephemeral release worker
+    if: always() && needs.plan.outputs.gcp_shard_count != '0'
+    needs: [plan, gate-gcp]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.RVOIP_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.RVOIP_GCP_PROVISIONER_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+      - name: Sweep workers left by interrupted controllers
+        env:
+          PROJECT: ${{ vars.RVOIP_GCP_PROJECT_ID }}
+          RUN_PREFIX: rvoip-rel-${{ github.run_id }}-${{ github.run_attempt }}-
+        run: |
+          set -euo pipefail
+          instances="$(gcloud compute instances list --project "$PROJECT" --filter="labels.managed-by=github-actions AND name~'^${RUN_PREFIX}'" --format='csv[no-heading](name,zone.basename())' || true)"
+          while IFS=, read -r worker zone; do
+            test -n "$worker" || continue
+            gcloud compute instances delete "$worker" --project "$PROJECT" --zone "$zone" --quiet
+          done <<< "$instances"
+          remaining="$(gcloud compute instances list --project "$PROJECT" --filter="labels.managed-by=github-actions AND name~'^${RUN_PREFIX}'" --format='value(name)')"
+          test -z "$remaining"
+
+  collect:
+    name: Release Gate
+    if: always()
+    needs: [plan, gate-hosted, gate-gcp, cleanup-gcp]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.plan.outputs.candidate_sha }}
+
+      - name: Download qualification plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-gate-plan
+          path: target/release-plan
+
+      - name: Download fresh gate evidence
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-gate-shard-*
+          path: target/release-evidence
+          merge-multiple: true
+
+      - name: Reconcile exact-candidate qualification
+        run: >-
+          python3 scripts/release/gates.py collect
+          --plan target/release-plan/plan.json
+          --evidence target/release-evidence
+          --output target/release-qualification/aggregate.json
+
+      - name: Attest release qualification bundle
+        if: inputs.profile != 'remote-diagnostic'
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: target/release-qualification/aggregate.json
+
+      - name: Upload reusable release evidence
+        if: always() && inputs.profile != 'remote-diagnostic'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-gate-evidence
+          path: |
+            target/release-plan/plan.json
+            target/release-evidence/
+            target/release-qualification/aggregate.json
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload non-reusable diagnostic evidence
+        if: always() && inputs.profile == 'remote-diagnostic'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostic-gate-evidence
+          path: |
+            target/release-plan/plan.json
+            target/release-evidence/
+            target/release-qualification/aggregate.json
+          retention-days: 30
+          if-no-files-found: warn

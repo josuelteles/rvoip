@@ -7,6 +7,6 @@
 
 tool cargo-public-api 0.52.0
 rustdoc rustc 1.97.0-nightly (e22c616e4 2026-04-19)
-default-git-blob f8aea83bf2ad974750e3a90a938bf7a3c350ac7e
+default-git-blob 645d5b5f19c4c773d56e837346675b36ecc07c61
 docs-features generated-validation,dev-insecure-tls
-docs-git-blob e3958a492fc83a71ea5142c8e8f85c80d55e04ca
+docs-git-blob 77d6d1192c91ea8d80d043a709cc50c50323e331

@@ -48,6 +48,26 @@ const CONTACT_USER: &str = "current-target";
 
 /// Per-BYE capture: application extra, auth, and exact request-line target.
 type ByeCapture = (bool, Option<String>, bool, String, Option<String>);
+type LegacyByeCapture = (bool, String, Option<String>);
+
+fn attach_pcmu_sdp_answer(response: &mut Response, media_port: u16) {
+    response.body = format!(
+        "v=0\r\no=bye-auth 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {media_port} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+    )
+    .into_bytes()
+    .into();
+    response
+        .headers
+        .retain(|header| !matches!(header, TypedHeader::ContentLength(_)));
+    response
+        .headers
+        .push(TypedHeader::ContentLength(ContentLength::new(
+            response.body.len() as u32,
+        )));
+    response
+        .headers
+        .push(TypedHeader::ContentType(ContentType::sdp()));
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bye_extras_survive_401_driven_auth_retry() {
@@ -101,6 +121,7 @@ async fn bye_extras_survive_401_driven_auth_retry() {
                             format!("<sip:{CONTACT_USER}@127.0.0.1:{UAS_PORT}>").into_bytes(),
                         ),
                     ));
+                    attach_pcmu_sdp_answer(&mut resp, UAS_PORT + 1_000);
                     let bytes = Message::Response(resp).to_bytes();
                     let _ = sock_task.send_to(&bytes, from).await;
                 }
@@ -276,8 +297,7 @@ async fn bye_extras_survive_401_driven_auth_retry() {
 async fn legacy_hangup_retries_bye_after_401_from_terminating() {
     let uas_addr = format!("127.0.0.1:{LEGACY_UAS_PORT}");
     let sock = Arc::new(UdpSocket::bind(&uas_addr).await.expect("legacy UAS bind"));
-    let captures: Arc<Mutex<Vec<(bool, String, Option<String>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let captures: Arc<Mutex<Vec<LegacyByeCapture>>> = Arc::new(Mutex::new(Vec::new()));
 
     let sock_task = Arc::clone(&sock);
     let captures_task = Arc::clone(&captures);
@@ -309,6 +329,7 @@ async fn legacy_hangup_retries_bye_after_401_from_terminating() {
                             format!("<sip:legacy-target@127.0.0.1:{LEGACY_UAS_PORT}>").into_bytes(),
                         ),
                     ));
+                    attach_pcmu_sdp_answer(&mut response, LEGACY_UAS_PORT + 1_000);
                     let _ = sock_task
                         .send_to(&Message::Response(response).to_bytes(), from)
                         .await;

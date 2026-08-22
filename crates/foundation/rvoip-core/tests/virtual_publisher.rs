@@ -24,6 +24,7 @@ fn opus() -> CodecInfo {
         clock_rate_hz: 48_000,
         channels: 1,
         fmtp: None,
+        payload_type: None,
     }
 }
 
@@ -34,6 +35,7 @@ fn g711(name: &str) -> CodecInfo {
         clock_rate_hz: 8_000,
         channels: 1,
         fmtp: None,
+        payload_type: None,
     }
 }
 

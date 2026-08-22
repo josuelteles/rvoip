@@ -1,6 +1,6 @@
 //! # Audio Codec Implementations
 //!
-//! This module contains G.711 audio codec implementation for VoIP applications.
+//! This module contains G.711 audio codec implementation for `VoIP` applications.
 //!
 //! ## Available Codecs
 //!
@@ -23,6 +23,8 @@
 //!
 //! ### Using the Codec Factory
 //! ```rust
+//! # #[cfg(feature = "g711")]
+//! # {
 //! use codec_core::codecs::CodecFactory;
 //! use codec_core::types::{CodecConfig, CodecType, SampleRate};
 //!
@@ -35,16 +37,20 @@
 //! let samples = vec![0i16; 160];
 //! let encoded = codec.encode(&samples)?;
 //! let decoded = codec.decode(&encoded)?;
+//! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! ### Direct Codec Access
 //! ```rust
+//! # #[cfg(feature = "g711")]
+//! # {
 //! use codec_core::codecs::g711::{G711Codec, G711Variant};
 //!
 //! // Direct instantiation
 //! let mut g711_ulaw = G711Codec::new(G711Variant::MuLaw);
 //! let mut g711_alaw = G711Codec::new(G711Variant::ALaw);
+//! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -78,14 +84,29 @@ pub mod g722;
 #[cfg(feature = "g729")]
 pub mod g729;
 
-#[cfg(any(feature = "opus", feature = "opus-sim"))]
+#[cfg(feature = "opus")]
 pub mod opus;
+
+#[cfg(any(feature = "amr-nb", feature = "amr-wb"))]
+pub mod amr;
 
 /// Codec factory for creating codec instances
 pub struct CodecFactory;
 
 impl CodecFactory {
     /// Create a codec instance from configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid, the codec feature
+    /// is disabled, or codec construction fails.
+    // Preserve the public by-value constructor in a build where every codec
+    // branch is compiled out; feature-enabled branches transfer ownership to
+    // their concrete codec constructors.
+    #[cfg_attr(
+        not(any(feature = "g711", feature = "g729", feature = "opus")),
+        allow(clippy::needless_pass_by_value)
+    )]
     pub fn create(config: CodecConfig) -> Result<Box<dyn AudioCodec>> {
         // Validate configuration first
         config.validate()?;
@@ -115,20 +136,36 @@ impl CodecFactory {
                 Ok(Box::new(codec))
             }
 
-            #[cfg(any(feature = "opus", feature = "opus-sim"))]
+            #[cfg(feature = "opus")]
             CodecType::Opus => {
                 let codec = opus::OpusCodec::new(config)?;
                 Ok(Box::new(codec))
             }
 
+            #[cfg(feature = "amr-nb")]
+            CodecType::AmrNb => {
+                let codec = amr::AmrCodec::new(&config)?;
+                Ok(Box::new(codec))
+            }
+
+            #[cfg(feature = "amr-wb")]
+            CodecType::AmrWb => {
+                let codec = amr::AmrCodec::new(&config)?;
+                Ok(Box::new(codec))
+            }
+
             codec_type => Err(CodecError::feature_not_enabled(format!(
-                "Codec {} not enabled in build features",
-                codec_type.name()
+                "Codec {codec_type} not enabled in build features"
             ))),
         }
     }
 
     /// Create a codec by name
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `name` is unknown, its feature is disabled, or
+    /// the configuration is invalid.
     pub fn create_by_name(name: &str, config: CodecConfig) -> Result<Box<dyn AudioCodec>> {
         let codec_type = match normalize_codec_name(name).as_str() {
             "PCMU" => CodecType::G711Pcmu,
@@ -138,6 +175,8 @@ impl CodecFactory {
             "G729A" => CodecType::G729A,
             "G729AB" | "G729BA" => CodecType::G729BA,
             "OPUS" => CodecType::Opus,
+            "AMR" => CodecType::AmrNb,
+            "AMR-WB" | "AMRWB" => CodecType::AmrWb,
             _ => return Err(CodecError::unsupported_codec(name)),
         };
 
@@ -150,6 +189,11 @@ impl CodecFactory {
     }
 
     /// Create a codec by RTP payload type
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload type is unknown, its codec feature is
+    /// disabled, or the configuration is invalid.
     pub fn create_by_payload_type(
         payload_type: u8,
         config: CodecConfig,
@@ -160,7 +204,7 @@ impl CodecFactory {
             9 => CodecType::G722,
             18 => CodecType::G729,
 
-            _ => return Err(CodecError::unsupported_codec(format!("PT{}", payload_type))),
+            _ => return Err(CodecError::unsupported_codec(format!("PT{payload_type}"))),
         };
 
         let config = CodecConfig {
@@ -172,6 +216,7 @@ impl CodecFactory {
     }
 
     /// Get all supported codec names
+    #[must_use]
     pub fn supported_codecs() -> Vec<&'static str> {
         vec![
             #[cfg(feature = "g711")]
@@ -186,12 +231,17 @@ impl CodecFactory {
             "G729A",
             #[cfg(feature = "g729")]
             "G729BA",
-            #[cfg(any(feature = "opus", feature = "opus-sim"))]
+            #[cfg(feature = "opus")]
             "OPUS",
+            #[cfg(feature = "amr-nb")]
+            "AMR",
+            #[cfg(feature = "amr-wb")]
+            "AMR-WB",
         ]
     }
 
     /// Check if a codec is supported
+    #[must_use]
     pub fn is_supported(name: &str) -> bool {
         let normalized = normalize_codec_name(name);
         match normalized.as_str() {
@@ -201,8 +251,12 @@ impl CodecFactory {
             "G722" => true,
             #[cfg(feature = "g729")]
             "G729" | "G729A" | "G729AB" | "G729BA" => true,
-            #[cfg(any(feature = "opus", feature = "opus-sim"))]
+            #[cfg(feature = "opus")]
             "OPUS" => true,
+            #[cfg(feature = "amr-nb")]
+            "AMR" => true,
+            #[cfg(feature = "amr-wb")]
+            "AMR-WB" | "AMRWB" => true,
             _ => false,
         }
     }
@@ -219,6 +273,7 @@ pub struct CodecRegistry {
 
 impl CodecRegistry {
     /// Create a new empty registry
+    #[must_use]
     pub fn new() -> Self {
         Self {
             codecs: HashMap::new(),
@@ -231,8 +286,9 @@ impl CodecRegistry {
     }
 
     /// Get a codec by name
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn AudioCodec> {
-        self.codecs.get(name).map(|codec| codec.as_ref())
+        self.codecs.get(name).map(std::convert::AsRef::as_ref)
     }
 
     /// Get a mutable codec by name
@@ -246,16 +302,19 @@ impl CodecRegistry {
     }
 
     /// List all registered codec names
+    #[must_use]
     pub fn list_codecs(&self) -> Vec<&String> {
         self.codecs.keys().collect()
     }
 
     /// Get the count of registered codecs
+    #[must_use]
     pub fn len(&self) -> usize {
         self.codecs.len()
     }
 
     /// Check if the registry is empty
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.codecs.is_empty()
     }
@@ -281,10 +340,58 @@ pub struct CodecCapabilities {
     pub codec_info: HashMap<CodecType, CodecInfo>,
 }
 
+/// Register the AMR variants enabled by feature flags.
+///
+/// Split out of [`CodecCapabilities::get_all`] to keep that function within the
+/// workspace line limit as codecs accumulate.
+// Both parameters go unused in a build with neither AMR feature enabled.
+#[allow(unused_variables)]
+fn add_amr_capabilities(
+    codec_types: &mut Vec<CodecType>,
+    codec_info: &mut HashMap<CodecType, CodecInfo>,
+) {
+    #[cfg(feature = "amr-nb")]
+    {
+        codec_types.push(CodecType::AmrNb);
+        codec_info.insert(
+            CodecType::AmrNb,
+            CodecInfo {
+                name: "AMR",
+                sample_rate: 8000,
+                channels: 1,
+                bitrate: CodecType::AmrNb.default_bitrate(),
+                frame_size: 160,
+                payload_type: None,
+            },
+        );
+    }
+
+    #[cfg(feature = "amr-wb")]
+    {
+        codec_types.push(CodecType::AmrWb);
+        codec_info.insert(
+            CodecType::AmrWb,
+            CodecInfo {
+                name: "AMR-WB",
+                sample_rate: 16000,
+                channels: 1,
+                bitrate: CodecType::AmrWb.default_bitrate(),
+                frame_size: 320,
+                payload_type: None,
+            },
+        );
+    }
+}
+
 impl CodecCapabilities {
     /// Get capabilities for all supported codecs
+    #[must_use]
     pub fn get_all() -> Self {
+        // Both values are populated by feature-gated blocks. In a deliberately
+        // codec-free build they remain empty and therefore need no mutation.
+        #[allow(unused_mut)]
         let mut codec_types = Vec::new();
+        #[allow(unused_mut)]
         let mut codec_info = HashMap::new();
 
         #[cfg(feature = "g711")]
@@ -317,7 +424,7 @@ impl CodecCapabilities {
             );
         }
 
-        #[cfg(any(feature = "opus", feature = "opus-sim"))]
+        #[cfg(feature = "opus")]
         {
             codec_types.push(CodecType::Opus);
             codec_info.insert(
@@ -332,6 +439,8 @@ impl CodecCapabilities {
                 },
             );
         }
+
+        add_amr_capabilities(&mut codec_types, &mut codec_info);
 
         #[cfg(feature = "g729")]
         {
@@ -381,11 +490,13 @@ impl CodecCapabilities {
     }
 
     /// Check if a codec type is supported
+    #[must_use]
     pub fn is_supported(&self, codec_type: CodecType) -> bool {
         self.codec_types.contains(&codec_type)
     }
 
     /// Get information for a specific codec type
+    #[must_use]
     pub fn get_info(&self, codec_type: CodecType) -> Option<&CodecInfo> {
         self.codec_info.get(&codec_type)
     }
@@ -398,7 +509,12 @@ mod tests {
     #[test]
     fn test_codec_factory_supported_codecs() {
         let supported = CodecFactory::supported_codecs();
+
+        #[cfg(any(feature = "g711", feature = "g729", feature = "opus"))]
         assert!(!supported.is_empty());
+
+        #[cfg(not(any(feature = "g711", feature = "g729", feature = "opus")))]
+        assert!(supported.is_empty());
 
         #[cfg(feature = "g711")]
         {
@@ -417,6 +533,16 @@ mod tests {
         }
 
         assert!(!CodecFactory::is_supported("UNSUPPORTED"));
+        assert!(!CodecFactory::is_supported("G722"));
+
+        #[cfg(feature = "opus")]
+        for name in ["opus", "Opus", "OPUS"] {
+            assert!(CodecFactory::is_supported(name));
+        }
+        #[cfg(not(feature = "opus"))]
+        for name in ["opus", "Opus", "OPUS"] {
+            assert!(!CodecFactory::is_supported(name));
+        }
     }
 
     #[test]
@@ -443,8 +569,18 @@ mod tests {
     #[test]
     fn test_codec_capabilities() {
         let caps = CodecCapabilities::get_all();
-        assert!(!caps.codec_types.is_empty());
-        assert!(!caps.codec_info.is_empty());
+
+        #[cfg(any(feature = "g711", feature = "g729", feature = "opus"))]
+        {
+            assert!(!caps.codec_types.is_empty());
+            assert!(!caps.codec_info.is_empty());
+        }
+
+        #[cfg(not(any(feature = "g711", feature = "g729", feature = "opus")))]
+        {
+            assert!(caps.codec_types.is_empty());
+            assert!(caps.codec_info.is_empty());
+        }
 
         #[cfg(feature = "g711")]
         {

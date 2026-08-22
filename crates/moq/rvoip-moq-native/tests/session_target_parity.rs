@@ -8,20 +8,12 @@ use moq_native_ietf::{quic, tls};
 use moq_transport::session::{Session, SessionTarget, Transport};
 use tokio::time::timeout;
 
-mod common;
+mod support;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn test_tls() -> anyhow::Result<tls::Config> {
-    let identity = common::localhost_server_identity()?;
-    tls::Args {
-        cert: vec![identity.cert],
-        key: vec![identity.key],
-        root: Vec::new(),
-        disable_verify: true,
-        ..Default::default()
-    }
-    .load()
+    support::localhost_server_tls(tls::ClientAuthMode::Disabled, &[])
 }
 
 async fn assert_target_parity(policy: quic::SubstratePolicy) -> anyhow::Result<Transport> {

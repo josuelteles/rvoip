@@ -137,36 +137,13 @@ impl SdesClient {
     }
 
     /// Create SDES client from security config
-    pub fn from_security_config(config: &SecurityConfig) -> Self {
+    pub fn from_security_config(config: &SecurityConfig) -> Result<Self, SecurityError> {
         let client_config = SdesClientConfig {
             supported_profiles: config.srtp_profiles.clone(),
             strict_validation: config.required,
             max_crypto_attributes: 8,
         };
-        Self::new(client_config)
-    }
-
-    /// Convert API SRTP profiles to core crypto suites
-    fn convert_srtp_profiles(profiles: &[SrtpProfile]) -> Vec<SrtpCryptoSuite> {
-        profiles
-            .iter()
-            .filter_map(|profile| {
-                match profile {
-                    SrtpProfile::AesCm128HmacSha1_80 => Some(SRTP_AES128_CM_SHA1_80),
-                    SrtpProfile::AesCm128HmacSha1_32 => Some(SRTP_AES128_CM_SHA1_32),
-                    SrtpProfile::AesGcm128 => {
-                        // AES-GCM not implemented in core yet
-                        debug!("AES-GCM profile not yet supported, skipping");
-                        None
-                    }
-                    SrtpProfile::AesGcm256 => {
-                        // AES-GCM not implemented in core yet
-                        debug!("AES-GCM-256 profile not yet supported, skipping");
-                        None
-                    }
-                }
-            })
-            .collect()
+        Ok(Self::new(client_config))
     }
 
     /// Get current state
@@ -328,7 +305,9 @@ impl SdesClient {
             ));
         }
 
-        let suites = Self::convert_srtp_profiles(&self.config.supported_profiles);
+        let suites = crate::api::common::config::implemented_srtp_suites(
+            &self.config.supported_profiles,
+        )?;
         let (_offerer, attrs) = SdesNegotiator::new_offerer(&suites).map_err(|e| {
             SecurityError::CryptoError(format!("SDES offer generation failed: {e}"))
         })?;
@@ -349,12 +328,18 @@ impl SdesClient {
     }
 }
 
-/// SRTP-only client security context (no DTLS handshake)
-/// This implementation uses pre-shared keys negotiated through SIP/SDP
+/// Configuration-only companion for a pre-shared-key SRTP client.
+///
+/// This type validates and describes key material but does not own or install
+/// the [`crate::srtp::SrtpContext`] that protects media. The default media
+/// transport installs that crypto context separately; a standalone instance
+/// therefore reports [`ClientSecurityContext::is_secure`] as `false`.
 #[allow(dead_code)] // retained (liveness/Drop hold or reserved); not read
 pub struct SrtpClientSecurityContext {
     /// Configuration
     config: ClientSecurityConfig,
+    /// Names derived only after the complete profile list validates.
+    advertised_profiles: Vec<String>,
     /// SDES client for key management
     #[allow(dead_code)] // retained (liveness/Drop hold or reserved); not read
     sdes_client: Arc<SdesClient>,
@@ -369,6 +354,11 @@ pub struct SrtpClientSecurityContext {
 impl SrtpClientSecurityContext {
     /// Create a new SRTP-only client security context
     pub async fn new(config: ClientSecurityConfig) -> Result<Arc<Self>, SecurityError> {
+        config.validate()?;
+
+        let advertised_profiles =
+            crate::api::common::config::implemented_srtp_profile_names(&config.srtp_profiles)?;
+
         // Create SDES client config from security config
         let sdes_config = SdesClientConfig {
             supported_profiles: config.srtp_profiles.clone(),
@@ -380,6 +370,7 @@ impl SrtpClientSecurityContext {
 
         let ctx = Self {
             config,
+            advertised_profiles,
             sdes_client,
             remote_addr: Arc::new(RwLock::new(None)),
             socket: Arc::new(RwLock::new(None)),
@@ -470,26 +461,18 @@ impl ClientSecurityContext for SrtpClientSecurityContext {
     }
 
     async fn get_security_info(&self) -> Result<SecurityInfo, SecurityError> {
-        let crypto_suites = self
-            .config
-            .srtp_profiles
-            .iter()
-            .map(|p| match p {
-                SrtpProfile::AesCm128HmacSha1_80 => "AES_CM_128_HMAC_SHA1_80",
-                SrtpProfile::AesCm128HmacSha1_32 => "AES_CM_128_HMAC_SHA1_32",
-                SrtpProfile::AesGcm128 => "AEAD_AES_128_GCM",
-                SrtpProfile::AesGcm256 => "AEAD_AES_256_GCM",
-            })
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
+        let crypto_suites = self.advertised_profiles.clone();
+        let srtp_profile = crypto_suites.first().cloned();
 
         Ok(SecurityInfo {
             mode: SecurityMode::Srtp,
             fingerprint: None, // No fingerprint for pre-shared keys
             fingerprint_algorithm: None,
             crypto_suites,
-            key_params: Some("Pre-shared key (from SIP/SDP)".to_string()),
-            srtp_profile: Some("AES_CM_128_HMAC_SHA1_80".to_string()),
+            key_params: Some(
+                "Configured pre-shared key; media crypto not installed here".to_string(),
+            ),
+            srtp_profile,
         })
     }
 
@@ -501,17 +484,21 @@ impl ClientSecurityContext for SrtpClientSecurityContext {
     }
 
     fn is_secure(&self) -> bool {
-        true // Pre-shared key SRTP is secure
+        false
     }
 
     fn get_security_info_sync(&self) -> SecurityInfo {
+        let crypto_suites = self.advertised_profiles.clone();
+        let srtp_profile = crypto_suites.first().cloned();
         SecurityInfo {
             mode: SecurityMode::Srtp,
             fingerprint: None,
             fingerprint_algorithm: None,
-            crypto_suites: vec!["AES_CM_128_HMAC_SHA1_80".to_string()],
-            key_params: Some("Pre-shared key (from SIP/SDP)".to_string()),
-            srtp_profile: Some("AES_CM_128_HMAC_SHA1_80".to_string()),
+            crypto_suites,
+            key_params: Some(
+                "Configured pre-shared key; media crypto not installed here".to_string(),
+            ),
+            srtp_profile,
         }
     }
 

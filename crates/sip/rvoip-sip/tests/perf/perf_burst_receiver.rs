@@ -26,13 +26,15 @@ use support::burst::{
     BURST_ALICE_MEDIA_START, BURST_BOB_MEDIA_END, BURST_BOB_MEDIA_START,
 };
 use support::soak::{
-    admission_diagnostics, burst_retention_drain_wait, diagnostic_artifact_path,
-    diagnostic_sample_path, endpoint_metric, endpoint_retention_summary,
-    in_process_resource_sampler_enabled, media_receive_diagnostics, media_setup_raw_diagnostics,
-    media_setup_timing_diagnostics, memory_diagnostic_interval, memory_diagnostic_summary,
-    read_required_u16_env, resource_sampling_diagnostics, round2, sip_dialog_raw_diagnostics,
-    sip_dialog_timing_diagnostics, sip_udp_diagnostics, DhatProfile, EndpointRetentionSampler,
-    MemoryDiagnosticSampler, RssGrowthGate, MIN_RETENTION_DRAIN_WAIT_SECS,
+    admission_diagnostics, burst_retention_drain_wait, burst_retention_periodic_limit,
+    capture_endpoint_retention_sample, diagnostic_artifact_path, diagnostic_sample_path,
+    endpoint_metric, endpoint_retention_summary, in_process_resource_sampler_enabled,
+    media_receive_diagnostics, media_setup_raw_diagnostics, media_setup_timing_diagnostics,
+    memory_diagnostic_interval, memory_diagnostic_summary, read_required_u16_env,
+    resource_sampling_diagnostics, round2, rss_window_meets_minimum, sample_settled_rss_window,
+    sip_dialog_raw_diagnostics, sip_dialog_timing_diagnostics, sip_udp_diagnostics,
+    wait_for_burst_rss_quiescence, BurstRssQuiescence, DhatProfile, EndpointRetentionSampler,
+    MemoryDiagnosticSampler, RssGrowthGate,
 };
 use support::{
     CallSetupDiagnostics, LoadProfile, ResourceSampler, ResourceSummary, ScenarioReport,
@@ -132,6 +134,10 @@ async fn perf_burst_receiver() {
         BURST_ALICE_MEDIA_END,
     );
     let rss_gate = RssGrowthGate::resolve(&caller_cfg, &receiver_cfg);
+    let rss_limit = scenario
+        .acceptance
+        .max_rss_growth_mb_per_hr
+        .unwrap_or(rss_gate.effective_mb_per_hr);
     let retention_drain_wait = burst_retention_drain_wait();
 
     let received_frames = Arc::new(AtomicU64::new(0));
@@ -159,10 +165,15 @@ async fn perf_burst_receiver() {
     } else {
         None
     };
-    let retention_sampler = EndpointRetentionSampler::start(
+    let maximum_hold = max_hold(&scenario);
+    let retention_sampler = EndpointRetentionSampler::start_with_periodic_limit(
         "burst_receiver",
         receiver.coordinator.clone(),
         support::soak::RETENTION_DIAGNOSTIC_SAMPLE_INTERVAL,
+        Some(burst_retention_periodic_limit(
+            scenario.duration_secs(),
+            maximum_hold,
+        )),
     );
     let memory_sampler = MemoryDiagnosticSampler::start(
         "burst_receiver",
@@ -173,7 +184,7 @@ async fn perf_burst_receiver() {
 
     let started = std::time::Instant::now();
     let max_wait = Duration::from_secs(scenario.duration_secs())
-        + max_hold(&scenario)
+        + maximum_hold
         + retention_drain_wait
         + Duration::from_secs(300);
     let mut stop_seen = false;
@@ -189,17 +200,12 @@ async fn perf_burst_receiver() {
     }
     let active_secs = started.elapsed().as_secs_f64();
 
-    let retention_snapshot_wait =
-        Duration::from_secs(MIN_RETENTION_DRAIN_WAIT_SECS.try_into().unwrap());
-    tokio::time::sleep(retention_snapshot_wait).await;
-    let retention_series = retention_sampler.stop().await;
-    // Keep captured diagnostics allocated but quiescent during the final RSS
-    // tail. This measures the runtime after SIP retention expiry without
-    // measuring periodic diagnostic JSON construction.
-    tokio::time::sleep(retention_drain_wait.saturating_sub(retention_snapshot_wait)).await;
-    // End process sampling at the declared drain boundary. Retention capture
-    // and report construction allocate diagnostic data and are not part of
-    // the runtime-under-test RSS window.
+    let mut retention_series = retention_sampler.stop_periodic().await;
+    // Structural snapshots walk every owned runtime index and perturb the
+    // allocator. Keep the complete drain/RSS window quiet.
+    tokio::time::sleep(retention_drain_wait).await;
+    // End active-process sampling at the declared drain boundary. The separate
+    // settled sampler below is the authoritative memory-growth window.
     let mut resources = match sampler {
         Some(sampler) => sampler.stop().await,
         None => ResourceSummary::empty(),
@@ -208,6 +214,53 @@ async fn perf_burst_receiver() {
         Some(sampler) => Some(sampler.stop().await),
         None => None,
     };
+    let rss_quiescence = if in_process_resource_sampling {
+        wait_for_burst_rss_quiescence("burst_receiver", rss_limit).await
+    } else {
+        BurstRssQuiescence::not_sampled(rss_limit)
+    };
+    let (mut settled_resources, settled_observation) =
+        if in_process_resource_sampling && rss_quiescence.achieved {
+            sample_settled_rss_window(
+                "burst_receiver",
+                scenario.acceptance.min_rss_gate_window_secs,
+            )
+            .await
+        } else {
+            (ResourceSummary::empty(), Duration::ZERO)
+        };
+    let rss = support::soak::rss_result_metrics(
+        &settled_resources,
+        0.0,
+        0.0,
+        settled_observation.as_secs_f64(),
+        support::soak::RssGatePolicy::SettledFull,
+    );
+    let rss_gate_enforced = in_process_resource_sampling
+        && rss_quiescence.achieved
+        && rss_window_meets_minimum(
+            rss.post_drain_window_secs,
+            scenario.acceptance.min_rss_gate_window_secs,
+        );
+    let rss_gate_reason = if !in_process_resource_sampling {
+        "in_process_sampling_disabled"
+    } else if !rss_quiescence.achieved {
+        "rss_quiescence_not_achieved"
+    } else if rss_gate_enforced {
+        "settled_window_meets_minimum"
+    } else {
+        "settled_window_incomplete"
+    };
+    // Capture exact structural proof only after authoritative RSS sampling has
+    // stopped so the proof cannot manufacture the growth it is meant to find.
+    let final_sample = capture_endpoint_retention_sample(
+        "burst_receiver",
+        "after_drain",
+        started,
+        &receiver.coordinator,
+    )
+    .await;
+    retention_series.record_sample("burst_receiver", final_sample);
     let final_retention = retention_series
         .final_sample
         .clone()
@@ -217,21 +270,8 @@ async fn perf_burst_receiver() {
     let completed_audio_receivers = completed_audio_receivers.load(Ordering::Relaxed);
     let received_frames = received_frames.load(Ordering::Relaxed);
     let incoming_calls = incoming_calls.load(Ordering::Relaxed);
-    let rss = support::soak::rss_result_metrics(
-        &resources,
-        active_secs,
-        active_secs,
-        retention_drain_wait.as_secs_f64(),
-        support::soak::RssGatePolicy::PostDrainOrTail,
-    );
-    let rss_gate_enforced =
-        rss.post_drain_window_secs >= scenario.acceptance.min_rss_gate_window_secs;
-    let rss_gate_reason = if rss_gate_enforced {
-        "post_drain_window_meets_minimum"
-    } else {
-        "reported_only_short_post_drain_window"
-    };
     resources.samples.clear();
+    settled_resources.samples.clear();
     let dhat_diagnostics = dhat_profile.finish();
     let retained_session_trace_path =
         if retained_after_drain > 0 || active_audio_receivers_after_drain > 0 {
@@ -284,13 +324,8 @@ async fn perf_burst_receiver() {
         .result("rss_gate_window", rss.gate_window)
         .result("rss_gate_enforced", rss_gate_enforced)
         .result("rss_gate_reason", rss_gate_reason)
-        .result(
-            "rss_acceptance_limit_mb_per_hr",
-            scenario
-                .acceptance
-                .max_rss_growth_mb_per_hr
-                .unwrap_or(rss_gate.effective_mb_per_hr),
-        )
+        .result("rss_quiescence_achieved", rss_quiescence.achieved)
+        .result("rss_acceptance_limit_mb_per_hr", rss_limit)
         .result_block("rss_gate", rss_gate.to_json())
         .result("retained_objects_after_drain", retained_after_drain)
         .result(
@@ -321,6 +356,7 @@ async fn perf_burst_receiver() {
                 "final_retained_objects": retained_after_drain,
             }),
         )
+        .diagnostic_block("rss_quiescence", rss_quiescence.to_json())
         .diagnostic_block(
             "rss_windows",
             json!({
@@ -340,6 +376,19 @@ async fn perf_burst_receiver() {
         .diagnostic_block(
             "resource_sampling",
             resource_sampling_diagnostics("burst_receiver", in_process_resource_sampling),
+        )
+        .diagnostic_block(
+            "settled_resource_sampling",
+            json!({
+                "observation_secs": round2(settled_observation.as_secs_f64()),
+                "sample_count": settled_resources.sample_count,
+                "samples_path": settled_resources
+                    .samples_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                "baseline_rss_mb": round2(settled_resources.baseline_rss_mb),
+                "peak_rss_mb": round2(settled_resources.peak_rss_mb),
+            }),
         )
         .diagnostic_block(
             "retained_session_trace",
@@ -368,12 +417,20 @@ async fn perf_burst_receiver() {
     let _ = tokio::time::timeout(Duration::from_secs(3), receiver.task).await;
 
     let mut gate_failures = Vec::new();
-    let rss_limit = scenario
-        .acceptance
-        .max_rss_growth_mb_per_hr
-        .unwrap_or(rss_gate.effective_mb_per_hr);
     if !stop_seen {
         gate_failures.push("receiver stop file was not observed".to_string());
+    }
+    if in_process_resource_sampling && !rss_quiescence.achieved {
+        gate_failures.push(format!(
+            "receiver RSS did not become quiescent within {} bounded probes at {:.2} MB/hr",
+            support::soak::BURST_RSS_QUIESCENCE_MAX_PROBES,
+            rss_limit,
+        ));
+    } else if in_process_resource_sampling && !rss_gate_enforced {
+        gate_failures.push(format!(
+            "receiver RSS gate captured only {:.3}s of the required {:.3}s window",
+            rss.post_drain_window_secs, scenario.acceptance.min_rss_gate_window_secs,
+        ));
     }
     if rss_gate_enforced && rss.gate_growth_mb_per_hr > rss_limit {
         gate_failures.push(format!(
@@ -532,9 +589,8 @@ fn burst_config(
     let mut performance = PerformanceConfig::profile(profile)
         .with_capacity(capacity)
         .with_signaling_only_rtp_port(9);
-    if let Some(path) = std::env::var("RVOIP_PERF_RECIPE_FILE")
+    if let Ok(path) = std::env::var("RVOIP_PERF_RECIPE_FILE")
         .or_else(|_| std::env::var("BETA_PERFORMANCE_RECIPE_FILE"))
-        .ok()
     {
         performance = performance.with_recipe_path(path);
     }

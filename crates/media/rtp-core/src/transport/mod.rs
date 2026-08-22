@@ -151,7 +151,7 @@ pub use symmetric::{SymmetricRtpDiagnostics, SymmetricRtpPolicy};
 pub use tcp::TcpRtpTransport;
 pub use udp::{
     classify_rtp_mux_packet, set_diagnostics as set_udp_diagnostics, RtpMuxPacketClass,
-    UdpRtpTransport,
+    SrtpContextRollback, UdpRtpTransport,
 };
 pub use validation::{PlatformSocketStrategy, PlatformType, RtpSocketValidator};
 

@@ -37,7 +37,8 @@ use crate::api::incoming::IncomingCall;
 use crate::api::performance::PerformanceConfig;
 use crate::api::unified::{
     Config, MediaMode, MediaSessionControllerConfig, RegistrationHandle, RegistrationInfo,
-    RtpSessionBufferConfig, RtpTransportBufferConfig, UnifiedCoordinator,
+    RtpSessionBufferConfig, RtpTransportBufferConfig, SdesBase64Mode, SipNatConfig,
+    SipRuntimeConfig, SymmetricRtpPolicy, UnifiedCoordinator,
 };
 use crate::auth::SipClientAuth;
 use crate::errors::{Result, SessionError};
@@ -330,6 +331,10 @@ impl EventReceiver {
             {
                 return None;
             }
+            // The control receiver already owns this value. Boxing it here
+            // would add one allocation to every private high-CPS event only
+            // to equalize this short-lived select result's variant sizes.
+            #[allow(clippy::large_enum_variant)]
             enum Input {
                 Control(Option<SessionControlEvent>),
                 Observation(
@@ -798,6 +803,13 @@ impl PeerControl {
         Ok(EventReceiver::new(rx))
     }
 
+    /// Subscribe to bounded security and renegotiation diagnostics.
+    pub fn subscribe_diagnostics(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::api::events::DiagnosticEvent> {
+        self.coordinator.subscribe_diagnostics()
+    }
+
     /// Access the underlying [`UnifiedCoordinator`] for advanced use.
     ///
     /// This accessor is intentionally trivial and does not clone the
@@ -1045,8 +1057,26 @@ impl StreamPeer {
     /// # }
     /// ```
     pub async fn with_config(config: Config) -> Result<Self> {
+        Self::with_config_and_runtime(config, SipRuntimeConfig::default()).await
+    }
+
+    /// Create a peer with explicit signaling/media configuration and RTP NAT policy.
+    ///
+    /// This is the high-level equivalent of
+    /// [`UnifiedCoordinator::new_with_nat`]. It allows softphones and other
+    /// `StreamPeer` users to tune bounded symmetric-RTP rebinding without
+    /// dropping down to the coordinator API.
+    pub async fn with_config_and_nat(config: Config, nat: SipNatConfig) -> Result<Self> {
+        Self::with_config_and_runtime(config, SipRuntimeConfig::default().with_nat(nat)).await
+    }
+
+    /// Create a peer with source-compatible construction-time options.
+    pub async fn with_config_and_runtime(
+        config: Config,
+        runtime: SipRuntimeConfig,
+    ) -> Result<Self> {
         let local_uri = config.local_uri.clone();
-        let coordinator = UnifiedCoordinator::new(config).await?;
+        let coordinator = UnifiedCoordinator::new_with_runtime(config, runtime).await?;
         let event_rx = coordinator.subscribe_events().await?;
         let control_rx = coordinator.claim_session_control_events().await?;
         Ok(Self {
@@ -1056,6 +1086,13 @@ impl StreamPeer {
             },
             events: EventReceiver::with_control(event_rx, control_rx, coordinator),
         })
+    }
+
+    /// Subscribe to bounded security and renegotiation diagnostics.
+    pub fn subscribe_diagnostics(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::api::events::DiagnosticEvent> {
+        self.control.subscribe_diagnostics()
     }
 
     /// Split the peer into independent control and event halves.
@@ -1189,9 +1226,9 @@ impl StreamPeer {
                         .cloned()
                         .unwrap_or_else(crate::auth::SipTransportSecurityContext::unknown),
                 );
-                return Ok(incoming);
+                Ok(incoming)
             }
-            None => return Err(SessionError::Other("Event channel closed".to_string())),
+            None => Err(SessionError::Other("Event channel closed".to_string())),
         }
     }
 
@@ -1509,6 +1546,8 @@ fn media_security_state_from_event(event: Event) -> Option<(CallId, MediaSecurit
 /// ```
 pub struct StreamPeerBuilder {
     config: Config,
+    nat: SipNatConfig,
+    sdes_base64_mode: SdesBase64Mode,
     name: Option<String>,
 }
 
@@ -1524,6 +1563,8 @@ impl StreamPeerBuilder {
     pub fn new() -> Self {
         Self {
             config: Config::default(),
+            nat: SipNatConfig::default(),
+            sdes_base64_mode: SdesBase64Mode::default(),
             name: None,
         }
     }
@@ -1633,6 +1674,26 @@ impl StreamPeerBuilder {
     /// Set media-core controller pool and capacity tuning for SIP media calls.
     pub fn media_session_controller_config(mut self, config: MediaSessionControllerConfig) -> Self {
         self.config = self.config.with_media_session_controller_config(config);
+        self
+    }
+
+    /// Set the complete SIP/RTP NAT policy for this peer.
+    pub fn nat(mut self, nat: SipNatConfig) -> Self {
+        self.nat = nat;
+        self
+    }
+
+    /// Set the bounded symmetric-RTP source learning and rebinding policy.
+    pub fn symmetric_rtp_policy(mut self, policy: SymmetricRtpPolicy) -> Self {
+        self.nat = self.nat.with_symmetric_rtp_policy(policy);
+        self
+    }
+
+    /// Select the inbound RFC 4568 SDES Base64 validation policy.
+    ///
+    /// Outbound SDP remains canonical in both modes.
+    pub fn sdes_base64_mode(mut self, mode: SdesBase64Mode) -> Self {
+        self.sdes_base64_mode = mode;
         self
     }
 
@@ -1900,7 +1961,10 @@ impl StreamPeerBuilder {
                 name, self.config.local_ip, self.config.sip_port
             );
         }
-        StreamPeer::with_config(self.config).await
+        let runtime = SipRuntimeConfig::default()
+            .with_nat(self.nat)
+            .with_sdes_base64_mode(self.sdes_base64_mode);
+        StreamPeer::with_config_and_runtime(self.config, runtime).await
     }
 }
 
@@ -1912,16 +1976,41 @@ impl Default for StreamPeerBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{EventReceiver, StreamPeerBuilder};
     use crate::adapters::SessionApiCrossCrateEvent;
     use crate::api::events::{Event, SipTrace, SipTraceDirection};
     use crate::api::unified::{
         MediaSessionControllerConfig, RtpSessionBufferConfig, RtpTransportBufferConfig,
+        SipNatConfig, SymmetricRtpPolicy,
     };
     use crate::state_table::types::SessionId;
     use rvoip_infra_common::events::cross_crate::CrossCrateEvent;
-    use std::sync::Arc;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stream_peer_builder_passes_nat_policy_to_coordinator_validation() {
+        let invalid_policy = SymmetricRtpPolicy {
+            probation_packets: 0,
+            ..SymmetricRtpPolicy::default()
+        };
+        let result = StreamPeerBuilder::new()
+            .symmetric_rtp_policy(invalid_policy)
+            .build()
+            .await;
+        assert!(matches!(
+            result,
+            Err(crate::errors::SessionError::ConfigError(detail))
+                if detail.contains("probation_packets")
+        ));
+
+        let nat = SipNatConfig::default().with_symmetric_rtp_policy(SymmetricRtpPolicy {
+            max_rebindings: 9,
+            ..SymmetricRtpPolicy::default()
+        });
+        assert_eq!(StreamPeerBuilder::new().nat(nat).nat, nat);
+    }
 
     #[test]
     fn stream_peer_builder_exposes_rtp_media_buffer_tuning() {

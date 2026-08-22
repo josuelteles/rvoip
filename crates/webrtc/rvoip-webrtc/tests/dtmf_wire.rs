@@ -2,10 +2,10 @@
 //! generates correct telephone-event RTP packets on the wire, end-to-end
 //! through SRTP on a real loopback.
 //!
-//! DTMF is a supplemental SSRC encoding on the same negotiated audio sender as
-//! Opus. The offer therefore carries one audio m-line, while primary audio and
-//! telephone-event retain independent RTP timelines. The tests discover every
-//! audio remote track so they remain insensitive to receiver-side demux shape.
+//! DTMF is an alternate payload on the same negotiated audio source as Opus.
+//! The offer therefore carries one audio m-line, SSRC, and sequence/timestamp
+//! owner. The tests discover every audio remote track so they remain
+//! insensitive to receiver-side demux shape.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,6 +55,21 @@ fn retain_only_48khz_telephone_event(sdp: &str) -> String {
     output
 }
 
+/// Drop every SDES MID `a=extmap` line, reproducing an endpoint such as
+/// Amazon Connect that never negotiates the MID header extension. The `a=mid:`
+/// attribute itself is retained so BUNDLE grouping is unchanged.
+fn strip_sdes_mid_extmap(sdp: &str) -> String {
+    let mut output = String::with_capacity(sdp.len());
+    for line in sdp.lines() {
+        if line.starts_with("a=extmap:") && line.contains("urn:ietf:params:rtp-hdrext:sdes:mid") {
+            continue;
+        }
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+    output
+}
+
 fn decode_event(payload: &[u8]) -> Option<(u8, bool, u8, u16)> {
     if payload.len() < 4 {
         return None;
@@ -74,13 +89,11 @@ async fn send_dtmf_emits_rfc4733_telephone_events() {
         .await
         .expect("loopback");
 
-    // D1 — Opus and telephone-event are codec-distinct encodings on one
-    // negotiated audio sender. Receiver implementations may expose those
-    // SSRCs through one grouped track or multiple remote-track events, so the
-    // watcher drains every audio track and polls each one. A track may appear
-    // only after the first PT 101 packet arrives, so keep polling until the
-    // deadline.
-    let captured: Arc<parking_lot::Mutex<Vec<(u8, bool, u8, u16, bool)>>> =
+    // Opus and telephone-event share one negotiated audio source. Receiver
+    // implementations may expose a remote track only after the first RTP
+    // packet arrives, so keep discovering and polling until the deadline.
+    let expected_ssrc = offerer.local_audio_ssrc().expect("primary audio SSRC");
+    let captured: Arc<parking_lot::Mutex<Vec<(u8, bool, u8, u16, bool, u32)>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     let cap_clone = Arc::clone(&captured);
     let answerer_watch = Arc::clone(&answerer);
@@ -103,7 +116,14 @@ async fn send_dtmf_emits_rfc4733_telephone_events() {
                         if let TrackRemoteEvent::OnRtpPacket(pkt) = event {
                             if pkt.header.payload_type == TELEPHONE_EVENT_PT {
                                 if let Some((ev, eoe, vol, dur)) = decode_event(&pkt.payload) {
-                                    cap.lock().push((ev, eoe, vol, dur, pkt.header.marker));
+                                    cap.lock().push((
+                                        ev,
+                                        eoe,
+                                        vol,
+                                        dur,
+                                        pkt.header.marker,
+                                        pkt.header.ssrc,
+                                    ));
                                 }
                             }
                         }
@@ -117,8 +137,7 @@ async fn send_dtmf_emits_rfc4733_telephone_events() {
         }
     });
 
-    // Send DTMF "5" for 100ms. The first PT 101 packet may trigger a new
-    // remote-track event for the supplemental SSRC.
+    // Send DTMF "5" for 100ms on the already-negotiated primary audio source.
     send_dtmf(&offerer, "5", 100).await.expect("send_dtmf");
 
     // Wait long enough for end-of-event retransmissions to arrive.
@@ -132,9 +151,13 @@ async fn send_dtmf_emits_rfc4733_telephone_events() {
     );
 
     // Every captured event must be digit 5 with reasonable volume (0..63).
-    for (ev, _, vol, _, _) in &events {
+    for (ev, _, vol, _, _, ssrc) in &events {
         assert_eq!(*ev, 5, "event code must be 5 for digit '5'");
         assert!(*vol <= 63, "volume must fit in 6 bits (got {vol})");
+        assert_eq!(
+            *ssrc, expected_ssrc,
+            "RFC 4733 must use the primary audio source"
+        );
     }
 
     // First packet must carry the marker bit.
@@ -154,7 +177,7 @@ async fn send_dtmf_emits_rfc4733_telephone_events() {
 
     // Duration must monotonically increase (cumulative samples across the tone).
     let mut last = 0u16;
-    for (_, _, _, dur, _) in &events {
+    for (_, _, _, dur, _, _) in &events {
         assert!(*dur >= last, "duration regressed: {dur} < {last}");
         last = *dur;
     }
@@ -202,6 +225,7 @@ async fn negotiated_pt110_48khz_reaches_the_remote_peer() {
     let expected_mid_id = sender
         .negotiated_outbound_audio_mid_extension_id()
         .expect("negotiated outbound audio MID extension ID");
+    let expected_ssrc = sender.local_audio_ssrc().expect("primary audio SSRC");
 
     let timeout = Duration::from_secs(config.connection_timeout_secs);
     tokio::try_join!(
@@ -210,7 +234,7 @@ async fn negotiated_pt110_48khz_reaches_the_remote_peer() {
     )
     .expect("connected peers");
 
-    let captured: Arc<parking_lot::Mutex<Vec<(u8, bool, u16, bool, Option<Vec<u8>>)>>> =
+    let captured: Arc<parking_lot::Mutex<Vec<(u8, bool, u16, bool, Option<Vec<u8>>, u32)>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
     let captured_for_watcher = Arc::clone(&captured);
     let receiver_for_watcher = Arc::clone(&receiver);
@@ -241,6 +265,7 @@ async fn negotiated_pt110_48khz_reaches_the_remote_peer() {
                                         .header
                                         .get_extension(expected_mid_id)
                                         .map(|payload| payload.to_vec()),
+                                    packet.header.ssrc,
                                 ));
                             }
                         }
@@ -266,12 +291,16 @@ async fn negotiated_pt110_48khz_reaches_the_remote_peer() {
     assert!(events.first().is_some_and(|event| event.3));
     assert!(events
         .iter()
-        .any(|(_, end, duration, _, _)| { *end && *duration == 5_760 }));
+        .any(|(_, end, duration, _, _, _)| { *end && *duration == 5_760 }));
     assert!(
         events
             .iter()
             .all(|event| event.4.as_deref() == Some(expected_mid.as_bytes())),
-        "every supplemental-SSRC packet must carry the exact negotiated MID bytes"
+        "every telephone-event packet must carry the exact negotiated MID bytes"
+    );
+    assert!(
+        events.iter().all(|event| event.5 == expected_ssrc),
+        "PT110 must use the primary audio source"
     );
 
     receiver.close().await.ok();
@@ -341,6 +370,7 @@ async fn public_media_stream_decodes_the_negotiated_dynamic_dtmf_mapping() {
             clock_rate_hz: 48_000,
             channels: 1,
             fmtp: None,
+            payload_type: None,
         },
         receiver.local_audio_track().expect("receiver audio track"),
         receiver.local_audio_ssrc().expect("receiver audio SSRC"),
@@ -357,6 +387,141 @@ async fn public_media_stream_decodes_the_negotiated_dynamic_dtmf_mapping() {
     assert_eq!(event.duration_ms, 120);
 
     stream.close().await.expect("close media stream");
+    receiver.close().await.ok();
+    sender.close().await.ok();
+}
+
+/// Regression: an endpoint that does not negotiate the SDES MID header
+/// extension must still receive RFC 4733 telephone events.
+///
+/// Since telephone events were moved onto the primary negotiated audio SSRC,
+/// they are exactly as demuxable as primary audio. Primary audio is already
+/// allowed to be written without a MID, so DTMF must not fail closed where
+/// audio succeeds -- otherwise audio reaches the peer and IVR digits do not.
+#[tokio::test]
+async fn dtmf_reaches_a_peer_that_never_negotiates_the_sdes_mid_extension() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let config = WebRtcConfig::loopback();
+
+    let receiver = RvoipPeerConnection::new(&config, PeerRole::Offerer)
+        .await
+        .expect("receiver");
+    receiver
+        .prepare_receive_only_offer()
+        .await
+        .expect("receive-only offer");
+    let original_offer = receiver.create_offer_and_gather().await.expect("offer");
+    assert!(
+        original_offer.contains("urn:ietf:params:rtp-hdrext:sdes:mid"),
+        "baseline offer must advertise the MID extension so stripping is meaningful"
+    );
+    let offer = strip_sdes_mid_extmap(&original_offer);
+    assert!(!offer.contains("urn:ietf:params:rtp-hdrext:sdes:mid"));
+    assert!(
+        offer.contains("a=mid:"),
+        "BUNDLE grouping must be preserved"
+    );
+
+    let sender = RvoipPeerConnection::new(&config, PeerRole::Answerer)
+        .await
+        .expect("sender");
+    let answer = sender
+        .accept_offer_and_gather(&offer)
+        .await
+        .expect("answer without the MID extension");
+    receiver
+        .set_remote_answer(&answer)
+        .await
+        .expect("install answer");
+
+    // Preconditions: DTMF is negotiated, but no MID was agreed.
+    assert!(
+        matches!(
+            sender.outbound_dtmf_negotiation(),
+            OutboundDtmfNegotiation::Negotiated(_)
+        ),
+        "telephone-event must still negotiate without the MID extension"
+    );
+    assert!(
+        sender.negotiated_outbound_audio_mid().is_none(),
+        "this test is only meaningful when no MID is negotiated"
+    );
+    let expected_ssrc = sender.local_audio_ssrc().expect("primary audio SSRC");
+
+    let timeout = Duration::from_secs(config.connection_timeout_secs);
+    tokio::try_join!(
+        receiver.wait_connected(timeout),
+        sender.wait_connected(timeout)
+    )
+    .expect("connected peers");
+
+    let captured: Arc<parking_lot::Mutex<Vec<(u8, bool, u32, bool)>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let captured_for_watcher = Arc::clone(&captured);
+    let receiver_for_watcher = Arc::clone(&receiver);
+    let watcher = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut pollers = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            if let Some(track) = receiver_for_watcher.try_recv_remote_track().await {
+                let captured = Arc::clone(&captured_for_watcher);
+                pollers.push(tokio::spawn(async move {
+                    loop {
+                        let Some(TrackRemoteEvent::OnRtpPacket(packet)) =
+                            tokio::time::timeout(Duration::from_millis(100), track.poll())
+                                .await
+                                .ok()
+                                .flatten()
+                        else {
+                            continue;
+                        };
+                        if packet.header.payload_type == TELEPHONE_EVENT_PT {
+                            if let Some((event, end, _, _)) = decode_event(&packet.payload) {
+                                captured.lock().push((
+                                    event,
+                                    end,
+                                    packet.header.ssrc,
+                                    packet.header.extension,
+                                ));
+                            }
+                        }
+                    }
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for poller in pollers {
+            poller.abort();
+        }
+    });
+
+    // The regression itself: this returned Err(IncompatibleCapabilities)
+    // before the fix, without writing a single packet.
+    send_dtmf(&sender, "7", 120)
+        .await
+        .expect("DTMF must not fail closed merely because no MID was negotiated");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    watcher.abort();
+
+    let events = captured.lock().clone();
+    assert!(
+        !events.is_empty(),
+        "expected telephone-event packets on the wire without a negotiated MID"
+    );
+    assert!(events.iter().all(|(event, ..)| *event == 7));
+    assert!(
+        events.iter().any(|(_, end, _, _)| *end),
+        "expected an end-of-event packet"
+    );
+    assert!(
+        events.iter().all(|event| event.2 == expected_ssrc),
+        "telephone events must use the primary audio source"
+    );
+    assert!(
+        events.iter().all(|event| !event.3),
+        "no RTP header extension may be written when no MID was negotiated"
+    );
+
     receiver.close().await.ok();
     sender.close().await.ok();
 }

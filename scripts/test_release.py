@@ -8,7 +8,9 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest import mock
 
@@ -134,6 +136,72 @@ class ReleaseTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(release.ReleaseError):
                 release.require_version(value)
 
+    def test_release_lockfiles_cover_root_and_standalone_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "examples").mkdir()
+            (root / "Cargo.toml").write_text("[workspace]\n")
+            (root / "examples/Cargo.toml").write_text("[workspace]\n")
+            commands: list[list[str]] = []
+
+            def fake_run(
+                argv: list[str],
+                *,
+                cwd: Path,
+                **_: object,
+            ) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(cwd, root)
+                commands.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+            with mock.patch.object(release, "run", side_effect=fake_run):
+                release.refresh_release_lockfiles(root)
+                release.validate_release_lockfiles(root)
+
+            self.assertEqual(
+                release.release_lock_paths(root),
+                (root / "Cargo.lock", root / "examples/Cargo.lock"),
+            )
+            self.assertEqual(
+                commands,
+                [
+                    [
+                        "cargo",
+                        "metadata",
+                        "--manifest-path",
+                        "Cargo.toml",
+                        "--format-version",
+                        "1",
+                    ],
+                    [
+                        "cargo",
+                        "metadata",
+                        "--manifest-path",
+                        "examples/Cargo.toml",
+                        "--format-version",
+                        "1",
+                    ],
+                    [
+                        "cargo",
+                        "metadata",
+                        "--manifest-path",
+                        "Cargo.toml",
+                        "--format-version",
+                        "1",
+                        "--locked",
+                    ],
+                    [
+                        "cargo",
+                        "metadata",
+                        "--manifest-path",
+                        "examples/Cargo.toml",
+                        "--format-version",
+                        "1",
+                        "--locked",
+                    ],
+                ],
+            )
+
     def test_topological_order_includes_0_3_and_ignores_dev_cycle(self) -> None:
         packages = {
             "core": package(
@@ -201,6 +269,20 @@ serde = { version = "1.0" }
             source, {"rvoip-a"}, "0.3.0"
         )
         self.assertIn('rvoip-a = { path = "a", version = "0.3.0" }', updated)
+        self.assertIn('serde = { version = "1.0" }', updated)
+
+    def test_workspace_dependency_update_resolves_renamed_package(self) -> None:
+        source = """[workspace.dependencies]
+rtc = { package = "rvoip-rtc", path = "rtc", version = "0.3.3" }
+serde = { version = "1.0" }
+"""
+        updated = release.update_workspace_dependency_versions(
+            source, {"rvoip-rtc"}, "0.3.4"
+        )
+        self.assertIn(
+            'rtc = { package = "rvoip-rtc", path = "rtc", version = "0.3.4" }',
+            updated,
+        )
         self.assertIn('serde = { version = "1.0" }', updated)
 
     def test_planned_version_edits_update_renamed_member_dependency(
@@ -290,6 +372,48 @@ rvoip-rtc = { path = "../rvoip-rtc" }
                 'rvoip-rtc = { path = "../rvoip-rtc" }',
                 edits[stack_manifest].decode(),
             )
+
+    def test_planned_release_metadata_edits_update_all_active_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active_files = {
+                Path("README.md"): (
+                    "> **Unified `0.3.5` release train.**\n"
+                    'rvoip-sip = "0.3.5"\n'
+                ),
+                Path("crates/sip/rvoip-sip/docs/BETA_RELEASE_CHECKLIST.md"): (
+                    "Current candidate and runtime crate version: `0.3.5`.\n"
+                ),
+                Path("crates/sip/rvoip-sip/docs/RELEASE_NOTES_NEXT.md"): (
+                    "# rvoip 0.3.5 Release Candidate Notes\n"
+                ),
+            }
+            for relative_path, body in active_files.items():
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body, encoding="utf-8")
+
+            edits = release.planned_release_metadata_edits(
+                root, "0.3.5", "0.3.6"
+            )
+
+            self.assertEqual(set(edits), {root / path for path in active_files})
+            for payload in edits.values():
+                self.assertIn("0.3.6", payload.decode())
+                self.assertNotIn("0.3.5", payload.decode())
+
+    def test_planned_release_metadata_edits_fail_closed_on_missing_marker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text("no active marker\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                release.ReleaseError, "does not reference workspace version"
+            ):
+                release.planned_release_metadata_edits(
+                    root, "0.3.5", "0.3.6"
+                )
 
     def test_member_dependency_versions_reject_stale_renamed_requirement(
         self,
@@ -426,6 +550,77 @@ rvoip-rtc = { path = "../rvoip-rtc" }
             )
             self.assertEqual(set(receipt["package_sha256"]), {"leaf"})
 
+    def test_remote_qualification_is_exact_commit_catalog_and_profile_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog_path = root / "scripts/release/gates.json"
+            catalog_path.parent.mkdir(parents=True)
+            gate_ids = [f"core.gate-{index}" for index in range(45)]
+            catalog = {
+                "schema": release.REMOTE_GATE_CATALOG_SCHEMA,
+                "profiles": {"remote-release": gate_ids},
+                "remote_release_legacy_coverage": {
+                    "required_legacy_count": 108,
+                    "profile_legacy_count": 108,
+                    "unautomated_legacy_ids": [],
+                },
+            }
+            catalog_path.write_text(json.dumps(catalog))
+            head = "a" * 40
+            aggregate = root / "aggregate.json"
+            payload = {
+                "schema": release.REMOTE_QUALIFICATION_SCHEMA,
+                "status": "PASS",
+                "failures": [],
+                "candidate_sha": head,
+                "profile": "remote-release",
+                "catalog_sha256": release.canonical_json_sha256(catalog),
+                "gate_count": len(gate_ids),
+                "fresh_count": 4,
+                "reused_count": len(gate_ids) - 4,
+                "accepted_gates": [{"gate_id": gate_id} for gate_id in gate_ids],
+            }
+            aggregate.write_text(json.dumps(payload))
+            qualification = release.verify_remote_qualification(
+                root, "0.3.6", head, str(aggregate), mock.Mock()
+            )
+            self.assertEqual(qualification["mode"], "remote-release")
+            self.assertEqual(qualification["gate_count"], len(gate_ids))
+
+            catalog["remote_release_legacy_coverage"]["unautomated_legacy_ids"] = [
+                "legacy.missing"
+            ]
+            catalog["remote_release_legacy_coverage"]["profile_legacy_count"] = 107
+            catalog_path.write_text(json.dumps(catalog))
+            payload["catalog_sha256"] = release.canonical_json_sha256(catalog)
+            aggregate.write_text(json.dumps(payload))
+            with self.assertRaises(release.ReleaseError):
+                release.verify_remote_qualification(
+                    root, "0.3.6", head, str(aggregate), mock.Mock()
+                )
+
+            payload["candidate_sha"] = "b" * 40
+            aggregate.write_text(json.dumps(payload))
+            with self.assertRaises(release.ReleaseError):
+                release.verify_remote_qualification(
+                    root, "0.3.6", head, str(aggregate), mock.Mock()
+                )
+
+    def test_remote_qualification_cli_is_mutually_exclusive(self) -> None:
+        parser = release.parser()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "verify",
+                    "--version",
+                    "0.3.6",
+                    "--beta-report-root",
+                    "strict",
+                    "--remote-qualification",
+                    "aggregate.json",
+                ]
+            )
+
     def test_beta_exception_is_explicit_and_hash_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -447,6 +642,7 @@ rvoip-rtc = { path = "../rvoip-rtc" }
                 "0.3.3",
                 None,
                 str(attestation),
+                None,
                 log,
             )
             self.assertEqual(qualification["mode"], "owner-approved-exception")
@@ -469,7 +665,160 @@ rvoip-rtc = { path = "../rvoip-rtc" }
                 "0.3.3",
                 "/tmp/strict-report",
                 "/tmp/exception.json",
+                None,
                 mock.Mock(),
+            )
+
+    def test_carry_forward_is_explicit_hash_bound_and_not_a_beta_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attestation = root / "carry-forward-attestation.json"
+            attestation.write_text(
+                json.dumps(
+                    {
+                        "release": {
+                            "version": "0.3.4",
+                            "disposition": "OWNER-APPROVED-CARRY-FORWARD",
+                            "beta_suite": "NOT-RERUN",
+                        },
+                        "inherited_beta_background": {
+                            "version": "0.3.2",
+                            "disposition": "APPROVED-WITH-EXCEPTION",
+                            "strict_automated_status": "NON-RC",
+                        },
+                        "current_evidence": {
+                            "canonical_2k": {"status": "PASS"}
+                        },
+                    }
+                )
+            )
+            log = mock.Mock()
+            qualification = release.verify_beta_reporting(
+                root,
+                "0.3.4",
+                None,
+                None,
+                str(attestation),
+                log,
+            )
+            self.assertEqual(
+                qualification["mode"], "owner-approved-carry-forward"
+            )
+            self.assertEqual(
+                qualification["strict_automated_status"], "NOT-RERUN"
+            )
+            self.assertEqual(
+                qualification["current_workspace_verification"], "PASS"
+            )
+            self.assertEqual(
+                qualification["attestation_sha256"],
+                release.hashlib.sha256(attestation.read_bytes()).hexdigest(),
+            )
+            command = log.command.call_args.args[0]
+            self.assertIn("release_carry_forward_attestation.py", command[1])
+            self.assertEqual(command[-2:], ["--version", "0.3.4"])
+
+    def test_carry_forward_receipt_requires_exact_bounded_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            receipt_path = root / "target/release-logs/0.3.4/verification.json"
+            receipt_path.parent.mkdir(parents=True)
+            attestation = root / "carry-forward-attestation.json"
+            attestation.write_text("{}")
+            attestation_sha256 = release.hashlib.sha256(
+                attestation.read_bytes()
+            ).hexdigest()
+            receipt = {
+                "schema": release.VERIFICATION_RECEIPT_SCHEMA,
+                "version": "0.3.4",
+                "git_commit": "a" * 40,
+                "package_count": 1,
+                "ordered_packages": ["rvoip"],
+                "package_sha256": {},
+                "package_file_manifest_sha256": {"rvoip": "b" * 64},
+                "beta_qualification": {
+                    "mode": "owner-approved-carry-forward",
+                    "disposition": "OWNER-APPROVED-CARRY-FORWARD",
+                    "strict_automated_status": "NOT-RERUN",
+                    "current_workspace_verification": "PASS",
+                    "inherited_beta_background": {
+                        "version": "0.3.2",
+                        "disposition": "APPROVED-WITH-EXCEPTION",
+                        "strict_automated_status": "NON-RC",
+                    },
+                    "current_canonical_2k": {"status": "PASS"},
+                    "attestation_path": attestation.name,
+                    "attestation_sha256": attestation_sha256,
+                },
+                "verification_scope": {
+                    "mode": "full",
+                    "workspace_manifest": "PASS",
+                    "workspace_compile": "PASS",
+                    "workspace_tests": "PASS",
+                    "workspace_doctests": "PASS",
+                    "beta_suite": "OWNER-APPROVED-CARRY-FORWARD",
+                    "targeted_commands": [],
+                    "postgresql_evidence": None,
+                    "package_file_manifests": "PASS",
+                    "package_archives": "VERIFIED-WHEN-REGISTRY-RESOLVABLE",
+                },
+            }
+            receipt_path.write_text(json.dumps(receipt))
+            with mock.patch.object(
+                release, "run", return_value=mock.Mock(returncode=0)
+            ):
+                release.read_verification_receipt(
+                    root, "0.3.4", "a" * 40, ["rvoip"]
+                )
+                for label, mutate in (
+                    (
+                        "beta relabeled pass",
+                        lambda value: value["beta_qualification"].update(
+                            {"strict_automated_status": "PASS"}
+                        ),
+                    ),
+                    (
+                        "inherited relabeled pass",
+                        lambda value: value["beta_qualification"][
+                            "inherited_beta_background"
+                        ].update({"strict_automated_status": "PASS"}),
+                    ),
+                    (
+                        "canonical missing",
+                        lambda value: value["beta_qualification"].update(
+                            {"current_canonical_2k": {"status": "MISSING"}}
+                        ),
+                    ),
+                ):
+                    with self.subTest(label=label):
+                        candidate = json.loads(json.dumps(receipt))
+                        mutate(candidate)
+                        receipt_path.write_text(json.dumps(candidate))
+                        with self.assertRaises(release.ReleaseError):
+                            release.read_verification_receipt(
+                                root, "0.3.4", "a" * 40, ["rvoip"]
+                            )
+
+                receipt_path.write_text(json.dumps(receipt))
+                attestation.write_text("altered")
+                with self.assertRaises(release.ReleaseError):
+                    release.read_verification_receipt(
+                        root, "0.3.4", "a" * 40, ["rvoip"]
+                    )
+
+    def test_carry_forward_cli_is_mutually_exclusive(self) -> None:
+        parser = release.parser()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "verify",
+                    "--version",
+                    "0.3.4",
+                    "--beta-report-root",
+                    "strict",
+                    "--beta-carry-forward-attestation",
+                    "carry-forward.json",
+                ]
             )
 
     def test_targeted_delta_attestation_is_exact_and_commit_bound(self) -> None:
@@ -730,6 +1079,46 @@ rvoip-rtc = { path = "../rvoip-rtc" }
                 ]
             )
 
+    def test_qualified_head_requires_remote_qualification(self) -> None:
+        with self.assertRaisesRegex(
+            release.ReleaseError, "requires an exact --remote-qualification"
+        ):
+            release.verify(
+                Path("/repo"),
+                "0.3.6",
+                None,
+                None,
+                None,
+                None,
+                None,
+                "a" * 40,
+            )
+
+    def test_qualified_publish_requires_remote_release_receipt(self) -> None:
+        head = "a" * 40
+        receipt = {
+            "beta_qualification": {
+                "mode": "strict",
+                "git_commit": head,
+            }
+        }
+        with (
+            mock.patch.object(release, "ensure_release_state", return_value=head),
+            mock.patch.object(release, "validate_workspace", return_value=({}, [])),
+            mock.patch.object(
+                release, "read_verification_receipt", return_value=receipt
+            ),
+            self.assertRaisesRegex(
+                release.ReleaseError, "matching remote-release evidence"
+            ),
+        ):
+            release.publish(
+                Path("/repo"),
+                "0.3.6",
+                execute=False,
+                qualified_head=head,
+            )
+
     def test_visibility_timeout_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log = release.ReleaseLog(Path(directory), "0.3.0", "test")
@@ -782,10 +1171,82 @@ rvoip-rtc = { path = "../rvoip-rtc" }
                 Path("/repo"), "0.3.0", require_no_tag=True
             )
 
+    def test_qualified_ancestor_release_state_succeeds(self) -> None:
+        head = "a" * 40
+        remote_head = "b" * 40
+        remote = release.subprocess.CompletedProcess(
+            ["git", "ls-remote"],
+            0,
+            stdout=f"{remote_head}\trefs/heads/main\n",
+            stderr="",
+        )
+        ancestor = release.subprocess.CompletedProcess(
+            ["git", "merge-base"], 0, stdout="", stderr=""
+        )
+        fetched = release.subprocess.CompletedProcess(
+            ["git", "fetch"], 0, stdout="", stderr=""
+        )
+        with (
+            mock.patch.object(
+                release,
+                "git_output",
+                side_effect=["", "main", head],
+            ),
+            mock.patch.object(
+                release, "run", side_effect=[remote, fetched, ancestor]
+            ),
+        ):
+            actual = release.ensure_release_state(
+                Path("/repo"),
+                "0.3.6",
+                require_no_tag=False,
+                qualified_head=head,
+            )
+
+        self.assertEqual(actual, head)
+
+    def test_qualified_non_ancestor_release_state_fails_closed(self) -> None:
+        head = "a" * 40
+        remote_head = "b" * 40
+        remote = release.subprocess.CompletedProcess(
+            ["git", "ls-remote"],
+            0,
+            stdout=f"{remote_head}\trefs/heads/main\n",
+            stderr="",
+        )
+        not_ancestor = release.subprocess.CompletedProcess(
+            ["git", "merge-base"], 1, stdout="", stderr=""
+        )
+        fetched = release.subprocess.CompletedProcess(
+            ["git", "fetch"], 0, stdout="", stderr=""
+        )
+        with (
+            mock.patch.object(
+                release,
+                "git_output",
+                side_effect=["", "main", head],
+            ),
+            mock.patch.object(
+                release,
+                "run",
+                side_effect=[remote, fetched, not_ancestor],
+            ),
+            self.assertRaises(release.ReleaseError),
+        ):
+            release.ensure_release_state(
+                Path("/repo"),
+                "0.3.6",
+                require_no_tag=False,
+                qualified_head=head,
+            )
+
     def test_current_workspace_has_all_44_unique_publishable_packages(self) -> None:
         root = SCRIPT.parent.parent
+        workspace_version = tomllib.loads(
+            (root / "Cargo.toml").read_text()
+        )["workspace"]["package"]["version"]
         packages, ordered = release.validate_workspace(
-            root, "0.3.3", locked=True
+            root, workspace_version, locked=True
         )
         self.assertEqual(len(packages), release.EXPECTED_PACKAGE_COUNT)
         self.assertEqual(len(ordered), 44)

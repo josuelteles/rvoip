@@ -20,6 +20,18 @@ if [ -z "${BARESIP_MODULE_PATH:-}" ] && command -v brew >/dev/null 2>&1; then
     BARESIP_MODULE_PATH="$prefix/lib/baresip/modules"
   fi
 fi
+if [ -z "${BARESIP_MODULE_PATH:-}" ]; then
+  for candidate in \
+    /usr/lib/*/baresip/modules \
+    /usr/lib/baresip/modules \
+    /usr/local/lib/baresip/modules \
+    /opt/homebrew/lib/baresip/modules; do
+    if [ -f "$candidate/g711.so" ]; then
+      BARESIP_MODULE_PATH="$candidate"
+      break
+    fi
+  done
+fi
 BARESIP_MODULE_PATH="${BARESIP_MODULE_PATH:-/opt/homebrew/lib/baresip/modules}"
 CALL_SECONDS="${RVOIP_STRICT_UA_CALL_SECONDS:-8}"
 TARGET_PORT="${RVOIP_STRICT_UA_TARGET_PORT:-35160}"
@@ -135,7 +147,26 @@ start_managed_target() {
 
 write_baresip_config() {
   local cfg="$OUT_ROOT/baresip"
+  local source_wav="$OUT_ROOT/baresip_tx.wav"
   mkdir -p "$cfg"
+  python3 - "$source_wav" "$CALL_SECONDS" <<'PY'
+import math
+from pathlib import Path
+import struct
+import sys
+import wave
+
+path = Path(sys.argv[1])
+seconds = max(1, int(sys.argv[2]) + 1)
+sample_rate = 8000
+with wave.open(str(path), "wb") as output:
+    output.setnchannels(1)
+    output.setsampwidth(2)
+    output.setframerate(sample_rate)
+    for index in range(sample_rate * seconds):
+        sample = int(4000 * math.sin(2 * math.pi * 440 * index / sample_rate))
+        output.writeframesraw(struct.pack("<h", sample))
+PY
   cat >"$cfg/config" <<EOF
 sip_listen 0.0.0.0:0
 sip_transports udp
@@ -144,13 +175,10 @@ call_local_timeout 10
 call_max_calls 2
 call_accept no
 audio_player aufile,$OUT_ROOT/baresip_rx.wav
-audio_source ausine,440
+audio_source aufile,$source_wav
 module_path $BARESIP_MODULE_PATH
 module g711.so
-module auconv.so
-module auresamp.so
 module aufile.so
-module ausine.so
 module uuid.so
 module_app account.so
 module_app menu.so
@@ -167,7 +195,7 @@ run_baresip_call() {
   local target_uri="sip:rvoip@$TARGET_HOST:$TARGET_PORT"
   echo "[strict-ua] dialing $target_uri with baresip"
   set +e
-  "$BARESIP_BIN" -f "$cfg" -4 -c -s -t "$CALL_SECONDS" -e "/dial $target_uri" >"$log" 2>&1
+  "$BARESIP_BIN" -f "$cfg" -4 -s -t "$CALL_SECONDS" -e "/dial $target_uri" >"$log" 2>&1
   local rc=$?
   set -e
   echo "$rc" >"$OUT_ROOT/baresip_exit_status.txt"

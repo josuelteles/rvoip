@@ -11,11 +11,12 @@ transport adapters. It always provides the transport-independent
 applications opt into WebRTC, UCTP, Vapi voice agents, client,
 application-builder, and conversation-extension surfaces.
 
-> **Unified `0.3.3` release.** The `sip` feature is the release-gated beta
+> **Unified `0.3.8` release train.** The `sip` feature is the release-gated beta
 > surface. Other facade features are available today as developer previews:
 > they are implemented and published, but API-unstable or outside the SIP beta
-> attestation. The vCon-only targeted delta reuses the immutable 0.3.2 SIP
-> evidence as unchanged-subsystem background; it is not a new beta run.
+> attestation. Publication requires fresh strict full-beta evidence bound to
+> the exact clean `0.3.8` release source; historical exception and
+> carry-forward reports do not qualify this train.
 > Breaking changes remain possible before `1.0`.
 
 ## Quick start
@@ -24,7 +25,7 @@ The default feature is `sip`:
 
 ```toml
 [dependencies]
-rvoip = "0.3.3"
+rvoip = "0.3.8"
 ```
 
 The shared orchestrator is available with every feature combination:
@@ -61,6 +62,11 @@ This table mirrors `crates/rvoip/Cargo.toml`.
 | --- | :---: | --- | --- |
 | `sip` | ✅ | **Beta-qualified** | SIP application and interop surface under `rvoip::sip` |
 | `g729` |  | Developer preview | End-to-end G.729A/G.729AB media, SDP, RTP, and transcoding support; implies `sip` |
+| `amr-nb` |  | Developer preview | End-to-end AMR narrowband media with RFC 4867 framing, DTX, and CMR; implies `sip` |
+| `amr-wb` |  | Developer preview | The same for AMR wideband (G.722.2) at 16 kHz; implies `sip` |
+| `amr` |  | Developer preview | Both AMR variants |
+| `opus` |  | Developer preview | End-to-end Opus media; requires libopus on the build host; implies `sip` |
+| `all-codecs` |  | Developer preview | `g729` + `amr` + `opus` |
 | `webrtc` |  | Developer preview | WebRTC interop adapter under `rvoip::webrtc` |
 | `uctp` |  | Developer preview | UCTP protocol plus QUIC, WebTransport, and WebSocket adapters under `rvoip::uctp` |
 | `vapi` |  | Developer preview | Vapi bidirectional WebSocket agent adapter under `rvoip::vapi` |
@@ -68,19 +74,19 @@ This table mirrors `crates/rvoip/Cargo.toml`.
 | `voip-3` |  | Developer preview | `sip` + `webrtc` + `uctp` + vCon + identity + AI harness |
 | `client` |  | Developer preview | Cross-transport SDK under `rvoip::client` |
 | `app` |  | Developer preview | High-level SIP/WebRTC/UCTP gateway builder under `rvoip::app` |
-| `full` |  | Developer preview | `voip-3` + `vapi` + `sip-stir-shaken` + `client` + `app` |
+| `full` |  | Developer preview | `voip-3` + `vapi` + `sip-stir-shaken` + `client` + `app` + `g729` + `amr`. Excludes `opus`, which needs libopus on the build host — use `all-codecs` for that |
 
 Examples:
 
 ```toml
 # Shared conversation model plus SIP, WebRTC, UCTP, vCon, identity, and AI.
-rvoip = { version = "0.3.3", features = ["voip-3"] }
+rvoip = { version = "0.3.8", features = ["voip-3"] }
 
 # High-level cross-transport application builder.
-rvoip = { version = "0.3.3", features = ["app"] }
+rvoip = { version = "0.3.8", features = ["app"] }
 
 # Every facade-owned feature.
-rvoip = { version = "0.3.3", features = ["full"] }
+rvoip = { version = "0.3.8", features = ["full"] }
 ```
 
 `full` means every **facade feature**, not every crate in the rvoip workspace.
@@ -121,15 +127,15 @@ For example:
 
 ```toml
 [dependencies]
-rvoip = { version = "0.3.3", features = ["sip"] }
-rvoip-keycloak = "0.3.3"
-rvoip-redis = "0.3.3"
-rvoip-audit = "0.3.3"
+rvoip = { version = "0.3.8", features = ["sip"] }
+rvoip-keycloak = "0.3.8"
+rvoip-redis = "0.3.8"
+rvoip-audit = "0.3.8"
 ```
 
 ## Specialized workspace products
 
-These products ship in the unified `0.3.3` train but are intentionally not
+These products ship in the unified `0.3.8` train but are intentionally not
 facade feature flags:
 
 | Product | Crate | Why it stays separate |
@@ -145,7 +151,7 @@ Enable `app` to declare transports, roles, assignment, and callbacks through
 one builder:
 
 ```toml
-rvoip = { version = "0.3.3", features = ["app"] }
+rvoip = { version = "0.3.8", features = ["app"] }
 ```
 
 ```rust,no_run

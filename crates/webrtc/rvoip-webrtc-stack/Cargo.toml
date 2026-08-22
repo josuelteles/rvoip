@@ -35,11 +35,8 @@ repository.workspace = true
 
 [features]
 default = ["runtime-tokio"]
-runtime-smol = [
-    "dep:smol",
-    "dep:async-broadcast",
-]
-runtime-tokio = ["dep:tokio"]
+# Retained as a source-compatible feature name. Tokio is now mandatory.
+runtime-tokio = []
 
 [lib]
 name = "webrtc"
@@ -189,30 +186,24 @@ path = "tests/peer_connection_test.rs"
 name = "simulcast_rtc_to_webrtc_interop"
 path = "tests/simulcast_rtc_to_webrtc_interop.rs"
 
-[dependencies.async-broadcast]
-version = "0.7"
-optional = true
+[[test]]
+name = "tokio_only_runtime"
+path = "tests/tokio_only_runtime.rs"
 
 [dependencies.async-trait]
-version = "0.1.89"
+workspace = true
 
 [dependencies.bytes]
 version = "1.11.1"
 
 [dependencies.futures]
-version = "0.3.31"
+workspace = true
 
 [dependencies.log]
-version = "0.4.29"
+workspace = true
 
 [dependencies.rtc]
-version = "0.3.3"
-path = "../rvoip-rtc"
-package = "rvoip-rtc"
-
-[dependencies.smol]
-version = "2.0.2"
-optional = true
+workspace = true
 
 [dependencies.tokio]
 version = "1.49.0"
@@ -223,23 +214,22 @@ features = [
     "rt",
     "rt-multi-thread",
 ]
-optional = true
 
 [dev-dependencies.anyhow]
-version = "1.0.102"
+workspace = true
 
 [dev-dependencies.chrono]
 version = "0.4.43"
 
 [dev-dependencies.clap]
-version = "4.5.59"
+workspace = true
 features = ["derive"]
 
 [dev-dependencies.ctrlc]
 version = "3.5.2"
 
 [dev-dependencies.env_logger]
-version = "0.11.8"
+workspace = true
 
 [dev-dependencies.hyper]
 version = "0.14.32"
@@ -249,7 +239,7 @@ features = ["full"]
 version = "0.10.0"
 
 [dev-dependencies.serde_json]
-version = "1.0.149"
+workspace = true
 
 [dev-dependencies.signal]
 version = "0.20.0-alpha.1"

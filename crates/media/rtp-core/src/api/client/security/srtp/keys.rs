@@ -81,8 +81,8 @@ pub fn profile_to_suite(profile: SrtpProfile) -> Result<SrtpCryptoSuite, Securit
     match profile {
         SrtpProfile::AesCm128HmacSha1_80 => Ok(SRTP_AES128_CM_SHA1_80),
         SrtpProfile::AesCm128HmacSha1_32 => Ok(SRTP_AES128_CM_SHA1_32),
-        SrtpProfile::AesGcm128 | SrtpProfile::AesGcm256 => Err(SecurityError::Internal(
-            "AES-GCM SRTP profiles are not implemented (RFC 7714)".to_string(),
+        SrtpProfile::AesGcm128 | SrtpProfile::AesGcm256 => Err(SecurityError::UnsupportedFeature(
+            format!("SRTP profile {profile:?} is not implemented"),
         )),
     }
 }

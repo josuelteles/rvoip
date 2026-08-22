@@ -171,8 +171,8 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -221,18 +221,109 @@ use crate::transaction::transport::{
 };
 use crate::transaction::utils::transaction_key_from_message;
 use crate::transaction::{
-    InternalTransactionCommand, SipRequestIngressAuthorizer, SipRequestIngressContext, Transaction,
-    TransactionEvent, TransactionKey, TransactionKind, TransactionState,
-    DEFAULT_TRANSACTION_COMMAND_CHANNEL_CAPACITY,
+    InternalTransactionCommand, SipRequestIngressAuthorizer, SipRequestIngressContext,
+    StatefulProxyIngressEvent, Transaction, TransactionEvent, TransactionKey, TransactionKind,
+    TransactionState, DEFAULT_TRANSACTION_COMMAND_CHANNEL_CAPACITY,
 };
 
+/// A forked INVITE can produce distinct successful dialogs and therefore one
+/// answer-bearing ACK per remote tag. Keep that uncommon cache explicitly
+/// bounded so a single transaction cannot turn one expiry record into
+/// unbounded retained work.
+const MAX_DELAYED_OFFER_ACK_ANSWERS_PER_TRANSACTION: usize = 32;
+const MAX_DELAYED_OFFER_ACK_ANSWER_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct DelayedOfferAckAnswers {
+    entries: DashMap<Arc<str>, Arc<str>>,
+    reserved_entries: AtomicUsize,
+}
+
+impl DelayedOfferAckAnswers {
+    fn get(&self, remote_tag: &str) -> Option<Arc<str>> {
+        self.entries
+            .get(remote_tag)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    fn insert_exact(&self, remote_tag: Arc<str>, answer: &str) -> Result<()> {
+        if answer.len() > MAX_DELAYED_OFFER_ACK_ANSWER_BYTES {
+            return Err(Error::Other(format!(
+                "delayed-offer ACK SDP exceeds the {}-byte retention limit",
+                MAX_DELAYED_OFFER_ACK_ANSWER_BYTES
+            )));
+        }
+        if let Some(existing) = self.entries.get(remote_tag.as_ref()) {
+            return if existing.value().as_ref() == answer {
+                Ok(())
+            } else {
+                Err(Error::Other(
+                    "delayed-offer ACK answer changed for the same INVITE transaction".into(),
+                ))
+            };
+        }
+        self.reserved_entries
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_DELAYED_OFFER_ACK_ANSWERS_PER_TRANSACTION).then_some(current + 1)
+            })
+            .map_err(|_| {
+                Error::Other(format!(
+                    "delayed-offer ACK fork limit of {} answers was reached",
+                    MAX_DELAYED_OFFER_ACK_ANSWERS_PER_TRANSACTION
+                ))
+            })?;
+        match self.entries.entry(remote_tag) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::from(answer));
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                self.reserved_entries.fetch_sub(1, Ordering::AcqRel);
+                if entry.get().as_ref() == answer {
+                    Ok(())
+                } else {
+                    Err(Error::Other(
+                        "delayed-offer ACK answer changed for the same INVITE transaction".into(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn delayed_offer_ack_remote_tag(
+    transaction_id: &TransactionKey,
+    response: &Response,
+) -> Result<Arc<str>> {
+    if !response.status().is_success()
+        || TransactionKey::from_response(response).as_ref() != Some(transaction_id)
+    {
+        return Err(Error::Other(
+            "delayed-offer ACK requires the exact successful INVITE response".into(),
+        ));
+    }
+    response
+        .to()
+        .and_then(|to| to.tag())
+        .filter(|tag| !tag.is_empty())
+        .map(Arc::from)
+        .ok_or_else(|| Error::Other("delayed-offer ACK response has no remote dialog tag".into()))
+}
+
 /// Internal first-write classification for one exact CANCEL generation.
-/// Composition and route-preparation failures are safe to retry; once the
-/// transport write boundary is crossed, the caller must retain teardown
-/// ownership and must not manufacture a second CANCEL.
+/// Composition failures are immediately safe to retry. A route-preparation
+/// failure is safe after the returned retired generation's terminal event has
+/// drained. Once the transport write boundary is crossed, the caller must
+/// retain teardown ownership and must not manufacture a second CANCEL.
 #[derive(Debug)]
 pub(crate) enum CancelInviteTransactionFailure {
-    ZeroWire(Error),
+    ZeroWire {
+        error: Error,
+        /// Exact internal CANCEL generation when admission succeeded before
+        /// route preparation failed. Its ordered terminal event must drain
+        /// before the RFC transaction key is reused.
+        retired_transaction_id: Option<TransactionKey>,
+    },
     WireUnknown {
         error: Error,
         transaction_id: TransactionKey,
@@ -242,14 +333,69 @@ pub(crate) enum CancelInviteTransactionFailure {
 impl CancelInviteTransactionFailure {
     pub(crate) fn into_error(self) -> Error {
         match self {
-            Self::ZeroWire(error) | Self::WireUnknown { error, .. } => error,
+            Self::ZeroWire { error, .. } | Self::WireUnknown { error, .. } => error,
         }
     }
 
     pub(crate) fn wire_unknown_transaction(&self) -> Option<&TransactionKey> {
         match self {
-            Self::ZeroWire(_) => None,
+            Self::ZeroWire { .. } => None,
             Self::WireUnknown { transaction_id, .. } => Some(transaction_id),
+        }
+    }
+}
+
+/// Conservative first-transport-write result for one exact generated CANCEL.
+///
+/// This type is intentionally narrow and hidden from the ordinary dialog API.
+/// Transaction users that coordinate an independently retained response
+/// context (for example, a transaction-stateful proxy) need to distinguish a
+/// proven pre-wire failure from a write whose outcome is unknown:
+///
+/// - [`Self::Success`] owns the returned transaction generation.
+/// - [`Self::ZeroWire`] proves that no SIP bytes were offered to the
+///   transport, so an owner may safely retry.
+/// - [`Self::WireUnknown`] owns the returned transaction generation because
+///   some or all bytes may have reached the peer; retrying would risk a second
+///   wire generation.
+///
+/// Public transaction events remain observational. The caller must retain the
+/// exact transaction ID returned by `Success` or `WireUnknown` until its own
+/// protocol context is safe to release.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum CancelInviteTransactionDispatch {
+    /// The first transport write completed successfully.
+    Success {
+        /// Exact generated CANCEL client transaction.
+        transaction_id: TransactionKey,
+    },
+    /// Route preparation failed before the first transport write boundary.
+    ZeroWire {
+        /// Failure that prevented the write.
+        error: Error,
+        /// Exact internally retired zero-wire generation, when transaction
+        /// admission occurred before route preparation failed. A protocol
+        /// owner must consume that generation's terminal event before
+        /// reusing its RFC transaction key. `None` means failure happened
+        /// before a CANCEL transaction was admitted.
+        retired_transaction_id: Option<TransactionKey>,
+    },
+    /// The transport returned an error after crossing the write boundary.
+    WireUnknown {
+        /// Exact generated CANCEL client transaction that owns the ambiguous
+        /// wire attempt.
+        transaction_id: TransactionKey,
+        /// Transport or transaction failure returned by the write.
+        error: Error,
+    },
+}
+
+impl CancelInviteTransactionDispatch {
+    fn into_result(self) -> Result<TransactionKey> {
+        match self {
+            Self::Success { transaction_id } => Ok(transaction_id),
+            Self::ZeroWire { error, .. } | Self::WireUnknown { error, .. } => Err(error),
         }
     }
 }
@@ -894,8 +1040,8 @@ pub(crate) enum ClientResponseRouteState {
     Active {
         route: TransportRoute,
         /// Allocation identity of the client transaction data that installed
-        /// this route. Compact Timer K cleanup retains this word-sized proof
-        /// rather than a second complete `TransportRoute`.
+        /// this route. The retained completion's admission owner remembers
+        /// the same identity, so retirement does not duplicate this word.
         owner: usize,
     },
     Retired(RetiredClientTransaction),
@@ -923,6 +1069,24 @@ impl ClientResponseRouteState {
             Self::Retired(retired) => Some(retired),
         }
     }
+
+    fn response_route_owner(&self) -> usize {
+        match self {
+            Self::Active { owner, .. } => *owner,
+            Self::Retired(retired) => retired
+                .completion
+                .response_route_owner()
+                .expect("retired client route retains its response-route owner"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ClientResponseRouteGeneration {
+    owner: usize,
+    route: TransportRoute,
+    admission_owner: TransactionAdmissionOwner,
+    delayed_offer_ack_answers: Option<Arc<DelayedOfferAckAnswers>>,
 }
 
 #[cfg(test)]
@@ -1141,8 +1305,387 @@ struct TransactionAdmissionRegistry {
     /// owns the wire key. The dialog layer uses this as a backstop when its
     /// authoritative terminal event cannot be observed (for example, because
     /// the primary event receiver closed).
-    final_release_hook:
-        std::sync::RwLock<Option<Arc<dyn Fn(&TransactionKey) + Send + Sync + 'static>>>,
+    final_release_hooks:
+        std::sync::RwLock<Vec<Arc<dyn Fn(&TransactionKey) + Send + Sync + 'static>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum NormalizedViaSentByHost {
+    Domain(String),
+    Address(std::net::IpAddr),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NormalizedViaSentBy {
+    host: NormalizedViaSentByHost,
+    port: u16,
+    transport: String,
+}
+
+impl NormalizedViaSentBy {
+    fn from_request(request: &Request) -> Option<Self> {
+        let via = request.first_via()?;
+        let top = via.0.first()?;
+        let transport = top.transport().to_ascii_uppercase();
+        let host = match top.host() {
+            Host::Domain(domain) => {
+                NormalizedViaSentByHost::Domain(domain.trim_end_matches('.').to_ascii_lowercase())
+            }
+            Host::Address(address) => NormalizedViaSentByHost::Address(*address),
+        };
+        let default_port = if matches!(transport.as_str(), "TLS" | "WSS") {
+            5061
+        } else {
+            5060
+        };
+        Some(Self {
+            host,
+            port: top.port().unwrap_or(default_port),
+            transport,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ServerIngressPeerBinding {
+    source: SocketAddr,
+    destination: SocketAddr,
+    transport_type: TransportType,
+    flow_id: Option<rvoip_sip_transport::TransportFlowId>,
+    tls_leaf_sha256: Option<String>,
+}
+
+impl ServerIngressPeerBinding {
+    fn from_context(context: &SipRequestIngressContext) -> Self {
+        Self {
+            source: context.source,
+            destination: context.destination,
+            transport_type: context.transport_type,
+            flow_id: context.flow_id,
+            tls_leaf_sha256: context.connection_metadata.as_ref().map(|metadata| {
+                metadata
+                    .tls_peer_identity
+                    .leaf_certificate_sha256
+                    .to_ascii_lowercase()
+            }),
+        }
+    }
+}
+
+/// RFC 3261 §17.2.3 server matching plus the transport-authenticated ingress
+/// binding. `TransactionKey` remains the public identifier; this private key
+/// prevents a repeated wire branch from cross-dispatching between legitimate
+/// peers or co-addressed stream flows.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ServerTransactionMatchKey {
+    branch: String,
+    method: Method,
+    sent_by: NormalizedViaSentBy,
+    peer: ServerIngressPeerBinding,
+}
+
+impl ServerTransactionMatchKey {
+    fn from_request(request: &Request, context: &SipRequestIngressContext) -> Option<Self> {
+        let transaction = TransactionKey::from_request(request)?;
+        Some(Self {
+            branch: transaction.branch,
+            method: request.method().clone(),
+            sent_by: NormalizedViaSentBy::from_request(request)?,
+            peer: ServerIngressPeerBinding::from_context(context),
+        })
+    }
+
+    fn with_method(&self, method: Method) -> Self {
+        Self {
+            branch: self.branch.clone(),
+            method,
+            sent_by: self.sent_by.clone(),
+            peer: self.peer.clone(),
+        }
+    }
+
+    fn wire_identity(&self) -> ServerTransactionWireIdentity {
+        ServerTransactionWireIdentity {
+            branch: self.branch.clone(),
+            method: self.method.clone(),
+            sent_by: self.sent_by.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ServerTransactionWireIdentity {
+    branch: String,
+    method: Method,
+    sent_by: NormalizedViaSentBy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ServerAuthenticatedOwner {
+    issuer: Option<String>,
+    tenant: Option<String>,
+    subject: String,
+}
+
+impl std::convert::From<&AuthenticatedPrincipal> for ServerAuthenticatedOwner {
+    fn from(principal: &AuthenticatedPrincipal) -> Self {
+        Self {
+            issuer: principal.issuer.clone(),
+            tenant: principal.tenant.clone(),
+            subject: principal.subject.clone(),
+        }
+    }
+}
+
+impl ServerAuthenticatedOwner {
+    fn transport_tls(fingerprint: &str) -> Self {
+        Self {
+            issuer: Some("transport-mtls".into()),
+            tenant: None,
+            subject: fingerprint.to_ascii_lowercase(),
+        }
+    }
+}
+
+const SERVER_MATCH_PENDING: u8 = 0;
+const SERVER_MATCH_PUBLISHED: u8 = 1;
+const SERVER_MATCH_FAILED: u8 = 2;
+
+struct ServerTransactionMatchRegistration {
+    transaction_id: TransactionKey,
+    state: AtomicU8,
+    changed: tokio::sync::Notify,
+    authenticated_owner: std::sync::OnceLock<Option<ServerAuthenticatedOwner>>,
+}
+
+impl ServerTransactionMatchRegistration {
+    fn new(transaction_id: TransactionKey) -> Arc<Self> {
+        Arc::new(Self {
+            transaction_id,
+            state: AtomicU8::new(SERVER_MATCH_PENDING),
+            changed: tokio::sync::Notify::new(),
+            authenticated_owner: std::sync::OnceLock::new(),
+        })
+    }
+
+    async fn wait_published(&self) -> bool {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.state.load(Ordering::Acquire) {
+                SERVER_MATCH_PUBLISHED => return true,
+                SERVER_MATCH_FAILED => return false,
+                _ => notified.await,
+            }
+        }
+    }
+
+    fn authenticated_owner(&self) -> Option<&ServerAuthenticatedOwner> {
+        self.authenticated_owner.get().and_then(Option::as_ref)
+    }
+}
+
+struct ServerTransactionMatchRegistry {
+    by_match: DashMap<ServerTransactionMatchKey, Arc<ServerTransactionMatchRegistration>>,
+    by_wire_identity: DashMap<ServerTransactionWireIdentity, Vec<ServerTransactionMatchKey>>,
+    by_transaction: DashMap<TransactionKey, ServerTransactionMatchKey>,
+    next_collision: AtomicU64,
+    claim_lock: std::sync::Mutex<()>,
+}
+
+enum ServerTransactionMatchClaim {
+    Existing(Arc<ServerTransactionMatchRegistration>),
+    Reserved(ServerTransactionMatchReservation),
+    PendingCollision(Vec<Arc<ServerTransactionMatchRegistration>>),
+    ConflictingOwner,
+}
+
+struct ServerTransactionMatchReservation {
+    registry: Arc<ServerTransactionMatchRegistry>,
+    match_key: ServerTransactionMatchKey,
+    registration: Arc<ServerTransactionMatchRegistration>,
+    authenticated_owner: Option<ServerAuthenticatedOwner>,
+    committed: bool,
+}
+
+impl ServerTransactionMatchReservation {
+    fn transaction_id(&self) -> &TransactionKey {
+        &self.registration.transaction_id
+    }
+
+    fn commit(mut self) {
+        let _ = self
+            .registration
+            .authenticated_owner
+            .set(self.authenticated_owner.take());
+        self.registration
+            .state
+            .store(SERVER_MATCH_PUBLISHED, Ordering::Release);
+        self.registration.changed.notify_waiters();
+        self.committed = true;
+    }
+}
+
+impl Drop for ServerTransactionMatchReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.registration
+            .state
+            .store(SERVER_MATCH_FAILED, Ordering::Release);
+        self.registration.changed.notify_waiters();
+        self.registry
+            .remove_exact(&self.match_key, &self.registration.transaction_id);
+    }
+}
+
+impl ServerTransactionMatchRegistry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            by_match: DashMap::new(),
+            by_wire_identity: DashMap::new(),
+            by_transaction: DashMap::new(),
+            next_collision: AtomicU64::new(1),
+            claim_lock: std::sync::Mutex::new(()),
+        })
+    }
+
+    fn registration(
+        &self,
+        key: &ServerTransactionMatchKey,
+    ) -> Option<Arc<ServerTransactionMatchRegistration>> {
+        self.by_match
+            .get(key)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    fn claim(
+        self: &Arc<Self>,
+        match_key: ServerTransactionMatchKey,
+        wire_key: &TransactionKey,
+        wire_key_is_available: bool,
+        authenticated_owner: Option<ServerAuthenticatedOwner>,
+    ) -> ServerTransactionMatchClaim {
+        let _guard = self
+            .claim_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = self.registration(&match_key) {
+            return ServerTransactionMatchClaim::Existing(existing);
+        }
+        let wire_identity = match_key.wire_identity();
+        let collisions: Vec<_> = self
+            .by_wire_identity
+            .get(&wire_identity)
+            .map(|matches| {
+                matches
+                    .iter()
+                    .filter_map(|stored| self.registration(stored))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !collisions.is_empty() {
+            if collisions.iter().any(|registration| {
+                registration.state.load(Ordering::Acquire) == SERVER_MATCH_PENDING
+            }) {
+                return ServerTransactionMatchClaim::PendingCollision(collisions);
+            }
+            let Some(owner) = authenticated_owner.as_ref() else {
+                return ServerTransactionMatchClaim::ConflictingOwner;
+            };
+            if collisions.iter().any(|registration| {
+                registration.authenticated_owner() == Some(owner)
+                    || registration.authenticated_owner().is_none()
+            }) {
+                return ServerTransactionMatchClaim::ConflictingOwner;
+            }
+        }
+        let transaction_id = if wire_key_is_available && !self.by_transaction.contains_key(wire_key)
+        {
+            wire_key.clone()
+        } else {
+            loop {
+                let generation = self.next_collision.fetch_add(1, Ordering::Relaxed);
+                let candidate = TransactionKey::new(
+                    format!("{}~rvoip-server-{generation}", wire_key.branch()),
+                    wire_key.method().clone(),
+                    true,
+                );
+                if !self.by_transaction.contains_key(&candidate) {
+                    break candidate;
+                }
+            }
+        };
+        let registration = ServerTransactionMatchRegistration::new(transaction_id.clone());
+        self.by_transaction
+            .insert(transaction_id, match_key.clone());
+        self.by_wire_identity
+            .entry(wire_identity)
+            .or_default()
+            .push(match_key.clone());
+        self.by_match
+            .insert(match_key.clone(), Arc::clone(&registration));
+        ServerTransactionMatchClaim::Reserved(ServerTransactionMatchReservation {
+            registry: Arc::clone(self),
+            match_key,
+            registration,
+            authenticated_owner,
+            committed: false,
+        })
+    }
+
+    fn remove_transaction(&self, transaction_id: &TransactionKey) {
+        if let Some((_, match_key)) = self.by_transaction.remove(transaction_id) {
+            self.remove_match_registration(&match_key, transaction_id);
+        }
+    }
+
+    fn remove_exact(&self, match_key: &ServerTransactionMatchKey, transaction_id: &TransactionKey) {
+        self.by_transaction
+            .remove_if(transaction_id, |_, stored| stored == match_key);
+        self.remove_match_registration(match_key, transaction_id);
+    }
+
+    fn remove_match_registration(
+        &self,
+        match_key: &ServerTransactionMatchKey,
+        transaction_id: &TransactionKey,
+    ) {
+        self.by_match.remove_if(match_key, |_, registration| {
+            registration.transaction_id == *transaction_id
+        });
+        let wire_identity = match_key.wire_identity();
+        if let Some(mut matches) = self.by_wire_identity.get_mut(&wire_identity) {
+            matches.retain(|stored| stored != match_key);
+            let empty = matches.is_empty();
+            drop(matches);
+            if empty {
+                self.by_wire_identity
+                    .remove_if(&wire_identity, |_, stored| stored.is_empty());
+            }
+        }
+    }
+
+    fn clear(&self) {
+        self.by_match.clear();
+        self.by_wire_identity.clear();
+        self.by_transaction.clear();
+    }
+}
+
+fn new_server_transaction_registries() -> (
+    Arc<TransactionAdmissionRegistry>,
+    Arc<ServerTransactionMatchRegistry>,
+) {
+    let admissions = TransactionAdmissionRegistry::new();
+    let matches = ServerTransactionMatchRegistry::new();
+    admissions.install_final_release_hook(Arc::new({
+        let matches = Arc::clone(&matches);
+        move |transaction_id| matches.remove_transaction(transaction_id)
+    }));
+    (admissions, matches)
 }
 
 const MANAGER_ADMISSION_RUNNING: u8 = 0;
@@ -1304,7 +1847,7 @@ impl TransactionAdmissionRegistry {
         Arc::new(Self {
             entries: DashMap::new(),
             next_generation: AtomicU64::new(1),
-            final_release_hook: std::sync::RwLock::new(None),
+            final_release_hooks: std::sync::RwLock::new(Vec::new()),
         })
     }
 
@@ -1312,10 +1855,10 @@ impl TransactionAdmissionRegistry {
         &self,
         hook: Arc<dyn Fn(&TransactionKey) + Send + Sync + 'static>,
     ) {
-        *self
-            .final_release_hook
+        self.final_release_hooks
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(hook);
     }
 
     fn try_claim(self: &Arc<Self>, key: &TransactionKey) -> Option<TransactionAdmissionOwner> {
@@ -1331,6 +1874,8 @@ impl TransactionAdmissionRegistry {
                         registry: Arc::clone(self),
                         key: key.clone(),
                         generation,
+                        response_route_owner: AtomicUsize::new(0),
+                        delayed_offer_ack_answers: OnceLock::new(),
                     }),
                 })
             }
@@ -1342,6 +1887,8 @@ struct TransactionAdmissionOwnerInner {
     registry: Arc<TransactionAdmissionRegistry>,
     key: TransactionKey,
     generation: u64,
+    response_route_owner: AtomicUsize,
+    delayed_offer_ack_answers: OnceLock<Arc<DelayedOfferAckAnswers>>,
 }
 
 impl Drop for TransactionAdmissionOwnerInner {
@@ -1355,13 +1902,13 @@ impl Drop for TransactionAdmissionOwnerInner {
             if *entry.get() != self.generation {
                 return;
             }
-            let hook = self
+            let hooks = self
                 .registry
-                .final_release_hook
+                .final_release_hooks
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            if let Some(hook) = hook {
+            for hook in hooks {
                 hook(&self.key);
             }
             entry.remove();
@@ -1382,6 +1929,54 @@ pub struct TransactionAdmissionOwner {
 impl TransactionAdmissionOwner {
     pub(crate) fn generation(&self) -> u64 {
         self._inner.generation
+    }
+
+    fn install_response_route_owner(&self, owner: usize) {
+        assert_ne!(
+            owner, 0,
+            "response-route allocation identity must be nonzero"
+        );
+        match self._inner.response_route_owner.compare_exchange(
+            0,
+            owner,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(current) => assert_eq!(
+                current, owner,
+                "transaction admission generation cannot change response-route owner"
+            ),
+        }
+    }
+
+    pub(crate) fn response_route_owner(&self) -> Option<usize> {
+        match self._inner.response_route_owner.load(Ordering::Acquire) {
+            0 => None,
+            owner => Some(owner),
+        }
+    }
+
+    fn owns_transaction_generation(&self, transaction_id: &TransactionKey) -> bool {
+        self._inner.key == *transaction_id
+            && self
+                ._inner
+                .registry
+                .entries
+                .get(transaction_id)
+                .is_some_and(|generation| *generation == self._inner.generation)
+    }
+
+    fn delayed_offer_ack_answers(&self) -> Option<Arc<DelayedOfferAckAnswers>> {
+        self._inner.delayed_offer_ack_answers.get().cloned()
+    }
+
+    fn ensure_delayed_offer_ack_answers(&self) -> Arc<DelayedOfferAckAnswers> {
+        Arc::clone(
+            self._inner
+                .delayed_offer_ack_answers
+                .get_or_init(|| Arc::new(DelayedOfferAckAnswers::default())),
+        )
     }
 }
 
@@ -1451,6 +2046,10 @@ pub struct TransactionManager {
     retained_client_deadline_worker: Option<RetainedClientDeadlineWorker>,
     /// Active server transactions. Same pattern as `client_transactions`.
     server_transactions: Arc<DashMap<TransactionKey, Arc<dyn ServerTransaction>>>,
+    /// Private RFC 3261 server-match identity. It includes normalized top-Via
+    /// sent-by and the exact transport-authenticated ingress peer, allowing
+    /// colliding wire branches to coexist without changing `TransactionKey`.
+    server_transaction_matches: Arc<ServerTransactionMatchRegistry>,
     /// Indexed queue of transactions that reached `Terminated`.
     /// Runtime cleanup drains this bounded index instead of scanning either
     /// active transaction table. The public full-scan repair API is reserved
@@ -1564,6 +2163,15 @@ pub struct TransactionManager {
     /// before the transaction user sees it. `None` preserves the historical
     /// unauthenticated-listener behavior.
     request_ingress_authorizer: Option<Arc<dyn SipRequestIngressAuthorizer>>,
+    /// A proxy transaction user forwards an unmatched CANCEL statelessly
+    /// instead of applying the UAS default (481). Disabled unless the sole TU
+    /// explicitly opts into proxy semantics.
+    forward_unmatched_cancel_to_tu: Arc<AtomicBool>,
+    /// Lossless, exact-transport ingress reserved for the sole stateful-proxy
+    /// transaction user. Proxy-only routing metadata stays off the stable
+    /// public `TransactionEvent` surface.
+    stateful_proxy_ingress_tx:
+        Arc<std::sync::Mutex<Option<mpsc::Sender<StatefulProxyIngressEvent>>>>,
     /// Successful ingress identities awaiting dialog/session consumption.
     pending_inbound_principals: Arc<DashMap<TransactionKey, InboundPrincipalBinding>>,
     pending_inbound_principal_inserted_at: Arc<DashMap<TransactionKey, InboundPrincipalLease>>,
@@ -1571,6 +2179,7 @@ pub struct TransactionManager {
     transaction_dispatch_workers: usize,
     transaction_dispatch_queue_capacity: usize,
     transaction_command_channel_capacity: usize,
+    stateless_overload_retry_after_secs: Arc<AtomicU32>,
     transaction_dispatch_priority_burst_max: Arc<AtomicUsize>,
     invite_2xx_retransmit_max_due_per_tick: Arc<AtomicUsize>,
 }
@@ -1583,6 +2192,25 @@ enum TransactionIngressKind {
     Bye,
     Cancel,
     Other,
+}
+
+/// Selects transaction-user behavior where RFC 3261 assigns different
+/// responsibilities to a user agent and a transaction-stateful proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionUserMode {
+    /// Preserve rvoip's UA-core safety features, including bounded retired
+    /// INVITE response authentication and TU-owned 2xx retransmission cache.
+    UserAgent,
+    /// Apply RFC 6026 proxy behavior: unmatched CANCEL reaches the proxy TU,
+    /// true stray INVITE responses are dropped, and the manager does not act
+    /// as a UAS core by proactively retransmitting INVITE 2xx responses.
+    StatefulProxy,
+}
+
+impl Default for TransactionUserMode {
+    fn default() -> Self {
+        Self::UserAgent
+    }
 }
 
 impl TransactionIngressKind {
@@ -2334,6 +2962,30 @@ impl TransactionManager {
         }
     }
 
+    /// Distinguish the legacy public `Terminated` projection from actual
+    /// protocol termination. RFC 6026 INVITE transactions remain retained in
+    /// private Accepted until Timer M/L even though their public state matches
+    /// 0.3.1. A destroyed runner is also authoritative: compact UDP Timer J/K
+    /// retirement intentionally leaves the public state at `Completed` after
+    /// transferring protocol ownership to the manager tombstone.
+    fn transaction_protocol_terminated(&self, transaction_id: &TransactionKey) -> bool {
+        if let Some(transaction) = self.client_transactions.get(transaction_id) {
+            if transaction.value().data().get_lifecycle() != TransactionLifecycle::Destroyed
+                && !transaction.value().is_protocol_terminated()
+            {
+                return false;
+            }
+        }
+        if let Some(transaction) = self.server_transactions.get(transaction_id) {
+            if transaction.value().data().get_lifecycle() != TransactionLifecycle::Destroyed
+                && !transaction.value().is_protocol_terminated()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Enable or disable the INVITE server transaction automatic `100 Trying`
     /// timer used by newly-created server transactions.
     pub fn set_auto_100_trying(&mut self, enabled: bool) {
@@ -2362,6 +3014,122 @@ impl TransactionManager {
         self.request_ingress_authorizer.clone()
     }
 
+    /// Monotonically claim this manager for one transaction-stateful proxy TU.
+    ///
+    /// The claim cannot be reverted or shared. It must happen before any
+    /// transaction is active, preventing a proxy from changing the semantics
+    /// of an already-running UA manager.
+    pub fn try_claim_stateful_proxy_mode(&self) -> Result<()> {
+        if !self.client_transactions.is_empty() || !self.server_transactions.is_empty() {
+            return Err(Error::Other(
+                "stateful-proxy TU mode must be claimed before transactions are active".into(),
+            ));
+        }
+        self.forward_unmatched_cancel_to_tu
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                Error::Other("transaction manager is already claimed by a stateful proxy TU".into())
+            })?;
+        // Close the admission/check race fail-closed. The mode remains
+        // monotonic even when an already-running transport won the race.
+        if !self.client_transactions.is_empty() || !self.server_transactions.is_empty() {
+            return Err(Error::Other(
+                "a transaction became active while stateful-proxy TU mode was claimed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Claim this manager for one stateful-proxy TU and install its exact,
+    /// transport-bound ingress channel.
+    ///
+    /// This is an additive implementation hook for `rvoip-sip-proxy`. Normal
+    /// applications continue to consume the source-compatible
+    /// [`TransactionEvent`] receiver returned by the constructor.
+    #[doc(hidden)]
+    pub fn try_claim_stateful_proxy_ingress(
+        &self,
+        capacity: usize,
+    ) -> Result<mpsc::Receiver<StatefulProxyIngressEvent>> {
+        if !self.client_transactions.is_empty() || !self.server_transactions.is_empty() {
+            return Err(Error::Other(
+                "stateful-proxy TU mode must be claimed before transactions are active".into(),
+            ));
+        }
+
+        let mut ingress_slot = self
+            .stateful_proxy_ingress_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ingress_slot.is_some() {
+            return Err(Error::Other(
+                "stateful-proxy exact ingress is already claimed".into(),
+            ));
+        }
+
+        let (ingress_tx, ingress_rx) = mpsc::channel(capacity.max(1));
+        *ingress_slot = Some(ingress_tx);
+        if self
+            .forward_unmatched_cancel_to_tu
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            ingress_slot.take();
+            return Err(Error::Other(
+                "transaction manager is already claimed by a stateful proxy TU".into(),
+            ));
+        }
+
+        // Keep the mode monotonic but close the admission/check race
+        // fail-closed, matching `try_claim_stateful_proxy_mode`.
+        if !self.client_transactions.is_empty() || !self.server_transactions.is_empty() {
+            ingress_slot.take();
+            return Err(Error::Other(
+                "a transaction became active while stateful-proxy TU mode was claimed".into(),
+            ));
+        }
+        drop(ingress_slot);
+        Ok(ingress_rx)
+    }
+
+    pub(crate) async fn send_stateful_proxy_ingress_event(
+        &self,
+        event: StatefulProxyIngressEvent,
+    ) -> Result<()> {
+        let sender = self
+            .stateful_proxy_ingress_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                Error::Other(
+                    "stateful-proxy mode has no exact ingress receiver; claim through rvoip-sip-proxy"
+                        .into(),
+                )
+            })?;
+        sender
+            .send(event)
+            .await
+            .map_err(|_| Error::Other("stateful-proxy exact ingress receiver is closed".into()))
+    }
+
+    /// Return the configured transaction-user mode.
+    pub fn transaction_user_mode(&self) -> TransactionUserMode {
+        if self.forward_unmatched_cancel_to_tu.load(Ordering::Acquire) {
+            TransactionUserMode::StatefulProxy
+        } else {
+            TransactionUserMode::UserAgent
+        }
+    }
+
+    pub(crate) fn forward_unmatched_cancel_to_tu(&self) -> bool {
+        self.transaction_user_mode() == TransactionUserMode::StatefulProxy
+    }
+
+    pub(crate) fn stateful_proxy_tu_mode(&self) -> bool {
+        self.transaction_user_mode() == TransactionUserMode::StatefulProxy
+    }
+
     /// Set the maximum number of consecutive priority-lane ACK/BYE events a
     /// transaction dispatch worker may process before giving one ready normal
     /// item a turn. Values below `1` are clamped to `1`.
@@ -2383,6 +3151,14 @@ impl TransactionManager {
     /// Return the capacity used for newly-created transaction command channels.
     pub fn transaction_command_channel_capacity(&self) -> usize {
         self.transaction_command_channel_capacity
+    }
+
+    /// Set the Retry-After value used when protocol-retention admission must
+    /// reject a request before allocating its server transaction.
+    #[doc(hidden)]
+    pub fn set_stateless_overload_retry_after_secs(&self, seconds: u32) {
+        self.stateless_overload_retry_after_secs
+            .store(seconds.max(1), Ordering::Release);
     }
 
     /// Register the integrated dialog consumer's extra dispatch queue. Compact
@@ -2509,6 +3285,32 @@ impl TransactionManager {
             pending_inbound_timing: self.pending_inbound_timing.len(),
             pending_inbound_principals: self.pending_inbound_principals.len(),
         }
+    }
+
+    /// Count active response routes that no live or compact transaction owns.
+    ///
+    /// Compact client tombstones intentionally retain their authenticated
+    /// response route through the applicable RFC timer. Keep those bounded
+    /// protocol records visible in [`Self::retention_counts`], but do not
+    /// classify them as leaks in post-call release gates.
+    pub fn orphaned_transaction_destination_count(&self) -> usize {
+        self.transaction_destinations
+            .iter()
+            .filter(|entry| {
+                let transaction_id = entry.key();
+                entry.value().is_active()
+                    && !self
+                        .client_transactions
+                        .contains_key(transaction_id.as_ref())
+                    && !self
+                        .server_transactions
+                        .contains_key(transaction_id.as_ref())
+                    && !self
+                        .compact_non_invite_tombstones
+                        .get(transaction_id.as_ref())
+                        .is_some_and(|compact| compact.is_client())
+            })
+            .count()
     }
 
     /// Number of unexpired INVITE client tombstones retained for authenticated
@@ -2656,8 +3458,33 @@ impl TransactionManager {
         let mut compact_server_response_wire_bytes = 0_usize;
         let mut compact_client_completion_wire_bytes = 0_usize;
         let mut compact_client_live_completion_cells = 0_usize;
+        let mut compact_timer_j = 0_usize;
+        let mut compact_timer_k = 0_usize;
+        let mut compact_timer_l = 0_usize;
+        let mut compact_timer_m = 0_usize;
+        let mut compact_late_2xx = 0_usize;
+        let mut compact_invite_request_wire_bytes = 0_usize;
         for entry in self.compact_non_invite_tombstones.iter() {
             compact_tombstone_key_bytes += transaction_key_payload_bytes(entry.key());
+            match entry.value().timer() {
+                crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::J => {
+                    compact_timer_j += 1
+                }
+                crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::K => {
+                    compact_timer_k += 1
+                }
+                crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::L => {
+                    compact_timer_l += 1
+                }
+                crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::M => {
+                    compact_timer_m += 1
+                }
+                crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::U => {
+                    compact_late_2xx += 1
+                }
+            }
+            compact_invite_request_wire_bytes +=
+                entry.value().request_wire().map_or(0, bytes::Bytes::len);
             match entry.value() {
                 crate::transaction::lifecycle_scheduler::CompactNonInviteTombstone::Client {
                     completion,
@@ -2724,8 +3551,40 @@ impl TransactionManager {
         let mut retained_invite_response_records = 0_usize;
         let mut retired_completion_wire_bytes = 0_usize;
         let mut retired_shared_wire_records = 0_usize;
+        let mut delayed_offer_ack_answer_records = 0_usize;
+        let mut delayed_offer_ack_remote_tag_bytes = 0_usize;
+        let mut delayed_offer_ack_answer_bytes = 0_usize;
         for entry in self.transaction_destinations.iter() {
             retired_route_key_bytes += transaction_key_payload_bytes(entry.key());
+            let route_owner = entry.value().response_route_owner();
+            let admission_owner = entry
+                .value()
+                .retired()
+                .and_then(|retired| retired.completion.admission_owner())
+                .or_else(|| {
+                    self.client_transactions
+                        .get(entry.key().as_ref())
+                        .and_then(|transaction| {
+                            (Arc::as_ptr(transaction.value().data()) as usize == route_owner)
+                                .then(|| transaction.value().data().transaction_admission_owner())
+                                .flatten()
+                        })
+                })
+                .or_else(|| {
+                    self.compact_non_invite_tombstones
+                        .get(entry.key().as_ref())
+                        .filter(|tombstone| tombstone.value().is_client())
+                        .and_then(|tombstone| tombstone.value().admission_owner())
+                });
+            if let Some(answers) =
+                admission_owner.and_then(|owner| owner.delayed_offer_ack_answers())
+            {
+                for answer in answers.entries.iter() {
+                    delayed_offer_ack_answer_records += 1;
+                    delayed_offer_ack_remote_tag_bytes += answer.key().len();
+                    delayed_offer_ack_answer_bytes += answer.value().len();
+                }
+            }
             if let Some(retired) = entry.value().retired() {
                 retained_invite_records += 1;
                 retained_invite_key_bytes += transaction_key_payload_bytes(entry.key());
@@ -2826,6 +3685,12 @@ impl TransactionManager {
             "server_by_lifecycle": server_by_lifecycle,
             "compact_non_invite_tombstones": self.compact_non_invite_tombstones.len(),
             "compact_non_invite_deadlines": self.lifecycle_scheduler.as_ref().map(|scheduler| scheduler.compact_deadline_count()).unwrap_or(0),
+            "compact_invite_accepted": {
+                "client_timer_m": compact_timer_m,
+                "server_timer_l": compact_timer_l,
+                "ua_late_2xx": compact_late_2xx,
+                "request_wire_bytes": compact_invite_request_wire_bytes,
+            },
             "retired_client_transactions": retired_client_counts.transactions,
             "retired_client_deadlines": retired_client_counts.deadlines,
             "retired_client_request_wire_bytes": retired_client_counts.request_wire_bytes,
@@ -2882,13 +3747,22 @@ impl TransactionManager {
                     "pending_inbound_principal_inserted_at": self.pending_inbound_principal_inserted_at.capacity(),
                 },
                 "compact_non_invite": {
-                    "client_tombstones": compact_client_tombstones,
-                    "server_tombstones": compact_server_tombstones,
+                    "client_tombstones": compact_timer_k,
+                    "server_tombstones": compact_timer_j,
                     "transaction_key_payload_bytes": compact_tombstone_key_bytes,
                     "server_response_wire_bytes": compact_server_response_wire_bytes,
                     "client_completion_wire_bytes": compact_client_completion_wire_bytes,
                     "client_live_completion_cells": compact_client_live_completion_cells,
                     "client_route_owner_proofs": compact_client_tombstones,
+                    "server_response_route_records": compact_server_tombstones,
+                },
+                "compact_invite_accepted": {
+                    "client_timer_m": compact_timer_m,
+                    "server_timer_l": compact_timer_l,
+                    "ua_late_2xx": compact_late_2xx,
+                    "request_wire_bytes": compact_invite_request_wire_bytes,
+                    "server_response_wire_bytes": self.compact_non_invite_tombstones.iter().filter(|entry| entry.value().timer() == crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::L).filter_map(|entry| entry.value().server_response().map(|(wire, _)| wire.len())).sum::<usize>(),
+                    "client_completion_wire_bytes": self.compact_non_invite_tombstones.iter().filter(|entry| matches!(entry.value().timer(), crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::M | crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::U)).filter_map(|entry| entry.value().client_completion().map(|completion| completion.diagnostics().wire_response_bytes)).sum::<usize>(),
                 },
                 "client_completion": {
                     "map_transaction_key_payload_bytes": completion_key_bytes,
@@ -2902,6 +3776,9 @@ impl TransactionManager {
                     "map_transaction_key_payload_bytes": retired_route_key_bytes,
                     "request_wire_bytes": retired_client_counts.request_wire_bytes,
                     "completion_wire_bytes": retired_completion_wire_bytes,
+                    "delayed_offer_ack_answer_records": delayed_offer_ack_answer_records,
+                    "delayed_offer_ack_remote_tag_bytes": delayed_offer_ack_remote_tag_bytes,
+                    "delayed_offer_ack_answer_bytes": delayed_offer_ack_answer_bytes,
                     "shared_request_response_wire_records": retired_shared_wire_records,
                     "deadline_records": retired_deadline_count,
                     "deadline_transaction_key_payload_bytes": retired_deadline_key_bytes,
@@ -3153,10 +4030,12 @@ impl TransactionManager {
         // Setup timer manager
         let timer_manager = Arc::new(TimerManager::new(Some(timer_settings.clone())));
 
+        let (transaction_admissions, server_transaction_matches) =
+            new_server_transaction_registries();
         let manager = Self {
             transport,
             client_transactions,
-            transaction_admissions: TransactionAdmissionRegistry::new(),
+            transaction_admissions,
             admission_lifecycle: TransactionManagerAdmissionLifecycle::new(),
             operation_cancellation: TransactionManagerOperationCancellation::new(),
             shutdown_gate: Arc::new(Mutex::new(())),
@@ -3169,6 +4048,7 @@ impl TransactionManager {
             client_completion_capacity: retired_client_transaction_capacity(index_capacity),
             retained_client_deadline_worker: Some(RetainedClientDeadlineWorker::new()),
             server_transactions,
+            server_transaction_matches,
             terminated_transactions: Arc::new(DashMap::with_capacity(index_initial_capacity)),
             server_invite_dialog_index: Arc::new(DashMap::new()),
             server_invite_dialog_keys_by_tx: Arc::new(DashMap::with_capacity(
@@ -3219,12 +4099,15 @@ impl TransactionManager {
                 index_initial_capacity,
             )),
             request_ingress_authorizer: None,
+            forward_unmatched_cancel_to_tu: Arc::new(AtomicBool::new(false)),
+            stateful_proxy_ingress_tx: Arc::new(std::sync::Mutex::new(None)),
             pending_inbound_principals,
             pending_inbound_principal_inserted_at,
             pending_inbound_principal_generation: Arc::new(AtomicU64::new(0)),
             transaction_dispatch_workers: DEFAULT_TRANSACTION_DISPATCH_WORKERS,
             transaction_dispatch_queue_capacity: events_capacity,
             transaction_command_channel_capacity: DEFAULT_TRANSACTION_COMMAND_CHANNEL_CAPACITY,
+            stateless_overload_retry_after_secs: Arc::new(AtomicU32::new(1)),
             transaction_dispatch_priority_burst_max: Arc::new(AtomicUsize::new(
                 DEFAULT_TRANSACTION_DISPATCH_PRIORITY_BURST_MAX,
             )),
@@ -3348,10 +4231,12 @@ impl TransactionManager {
 
         // Create the timer manager with custom config
         let timer_manager = Arc::new(TimerManager::new(Some(timer_settings.clone())));
+        let (transaction_admissions, server_transaction_matches) =
+            new_server_transaction_registries();
         let manager = Self {
             transport,
             client_transactions,
-            transaction_admissions: TransactionAdmissionRegistry::new(),
+            transaction_admissions,
             admission_lifecycle: TransactionManagerAdmissionLifecycle::new(),
             operation_cancellation: TransactionManagerOperationCancellation::new(),
             shutdown_gate: Arc::new(Mutex::new(())),
@@ -3364,6 +4249,7 @@ impl TransactionManager {
             client_completion_capacity: retired_client_transaction_capacity(index_capacity),
             retained_client_deadline_worker: Some(RetainedClientDeadlineWorker::new()),
             server_transactions,
+            server_transaction_matches,
             terminated_transactions: Arc::new(DashMap::with_capacity(index_initial_capacity)),
             server_invite_dialog_index: Arc::new(DashMap::new()),
             server_invite_dialog_keys_by_tx: Arc::new(DashMap::with_capacity(
@@ -3414,12 +4300,15 @@ impl TransactionManager {
                 index_initial_capacity,
             )),
             request_ingress_authorizer: None,
+            forward_unmatched_cancel_to_tu: Arc::new(AtomicBool::new(false)),
+            stateful_proxy_ingress_tx: Arc::new(std::sync::Mutex::new(None)),
             pending_inbound_principals,
             pending_inbound_principal_inserted_at,
             pending_inbound_principal_generation: Arc::new(AtomicU64::new(0)),
             transaction_dispatch_workers: DEFAULT_TRANSACTION_DISPATCH_WORKERS,
             transaction_dispatch_queue_capacity: events_capacity,
             transaction_command_channel_capacity: DEFAULT_TRANSACTION_COMMAND_CHANNEL_CAPACITY,
+            stateless_overload_retry_after_secs: Arc::new(AtomicU32::new(1)),
             transaction_dispatch_priority_burst_max: Arc::new(AtomicUsize::new(
                 DEFAULT_TRANSACTION_DISPATCH_PRIORITY_BURST_MAX,
             )),
@@ -3796,10 +4685,12 @@ impl TransactionManager {
         // Setup timer manager
         let timer_manager = Arc::new(TimerManager::new(Some(timer_settings.clone())));
 
+        let (transaction_admissions, server_transaction_matches) =
+            new_server_transaction_registries();
         let manager = Self {
             transport: default_transport,
             client_transactions,
-            transaction_admissions: TransactionAdmissionRegistry::new(),
+            transaction_admissions,
             admission_lifecycle: TransactionManagerAdmissionLifecycle::new(),
             operation_cancellation: TransactionManagerOperationCancellation::new(),
             shutdown_gate: Arc::new(Mutex::new(())),
@@ -3812,6 +4703,7 @@ impl TransactionManager {
             client_completion_capacity: retired_client_transaction_capacity(index_capacity),
             retained_client_deadline_worker: Some(RetainedClientDeadlineWorker::new()),
             server_transactions,
+            server_transaction_matches,
             terminated_transactions: Arc::new(DashMap::with_capacity(index_initial_capacity)),
             server_invite_dialog_index: Arc::new(DashMap::new()),
             server_invite_dialog_keys_by_tx: Arc::new(DashMap::with_capacity(
@@ -3862,12 +4754,15 @@ impl TransactionManager {
                 index_initial_capacity,
             )),
             request_ingress_authorizer,
+            forward_unmatched_cancel_to_tu: Arc::new(AtomicBool::new(false)),
+            stateful_proxy_ingress_tx: Arc::new(std::sync::Mutex::new(None)),
             pending_inbound_principals,
             pending_inbound_principal_inserted_at,
             pending_inbound_principal_generation: Arc::new(AtomicU64::new(0)),
             transaction_dispatch_workers,
             transaction_dispatch_queue_capacity,
             transaction_command_channel_capacity: DEFAULT_TRANSACTION_COMMAND_CHANNEL_CAPACITY,
+            stateless_overload_retry_after_secs: Arc::new(AtomicU32::new(1)),
             transaction_dispatch_priority_burst_max: Arc::new(AtomicUsize::new(
                 DEFAULT_TRANSACTION_DISPATCH_PRIORITY_BURST_MAX,
             )),
@@ -3971,10 +4866,12 @@ impl TransactionManager {
 
         // Create the timer manager
         let timer_manager = Arc::new(TimerManager::new(Some(timer_settings.clone())));
+        let (transaction_admissions, server_transaction_matches) =
+            new_server_transaction_registries();
         let manager = Self {
             transport,
             client_transactions,
-            transaction_admissions: TransactionAdmissionRegistry::new(),
+            transaction_admissions,
             admission_lifecycle: TransactionManagerAdmissionLifecycle::new(),
             operation_cancellation: TransactionManagerOperationCancellation::new(),
             shutdown_gate: Arc::new(Mutex::new(())),
@@ -3987,6 +4884,7 @@ impl TransactionManager {
             client_completion_capacity: retired_client_transaction_capacity(index_capacity),
             retained_client_deadline_worker: Some(RetainedClientDeadlineWorker::new()),
             server_transactions,
+            server_transaction_matches,
             terminated_transactions: Arc::new(DashMap::with_capacity(index_initial_capacity)),
             server_invite_dialog_index: Arc::new(DashMap::new()),
             server_invite_dialog_keys_by_tx: Arc::new(DashMap::with_capacity(
@@ -4037,12 +4935,15 @@ impl TransactionManager {
                 index_initial_capacity,
             )),
             request_ingress_authorizer: None,
+            forward_unmatched_cancel_to_tu: Arc::new(AtomicBool::new(false)),
+            stateful_proxy_ingress_tx: Arc::new(std::sync::Mutex::new(None)),
             pending_inbound_principals,
             pending_inbound_principal_inserted_at,
             pending_inbound_principal_generation: Arc::new(AtomicU64::new(0)),
             transaction_dispatch_workers: DEFAULT_TRANSACTION_DISPATCH_WORKERS,
             transaction_dispatch_queue_capacity: 100,
             transaction_command_channel_capacity: DEFAULT_TRANSACTION_COMMAND_CHANNEL_CAPACITY,
+            stateless_overload_retry_after_secs: Arc::new(AtomicU32::new(1)),
             transaction_dispatch_priority_burst_max: Arc::new(AtomicUsize::new(
                 DEFAULT_TRANSACTION_DISPATCH_PRIORITY_BURST_MAX,
             )),
@@ -4105,12 +5006,14 @@ impl TransactionManager {
         );
         let next_subscriber_id = Arc::new(AtomicUsize::new(0));
 
+        let (transaction_admissions, server_transaction_matches) =
+            new_server_transaction_registries();
         let manager = Self {
             transport,
             events_tx,
             event_subscribers,
             client_transactions,
-            transaction_admissions: TransactionAdmissionRegistry::new(),
+            transaction_admissions,
             admission_lifecycle: TransactionManagerAdmissionLifecycle::new(),
             operation_cancellation: TransactionManagerOperationCancellation::new(),
             shutdown_gate: Arc::new(Mutex::new(())),
@@ -4123,6 +5026,7 @@ impl TransactionManager {
             client_completion_capacity: retired_client_transaction_capacity(index_capacity),
             retained_client_deadline_worker: None,
             server_transactions,
+            server_transaction_matches,
             terminated_transactions: Arc::new(DashMap::with_capacity(index_initial_capacity)),
             server_invite_dialog_index: Arc::new(DashMap::new()),
             server_invite_dialog_keys_by_tx: Arc::new(DashMap::with_capacity(
@@ -4171,6 +5075,8 @@ impl TransactionManager {
                 index_initial_capacity,
             )),
             request_ingress_authorizer: None,
+            forward_unmatched_cancel_to_tu: Arc::new(AtomicBool::new(false)),
+            stateful_proxy_ingress_tx: Arc::new(std::sync::Mutex::new(None)),
             pending_inbound_principals: Arc::new(dashmap::DashMap::with_capacity(
                 index_initial_capacity,
             )),
@@ -4181,6 +5087,7 @@ impl TransactionManager {
             transaction_dispatch_workers: DEFAULT_TRANSACTION_DISPATCH_WORKERS,
             transaction_dispatch_queue_capacity: 10,
             transaction_command_channel_capacity: DEFAULT_TRANSACTION_COMMAND_CHANNEL_CAPACITY,
+            stateless_overload_retry_after_secs: Arc::new(AtomicU32::new(1)),
             transaction_dispatch_priority_burst_max: Arc::new(AtomicUsize::new(
                 DEFAULT_TRANSACTION_DISPATCH_PRIORITY_BURST_MAX,
             )),
@@ -4367,7 +5274,8 @@ impl TransactionManager {
     /// runner-owned write rather than either losing completion or following a
     /// later retry generation. Absence of the transaction is terminal because
     /// the exact generation can no longer be retried safely.
-    pub(crate) async fn classify_final_response_completion(
+    #[doc(hidden)]
+    pub async fn classify_final_response_completion(
         &self,
         transaction_id: &TransactionKey,
     ) -> crate::transaction::server::FinalResponseCompletionDisposition {
@@ -4403,10 +5311,78 @@ impl TransactionManager {
             .get(transaction_id)
             .map(|r| r.value().clone());
         let Some(tx) = tx_arc else {
-            return Err(Error::transaction_not_found(
-                transaction_id.clone(),
-                "send_response - transaction not found",
-            ));
+            let compact = self
+                .compact_non_invite_tombstones
+                .get(transaction_id)
+                .filter(|entry| {
+                    entry.value().timer()
+                        == crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::L
+                })
+                .and_then(|entry| {
+                    entry
+                        .value()
+                        .server_response()
+                        .map(|(_, route)| (route.clone(), entry.value().admission_owner()))
+                });
+            let Some((route, admission_owner)) = compact else {
+                return Err(Error::transaction_not_found(
+                    transaction_id.clone(),
+                    "send_response - transaction not found",
+                ));
+            };
+            if !response.status().is_success() {
+                return Err(Error::Other(
+                    "only additional 2xx responses are valid during RFC 6026 Accepted".into(),
+                ));
+            }
+            let mut response = response;
+            crate::transaction::utils::stamp_response_via_with_source(
+                &mut response,
+                route.destination,
+            );
+            let wire = bytes::Bytes::from(Message::Response(response.clone()).to_bytes());
+            let result = self
+                .send_cached_response(
+                    response.clone(),
+                    wire.clone(),
+                    route.clone(),
+                    "Failed to send compact Accepted response",
+                )
+                .await
+                .map_err(|error| {
+                    Error::transport_error(error, "Failed to send compact Accepted response")
+                });
+            if result.is_err() {
+                let _ = self
+                    .events_tx
+                    .send(TransactionEvent::TransportError {
+                        transaction_id: transaction_id.clone(),
+                    })
+                    .await;
+                return result;
+            }
+            if let Some(mut entry) = self.compact_non_invite_tombstones.get_mut(transaction_id) {
+                entry.update_server_accepted_response(wire.clone());
+            }
+            if !self.stateful_proxy_tu_mode() {
+                let now = Instant::now();
+                self.insert_invite_2xx_response_cache_entry(
+                    transaction_id.clone(),
+                    Invite2xxResponseCacheEntry {
+                        response,
+                        wire_bytes: wire,
+                        route,
+                        created_at: now,
+                        acked_at: None,
+                        expires_at: now + INVITE_2XX_RESPONSE_CACHE_TTL,
+                        next_retransmit_at: now + self.timer_settings.t1,
+                        retransmit_interval: self.timer_settings.t1,
+                        deadline_generation: 0,
+                        _admission_owner: admission_owner,
+                    },
+                );
+            }
+            return Ok(());
         };
 
         use crate::transaction::server::TransactionExt;
@@ -4690,10 +5666,17 @@ impl TransactionManager {
             return Ok(entry.value().kind());
         }
         if let Some(entry) = self.compact_non_invite_tombstones.get(transaction_id) {
-            return Ok(if entry.value().is_client() {
-                TransactionKind::NonInviteClient
-            } else {
-                TransactionKind::NonInviteServer
+            return Ok(match (entry.value().is_client(), entry.value().timer()) {
+                (
+                    true,
+                    crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::M
+                    | crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::U,
+                ) => TransactionKind::InviteClient,
+                (false, crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::L) => {
+                    TransactionKind::InviteServer
+                }
+                (true, _) => TransactionKind::NonInviteClient,
+                (false, _) => TransactionKind::NonInviteServer,
             });
         }
         Err(Error::transaction_not_found(
@@ -4726,16 +5709,28 @@ impl TransactionManager {
     /// # }
     /// ```
     pub async fn active_transactions(&self) -> (Vec<TransactionKey>, Vec<TransactionKey>) {
-        (
-            self.client_transactions
-                .iter()
-                .map(|r| r.key().clone())
-                .collect(),
-            self.server_transactions
-                .iter()
-                .map(|r| r.key().clone())
-                .collect(),
-        )
+        let mut clients: Vec<_> = self
+            .client_transactions
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
+        let mut servers: Vec<_> = self
+            .server_transactions
+            .iter()
+            .map(|r| r.key().clone())
+            .collect();
+        for entry in self.compact_non_invite_tombstones.iter() {
+            match entry.value().timer() {
+                crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::M => {
+                    clients.push(entry.key().clone())
+                }
+                crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::L => {
+                    servers.push(entry.key().clone())
+                }
+                _ => {}
+            }
+        }
+        (clients, servers)
     }
 
     /// Gets a reference to the transport layer used by this transaction manager.
@@ -4747,6 +5742,34 @@ impl TransactionManager {
     /// * `Arc<dyn Transport>` - The transport layer
     pub fn transport(&self) -> Arc<dyn Transport> {
         self.transport.clone()
+    }
+
+    /// Return the exact ingress route retained by an active server
+    /// transaction for responses. Transaction users that must forward
+    /// additional end-to-end responses after the server transaction
+    /// terminates (notably a forking stateful proxy forwarding every
+    /// INVITE 2xx) can snapshot this route while the transaction is active.
+    ///
+    /// The returned route preserves the concrete transport, authenticated
+    /// authority, and opaque stream flow rather than reconstructing routing
+    /// from a bare socket address.
+    pub fn server_transaction_response_route(
+        &self,
+        transaction_id: &TransactionKey,
+    ) -> Option<TransportRoute> {
+        self.server_transactions
+            .get(transaction_id)
+            .map(|transaction| transaction.value().data().response_route.clone())
+            .or_else(|| {
+                self.compact_non_invite_tombstones
+                    .get(transaction_id)
+                    .and_then(|entry| {
+                        entry
+                            .value()
+                            .server_response()
+                            .map(|(_, route)| route.clone())
+                    })
+            })
     }
 
     /// Look up the destination `SocketAddr` a given transaction's
@@ -4812,6 +5835,94 @@ impl TransactionManager {
             // Resolve that exact current generation instead of exposing a
             // transient unknown-transaction result.
         }
+    }
+
+    fn client_response_route_generation(
+        &self,
+        transaction_id: &TransactionKey,
+    ) -> Option<ClientResponseRouteGeneration> {
+        loop {
+            let (owner, route, retained_owner) =
+                self.with_client_response_route_state(transaction_id, |state| {
+                    (
+                        state.response_route_owner(),
+                        state.route().clone(),
+                        state
+                            .retired()
+                            .and_then(|retired| retired.completion.admission_owner()),
+                    )
+                })?;
+            let admission_owner = if let Some(owner) = retained_owner {
+                owner
+            } else {
+                let active_owner =
+                    self.client_transactions
+                        .get(transaction_id)
+                        .and_then(|transaction| {
+                            (Arc::as_ptr(transaction.value().data()) as usize == owner)
+                                .then(|| transaction.value().data().transaction_admission_owner())
+                                .flatten()
+                        });
+                active_owner.or_else(|| {
+                    self.compact_non_invite_tombstones
+                        .get(transaction_id)
+                        .filter(|tombstone| tombstone.value().is_client())
+                        .and_then(|tombstone| tombstone.value().admission_owner())
+                })?
+            };
+            if admission_owner.response_route_owner() != Some(owner) {
+                continue;
+            }
+            let generation = ClientResponseRouteGeneration {
+                owner,
+                route,
+                delayed_offer_ack_answers: admission_owner.delayed_offer_ack_answers(),
+                admission_owner,
+            };
+            if self.client_response_route_generation_matches(transaction_id, &generation) {
+                return Some(generation);
+            }
+        }
+    }
+
+    fn ensure_delayed_offer_ack_answers(
+        &self,
+        transaction_id: &TransactionKey,
+    ) -> Result<ClientResponseRouteGeneration> {
+        loop {
+            let mut generation = self
+                .client_response_route_generation(transaction_id)
+                .ok_or_else(|| {
+                    Error::transaction_not_found(
+                        transaction_id.clone(),
+                        "delayed-offer ACK route lookup failed",
+                    )
+                })?;
+            generation.delayed_offer_ack_answers = Some(
+                generation
+                    .admission_owner
+                    .ensure_delayed_offer_ack_answers(),
+            );
+            if self.client_response_route_generation_matches(transaction_id, &generation) {
+                return Ok(generation);
+            }
+        }
+    }
+
+    fn client_response_route_generation_matches(
+        &self,
+        transaction_id: &TransactionKey,
+        expected: &ClientResponseRouteGeneration,
+    ) -> bool {
+        expected
+            .admission_owner
+            .owns_transaction_generation(transaction_id)
+            && expected.admission_owner.response_route_owner() == Some(expected.owner)
+            && self
+                .with_client_response_route_state(transaction_id, |state| {
+                    state.response_route_owner() == expected.owner
+                })
+                .unwrap_or(false)
     }
 
     fn retired_client_request_wire(&self, transaction_id: &TransactionKey) -> Option<bytes::Bytes> {
@@ -4922,6 +6033,15 @@ impl TransactionManager {
         transaction_id: &TransactionKey,
         transaction: &ArcClientTransaction,
     ) -> (Instant, bool) {
+        if let Some(expires_at) = self
+            .compact_non_invite_tombstones
+            .get(transaction_id)
+            .filter(|entry| entry.value().is_client())
+            .map(|entry| entry.value().expires_at())
+        {
+            return (expires_at, true);
+        }
+
         if transaction_id.method() == &Method::Invite {
             return (Instant::now() + CLIENT_TRANSACTION_COMPLETION_TTL, false);
         }
@@ -4941,15 +6061,6 @@ impl TransactionManager {
         // A UDP non-INVITE runner is replaced by the compact Timer K
         // tombstone before cleanup. Use that exact deadline so the completion
         // cannot outlive the RFC retransmission-absorption window.
-        if let Some(expires_at) = self
-            .compact_non_invite_tombstones
-            .get(transaction_id)
-            .filter(|entry| entry.value().is_client())
-            .map(|entry| entry.value().expires_at())
-        {
-            return (expires_at, true);
-        }
-
         let route = transaction.data().request_route.lock().await;
         if crate::transaction::timer_utils::uses_unreliable_transport(
             &route,
@@ -5053,6 +6164,16 @@ impl TransactionManager {
         transaction_id: &TransactionKey,
         transaction: &ArcClientTransaction,
     ) -> bool {
+        // RFC 6026 requires a transaction-stateful proxy to drop responses
+        // once Timer M destroys the matching transaction. Do not retain the
+        // UA-core late-2xx route beyond that authoritative state-machine
+        // horizon.
+        if self.stateful_proxy_tu_mode() && transaction_id.method() == &Method::Invite {
+            self.transaction_destinations
+                .remove_if(transaction_id, |_, state| state.is_active());
+            return false;
+        }
+
         // Completed UDP non-INVITE transactions have already published a
         // compact Timer K tombstone. Keep the exact active response route
         // through T4 so retransmitted final responses remain authenticated;
@@ -5088,6 +6209,7 @@ impl TransactionManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .next_version(expires_at);
+        let response_route_owner = Arc::as_ptr(transaction.data()) as usize;
         let retired = RetiredClientTransaction::new(
             transaction.data().request.as_ref(),
             transaction.data().completion.as_ref(),
@@ -5110,7 +6232,11 @@ impl TransactionManager {
             .load(Ordering::Acquire);
         let previous_wake = deadlines.next_wake_at(now, retired_capacity);
         if let Some(mut state) = self.transaction_destinations.get_mut(transaction_id) {
-            if state.is_active() {
+            if matches!(
+                state.value(),
+                ClientResponseRouteState::Active { owner, .. }
+                    if *owner == response_route_owner
+            ) {
                 let shared_transaction_id = Arc::clone(state.key());
                 *state = ClientResponseRouteState::Retired(retired);
                 deadlines.schedule(shared_transaction_id, expires_at, deadline_version);
@@ -5136,6 +6262,42 @@ impl TransactionManager {
         else {
             return false;
         };
+
+        // Timer M already owns the request wire, completion authority,
+        // admission lease and exact response-route generation.  Replacing the
+        // Active route with the older RetiredClientTransaction here would
+        // duplicate the INVITE and create a second retention deadline.  Keep
+        // the small authenticated route in place and remove only the heavy
+        // runner representation; the compact scheduler removes that exact
+        // route generation at M (proxy) or U (endpoint) expiry.
+        let compact_timer_m = self
+            .compact_non_invite_tombstones
+            .get(transaction_id)
+            .is_some_and(|entry| {
+                entry.is_client()
+                    && matches!(
+                        entry.timer(),
+                        crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::M
+                            | crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::U
+                    )
+            });
+        if compact_timer_m {
+            let completion = &transaction.data().completion;
+            self.client_completions
+                .remove_if(transaction_id, |_, current| {
+                    matches!(
+                        current,
+                        ClientTransactionCompletionEntry::Active(active)
+                            if Arc::ptr_eq(active, completion)
+                    )
+                });
+            return self
+                .client_transactions
+                .remove_if(transaction_id, |_, current| {
+                    Arc::ptr_eq(current, &transaction)
+                })
+                .is_some();
+        }
 
         let transitioned = self
             .retire_client_transaction(transaction_id, &transaction)
@@ -5748,6 +6910,7 @@ impl TransactionManager {
         // non-reentrant and safe even when caller-held transaction Arcs later
         // drop their external owners. Stopped managers never admit reuse.
         self.transaction_admissions.entries.clear();
+        self.server_transaction_matches.clear();
         debug_assert_eq!(self.transaction_admissions.entries.len(), 0);
         self.admission_lifecycle.mark_stopped();
 
@@ -5807,8 +6970,23 @@ impl TransactionManager {
                     transaction_id,
                     new_state: TransactionState::Terminated,
                     ..
+                } if manager_instance.transaction_protocol_terminated(transaction_id) => {
+                    manager_instance.mark_transaction_terminated_indexed(transaction_id);
+                    manager_instance
+                        .pending_inbound_bytes
+                        .remove(transaction_id);
+                    manager_instance
+                        .pending_inbound_inserted_at
+                        .remove(transaction_id);
+                    manager_instance
+                        .pending_inbound_transport
+                        .remove(transaction_id);
+                    manager_instance
+                        .pending_inbound_timing
+                        .remove(transaction_id);
+                    manager_instance.enqueue_terminated_transaction_cleanup(transaction_id.clone());
                 }
-                | TransactionEvent::TransactionTerminated { transaction_id } => {
+                TransactionEvent::TransactionTerminated { transaction_id } => {
                     manager_instance.mark_transaction_terminated_indexed(transaction_id);
                     manager_instance
                         .pending_inbound_bytes
@@ -5837,6 +7015,11 @@ impl TransactionManager {
     async fn remove_terminated_transaction(&self, transaction_id: &TransactionKey) {
         debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id), "Removing terminated transaction after grace period");
 
+        if !self.transaction_protocol_terminated(transaction_id) {
+            debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id), "Retaining RFC 6026 Accepted transaction despite public Terminated projection");
+            return;
+        }
+
         let mut terminated = false;
         self.request_transaction_runner_stop(transaction_id);
 
@@ -5855,7 +7038,19 @@ impl TransactionManager {
 
         // Defensive: also remove from server in case of duplication.
         if self.server_transactions.remove(transaction_id).is_some() {
-            self.retire_server_invite_dialog_index_for(transaction_id);
+            let accepted_expires_at = self
+                .compact_non_invite_tombstones
+                .get(transaction_id)
+                .filter(|entry| {
+                    entry.value().timer()
+                        == crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::L
+                })
+                .map(|entry| entry.value().expires_at());
+            if let Some(expires_at) = accepted_expires_at {
+                self.retire_server_invite_dialog_index_until(transaction_id, expires_at);
+            } else {
+                self.retire_server_invite_dialog_index_for(transaction_id);
+            }
             debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id), "Removed terminated server transaction");
             terminated = true;
         }
@@ -6331,18 +7526,32 @@ impl TransactionManager {
         // constructor starts its runner or any request can reach the wire.
         // Saturation is an admission failure; an accepted transaction must
         // never shorten its RFC retransmission-absorption fence.
-        let compact_retention_reservation = if modified_request.method() != Method::Invite
-            && crate::transaction::timer_utils::uses_unreliable_transport(
+        let compact_retention_reservation = if modified_request.method() == Method::Invite
+            || crate::transaction::timer_utils::uses_unreliable_transport(
                 &request_route,
                 self.transport.default_transport_type(),
             ) {
             match self.lifecycle_scheduler.as_ref() {
-                Some(scheduler) => Some(scheduler.try_reserve_compact_retention().ok_or(
-                    Error::TransactionCapacityExhausted {
-                        resource: "UDP non-INVITE Timer K retention",
-                        limit: scheduler.compact_retention_limit(),
-                    },
-                )?),
+                Some(scheduler) => {
+                    let invite = modified_request.method() == Method::Invite;
+                    let reservation = if invite {
+                        scheduler.try_reserve_accepted_retention()
+                    } else {
+                        scheduler.try_reserve_compact_retention()
+                    };
+                    Some(reservation.ok_or(Error::TransactionCapacityExhausted {
+                        resource: if invite {
+                            "INVITE client Timer M retention"
+                        } else {
+                            "UDP non-INVITE Timer K retention"
+                        },
+                        limit: if invite {
+                            scheduler.accepted_retention_limit()
+                        } else {
+                            scheduler.compact_retention_limit()
+                        },
+                    })?)
+                }
                 None => None,
             }
         } else {
@@ -6444,6 +7653,13 @@ impl TransactionManager {
         }
         transaction
             .data()
+            .install_late_2xx_total_retention(if self.stateful_proxy_tu_mode() {
+                Duration::ZERO
+            } else {
+                RETIRED_CLIENT_TRANSACTION_TTL
+            });
+        transaction
+            .data()
             .install_transaction_admission_owner(admission_owner);
 
         // Capture the exact completion authority from the newly constructed
@@ -6458,6 +7674,7 @@ impl TransactionManager {
         let shared_retention_key = Arc::new(key.clone());
         self.install_client_completion(Arc::clone(&shared_retention_key), &transaction);
         let response_route_owner = Arc::as_ptr(transaction.data()) as usize;
+        returned_admission_owner.install_response_route_owner(response_route_owner);
         let response_routes = Arc::downgrade(&self.transaction_destinations);
         let response_route_key = Arc::clone(&shared_retention_key);
         transaction
@@ -6470,7 +7687,7 @@ impl TransactionManager {
                     return false;
                 };
                 match state.value_mut() {
-                    ClientResponseRouteState::Active { route, owner }
+                    ClientResponseRouteState::Active { route, owner, .. }
                         if *owner == response_route_owner =>
                     {
                         *route = prepared_route.clone();
@@ -6514,12 +7731,84 @@ impl TransactionManager {
             .admission_lifecycle
             .try_enter_existing()
             .ok_or_else(|| Error::Other("transaction manager is stopping".into()))?;
+        let remote_tag = delayed_offer_ack_remote_tag(invite_tx_id, response)?;
+        let generation = self
+            .client_response_route_generation(invite_tx_id)
+            .ok_or_else(|| {
+                Error::transaction_not_found(
+                    invite_tx_id.clone(),
+                    "delayed-offer ACK route lookup failed",
+                )
+            })?;
+        let cached_answer = generation
+            .delayed_offer_ack_answers
+            .as_ref()
+            .and_then(|answers| answers.get(remote_tag.as_ref()));
         tokio::select! {
             biased;
             _ = self.operation_cancellation.cancelled() => {
                 Err(Error::Other("transaction manager stopped ACK send".into()))
             }
-            result = self.send_ack_for_2xx_within_operation(invite_tx_id, response) => result,
+            result = self.send_ack_for_2xx_within_operation(
+                invite_tx_id,
+                response,
+                cached_answer.as_deref(),
+                &generation,
+            ) => result,
+        }
+    }
+
+    /// Send the SDP answer in the ACK for an offerless INVITE whose 2xx
+    /// response supplied the offer (RFC 3261 section 13.2.2.4).
+    pub async fn send_ack_for_2xx_with_sdp(
+        &self,
+        invite_tx_id: &TransactionKey,
+        response: &Response,
+        sdp_answer: &str,
+    ) -> Result<()> {
+        if sdp_answer.trim().is_empty() {
+            return Err(Error::Other(
+                "delayed-offer ACK requires a non-empty SDP answer".into(),
+            ));
+        }
+        let _operation = self
+            .admission_lifecycle
+            .try_enter_existing()
+            .ok_or_else(|| Error::Other("transaction manager is stopping".into()))?;
+        let remote_tag = delayed_offer_ack_remote_tag(invite_tx_id, response)?;
+        let generation = self.ensure_delayed_offer_ack_answers(invite_tx_id)?;
+        let prepared = tokio::select! {
+            biased;
+            _ = self.operation_cancellation.cancelled() => {
+                return Err(Error::Other("transaction manager stopped ACK send".into()));
+            }
+            result = self.prepare_ack_for_2xx_within_operation(
+                invite_tx_id,
+                response,
+                Some(sdp_answer),
+                &generation,
+            ) => result?,
+        };
+        let answers = generation
+            .delayed_offer_ack_answers
+            .as_ref()
+            .expect("delayed-offer answer cache was initialized");
+        answers.insert_exact(remote_tag, sdp_answer)?;
+        // Revalidate the exact route allocation, not merely the bare SIP
+        // transaction key. A same-key replacement must never inherit or send
+        // the preceding generation's delayed-offer answer.
+        if !self.client_response_route_generation_matches(invite_tx_id, &generation) {
+            return Err(Error::transaction_not_found(
+                invite_tx_id.clone(),
+                "delayed-offer ACK route generation changed before send",
+            ));
+        }
+        tokio::select! {
+            biased;
+            _ = self.operation_cancellation.cancelled() => {
+                Err(Error::Other("transaction manager stopped ACK send".into()))
+            }
+            result = self.send_prepared_ack_for_2xx_within_operation(prepared) => result,
         }
     }
 
@@ -6527,12 +7816,54 @@ impl TransactionManager {
         &self,
         invite_tx_id: &TransactionKey,
         response: &Response,
+        sdp_answer: Option<&str>,
+        generation: &ClientResponseRouteGeneration,
     ) -> Result<()> {
-        // Create the ACK request
-        let ack_request = self.create_ack_for_2xx(invite_tx_id, response).await?;
-        let original_route = self.transaction_route(invite_tx_id).await.ok_or_else(|| {
-            Error::transaction_not_found(invite_tx_id.clone(), "ACK route lookup failed")
-        })?;
+        let prepared = self
+            .prepare_ack_for_2xx_within_operation(invite_tx_id, response, sdp_answer, generation)
+            .await?;
+        self.send_prepared_ack_for_2xx_within_operation(prepared)
+            .await
+    }
+
+    async fn prepare_ack_for_2xx_within_operation(
+        &self,
+        invite_tx_id: &TransactionKey,
+        response: &Response,
+        sdp_answer: Option<&str>,
+        generation: &ClientResponseRouteGeneration,
+    ) -> Result<(Request, TransportRoute)> {
+        if !response.status().is_success()
+            || TransactionKey::from_response(response).as_ref() != Some(invite_tx_id)
+        {
+            return Err(Error::Other(
+                "ACK requires the exact successful INVITE response".into(),
+            ));
+        }
+
+        let mut ack_request = self.create_ack_for_2xx(invite_tx_id, response).await?;
+        if let Some(sdp_answer) = sdp_answer {
+            ack_request.headers.retain(|header| {
+                !matches!(
+                    header,
+                    TypedHeader::ContentLength(_) | TypedHeader::ContentType(_)
+                )
+            });
+            ack_request.headers.push(TypedHeader::ContentType(
+                rvoip_sip_core::types::ContentType::from_type_subtype("application", "sdp"),
+            ));
+            ack_request.headers.push(TypedHeader::ContentLength(
+                rvoip_sip_core::types::ContentLength::new(sdp_answer.len() as u32),
+            ));
+            ack_request.body = bytes::Bytes::copy_from_slice(sdp_answer.as_bytes());
+        }
+        if !self.client_response_route_generation_matches(invite_tx_id, generation) {
+            return Err(Error::transaction_not_found(
+                invite_tx_id.clone(),
+                "ACK route generation changed during preparation",
+            ));
+        }
+        let original_route = generation.route.clone();
 
         // ACK follows the established dialog route set: top Route if present,
         // otherwise the remote target in the Contact-derived Request-URI.
@@ -6575,6 +7906,13 @@ impl TransactionManager {
         // preserving the authenticated transport/authority/flow selected by
         // the original INVITE whenever its route remains the next hop.
         rvoip_sip_core::validation::validate_wire_request(&ack_request)?;
+        Ok((ack_request, ack_route))
+    }
+
+    async fn send_prepared_ack_for_2xx_within_operation(
+        &self,
+        (ack_request, ack_route): (Request, TransportRoute),
+    ) -> Result<()> {
         self.transport
             .send_message_via(Message::Request(ack_request), ack_route)
             .await
@@ -6786,8 +8124,10 @@ impl TransactionManager {
     ) -> Result<Arc<dyn ServerTransaction>> {
         self.create_server_transaction_inner(
             request,
+            remote_addr,
             TransportRoute::new(remote_addr).with_transport_type(TransportType::Udp),
             true,
+            None,
         )
         .await
     }
@@ -6798,8 +8138,14 @@ impl TransactionManager {
         request: Request,
         response_route: TransportRoute,
     ) -> Result<Arc<dyn ServerTransaction>> {
-        self.create_server_transaction_inner(request, response_route, true)
-            .await
+        self.create_server_transaction_inner(
+            request,
+            response_route.destination,
+            response_route,
+            true,
+            None,
+        )
+        .await
     }
 
     /// Transaction-ingress variant used while listener authorization is still
@@ -6812,30 +8158,59 @@ impl TransactionManager {
     ) -> Result<Arc<dyn ServerTransaction>> {
         self.create_server_transaction_inner(
             request,
+            remote_addr,
             TransportRoute::new(remote_addr).with_transport_type(TransportType::Udp),
             false,
+            None,
         )
         .await
     }
 
     /// Create a server transaction bound to the exact ingress route while TU
     /// publication remains deferred behind authorization.
+    #[cfg(test)]
     pub(crate) async fn create_server_transaction_deferred_events_on_route(
         &self,
         request: Request,
         response_route: TransportRoute,
     ) -> Result<Arc<dyn ServerTransaction>> {
-        self.create_server_transaction_inner(request, response_route, false)
-            .await
+        self.create_server_transaction_inner(
+            request,
+            response_route.destination,
+            response_route,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Ingress-only creation using a collision-safe private storage identity.
+    /// The public wire key remains represented by the match registry.
+    pub(crate) async fn create_server_transaction_deferred_events_on_route_with_id(
+        &self,
+        request: Request,
+        remote_addr: SocketAddr,
+        response_route: TransportRoute,
+        transaction_id: TransactionKey,
+    ) -> Result<Arc<dyn ServerTransaction>> {
+        self.create_server_transaction_inner(
+            request,
+            remote_addr,
+            response_route,
+            false,
+            Some(transaction_id),
+        )
+        .await
     }
 
     async fn create_server_transaction_inner(
         &self,
         request: Request,
+        remote_addr: SocketAddr,
         response_route: TransportRoute,
         publish_cancel_event: bool,
+        transaction_id: Option<TransactionKey>,
     ) -> Result<Arc<dyn ServerTransaction>> {
-        let remote_addr = response_route.destination;
         // Extract branch parameter from the top Via header
         let branch = match request.first_via() {
             Some(via) => match via.branch() {
@@ -6850,7 +8225,8 @@ impl TransactionManager {
         };
 
         // Create the transaction key directly with is_server: true
-        let key = TransactionKey::new(branch, request.method().clone(), true);
+        let wire_key = TransactionKey::new(branch, request.method().clone(), true);
+        let key = transaction_id.unwrap_or(wire_key);
         let _admission_guard = self.admission_lifecycle.try_enter().ok_or_else(|| {
             Error::Other("transaction manager is draining; new transactions are closed".into())
         })?;
@@ -6910,18 +8286,32 @@ impl TransactionManager {
         // the runner or publishing the transaction. A saturated listener may
         // reject new work, but it must not accept a request and later discard
         // its final-response replay state early.
-        let compact_retention_reservation = if request.method() != Method::Invite
-            && crate::transaction::timer_utils::uses_unreliable_transport(
+        let compact_retention_reservation = if request.method() == Method::Invite
+            || crate::transaction::timer_utils::uses_unreliable_transport(
                 &response_route,
                 self.transport.default_transport_type(),
             ) {
             match self.lifecycle_scheduler.as_ref() {
-                Some(scheduler) => Some(scheduler.try_reserve_compact_retention().ok_or(
-                    Error::TransactionCapacityExhausted {
-                        resource: "UDP non-INVITE Timer J retention",
-                        limit: scheduler.compact_retention_limit(),
-                    },
-                )?),
+                Some(scheduler) => {
+                    let invite = request.method() == Method::Invite;
+                    let reservation = if invite {
+                        scheduler.try_reserve_accepted_retention()
+                    } else {
+                        scheduler.try_reserve_compact_retention()
+                    };
+                    Some(reservation.ok_or(Error::TransactionCapacityExhausted {
+                        resource: if invite {
+                            "INVITE server Timer L retention"
+                        } else {
+                            "UDP non-INVITE Timer J retention"
+                        },
+                        limit: if invite {
+                            scheduler.accepted_retention_limit()
+                        } else {
+                            scheduler.compact_retention_limit()
+                        },
+                    })?)
+                }
                 None => None,
             }
         } else {
@@ -6935,6 +8325,7 @@ impl TransactionManager {
                     ServerInviteTransaction::new_with_response_route_command_capacity_and_timer_manager(
                         key.clone(),
                         request.clone(),
+                        remote_addr,
                         response_route.clone(),
                         self.transport.clone(),
                         self.events_tx.clone_for_transaction(),
@@ -6975,6 +8366,7 @@ impl TransactionManager {
                     ServerNonInviteTransaction::new_with_response_route_command_capacity_and_timer_manager(
                         key.clone(),
                         request.clone(),
+                        remote_addr,
                         response_route.clone(),
                         self.transport.clone(),
                         self.events_tx.clone_for_transaction(),
@@ -6999,6 +8391,7 @@ impl TransactionManager {
                     ServerNonInviteTransaction::new_with_response_route_command_capacity_and_timer_manager(
                         key.clone(),
                         request.clone(),
+                        remote_addr,
                         response_route.clone(),
                         self.transport.clone(),
                         self.events_tx.clone_for_transaction(),
@@ -7016,6 +8409,7 @@ impl TransactionManager {
                     ServerNonInviteTransaction::new_with_response_route_command_capacity_and_timer_manager(
                         key.clone(),
                         request.clone(),
+                        remote_addr,
                         response_route.clone(),
                         self.transport.clone(),
                         self.events_tx.clone_for_transaction(),
@@ -7217,7 +8611,14 @@ impl TransactionManager {
 
     pub(crate) fn retire_server_invite_dialog_index_for(&self, transaction_id: &TransactionKey) {
         let expires_at = Instant::now() + self.timer_settings.t4;
+        self.retire_server_invite_dialog_index_until(transaction_id, expires_at);
+    }
 
+    fn retire_server_invite_dialog_index_until(
+        &self,
+        transaction_id: &TransactionKey,
+        expires_at: Instant,
+    ) {
         if let Some((_, keys)) = self.server_invite_dialog_keys_by_tx.remove(transaction_id) {
             for key in keys {
                 let generation = self.next_server_invite_dialog_deadline_generation();
@@ -7310,13 +8711,64 @@ impl TransactionManager {
     }
 
     pub(crate) async fn cache_invite_2xx_response_for(&self, transaction_id: &TransactionKey) {
-        let Some(tx) = self
+        // RFC 6026 assigns 2xx retransmission to a UAS core, not the INVITE
+        // server transaction or a transaction-stateful proxy TU.
+        if self.stateful_proxy_tu_mode() {
+            return;
+        }
+
+        let tx = self
             .server_transactions
             .get(transaction_id)
-            .map(|entry| entry.value().clone())
-        else {
+            .map(|entry| entry.value().clone());
+
+        // The Accepted runner may hand Timer L to the compact lifecycle
+        // scheduler before the manager installs the independent UAS 2xx
+        // reliability cache.  Read the immutable compact image in that race
+        // instead of requiring the heavy server transaction to remain alive.
+        if tx.is_none() {
+            let compact = self
+                .compact_non_invite_tombstones
+                .get(transaction_id)
+                .and_then(|entry| {
+                    if entry.timer()
+                        != crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::L
+                    {
+                        return None;
+                    }
+                    let (wire, route) = entry.server_response()?;
+                    Some((wire.clone(), route.clone(), entry.admission_owner()))
+                });
+            let Some((wire_bytes, route, admission_owner)) = compact else {
+                return;
+            };
+            let response = match rvoip_sip_core::parse_message(wire_bytes.as_ref()) {
+                Ok(rvoip_sip_core::Message::Response(response))
+                    if response.status().is_success() =>
+                {
+                    response
+                }
+                _ => return,
+            };
+            let now = Instant::now();
+            self.insert_invite_2xx_response_cache_entry(
+                transaction_id.clone(),
+                Invite2xxResponseCacheEntry {
+                    response,
+                    wire_bytes,
+                    route,
+                    created_at: now,
+                    acked_at: None,
+                    expires_at: now + INVITE_2XX_RESPONSE_CACHE_TTL,
+                    next_retransmit_at: now + self.timer_settings.t1,
+                    retransmit_interval: self.timer_settings.t1,
+                    deadline_generation: 0,
+                    _admission_owner: admission_owner,
+                },
+            );
             return;
-        };
+        }
+        let tx = tx.expect("checked above");
 
         if tx.kind() != TransactionKind::InviteServer {
             return;
@@ -7423,6 +8875,10 @@ impl TransactionManager {
         transaction_id: &TransactionKey,
         ingress_route: TransportRoute,
     ) -> Result<bool> {
+        if self.stateful_proxy_tu_mode() {
+            return Ok(false);
+        }
+
         let entry = self
             .invite_2xx_response_cache
             .get(transaction_id)
@@ -7668,6 +9124,10 @@ impl TransactionManager {
     }
 
     async fn retransmit_due_invite_2xx_responses(&self) -> usize {
+        if self.stateful_proxy_tu_mode() {
+            return 0;
+        }
+
         let started = diagnostics::transaction_timing_enabled().then(Instant::now);
         let cache_len = self.invite_2xx_response_cache.len();
         let now = Instant::now();
@@ -7952,8 +9412,43 @@ impl TransactionManager {
         &self,
         invite_tx_id: &TransactionKey,
     ) -> Result<TransactionKey> {
-        self.cancel_invite_transaction_with_extras(invite_tx_id, Vec::new())
+        self.cancel_invite_transaction_classified(invite_tx_id)
             .await
+            .into_result()
+    }
+
+    /// Dispatch a generated CANCEL while preserving the conservative
+    /// first-transport-write classification and exact transaction ID.
+    ///
+    /// Ordinary user-agent callers should use
+    /// [`Self::cancel_invite_transaction`]. This protocol-owner API exists for
+    /// components that must retain an independently coordinated response
+    /// context across an ambiguous transport result.
+    #[doc(hidden)]
+    pub async fn cancel_invite_transaction_classified(
+        &self,
+        invite_tx_id: &TransactionKey,
+    ) -> CancelInviteTransactionDispatch {
+        match self
+            .cancel_invite_transaction_with_extras_classified(invite_tx_id, Vec::new())
+            .await
+        {
+            Ok(transaction_id) => CancelInviteTransactionDispatch::Success { transaction_id },
+            Err(CancelInviteTransactionFailure::ZeroWire {
+                error,
+                retired_transaction_id,
+            }) => CancelInviteTransactionDispatch::ZeroWire {
+                error,
+                retired_transaction_id,
+            },
+            Err(CancelInviteTransactionFailure::WireUnknown {
+                error,
+                transaction_id,
+            }) => CancelInviteTransactionDispatch::WireUnknown {
+                transaction_id,
+                error,
+            },
+        }
     }
 
     /// CANCEL with caller-supplied `extra_headers` (RFC 3326 `Reason:`,
@@ -7981,10 +9476,9 @@ impl TransactionManager {
         let _operation = self
             .admission_lifecycle
             .try_enter_existing()
-            .ok_or_else(|| {
-                CancelInviteTransactionFailure::ZeroWire(Error::Other(
-                    "transaction manager is stopping".into(),
-                ))
+            .ok_or_else(|| CancelInviteTransactionFailure::ZeroWire {
+                error: Error::Other("transaction manager is stopping".into()),
+                retired_transaction_id: None,
             })?;
         self.cancel_invite_transaction_with_extras_within_operation_classified(
             invite_tx_id,
@@ -8000,7 +9494,10 @@ impl TransactionManager {
     ) -> std::result::Result<TransactionKey, CancelInviteTransactionFailure> {
         debug!(id=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&invite_tx_id), "Canceling invite transaction");
 
-        let zero_wire = CancelInviteTransactionFailure::ZeroWire;
+        let zero_wire = |error| CancelInviteTransactionFailure::ZeroWire {
+            error,
+            retired_transaction_id: None,
+        };
 
         // Check that this is an INVITE client transaction
         if invite_tx_id.method() != &Method::Invite || invite_tx_id.is_server() {
@@ -8076,13 +9573,18 @@ impl TransactionManager {
                     .value()
                     .as_client_transaction()
                     .map(|transaction| transaction.data().clone())
-            })
-            .ok_or_else(|| {
-                zero_wire(Error::transaction_not_found(
-                    cancel_tx_id.clone(),
-                    "new CANCEL transaction generation is unavailable",
-                ))
-            })?;
+            });
+        let Some(cancel_data) = cancel_data else {
+            let error = Error::transaction_not_found(
+                cancel_tx_id.clone(),
+                "new CANCEL transaction generation is unavailable",
+            );
+            let _ = self.terminate_transaction(&cancel_tx_id).await;
+            return Err(CancelInviteTransactionFailure::ZeroWire {
+                error,
+                retired_transaction_id: Some(cancel_tx_id),
+            });
+        };
 
         debug!(id=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&cancel_tx_id), original_id=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&invite_tx_id), "Created CANCEL transaction");
 
@@ -8099,7 +9601,10 @@ impl TransactionManager {
             // boundary. Force exact transaction retirement before returning
             // so an immediate retry can claim the same RFC CANCEL key.
             let _ = self.terminate_transaction(&cancel_tx_id).await;
-            return Err(zero_wire(error));
+            return Err(CancelInviteTransactionFailure::ZeroWire {
+                error,
+                retired_transaction_id: Some(cancel_tx_id),
+            });
         }
 
         Ok(cancel_tx_id)

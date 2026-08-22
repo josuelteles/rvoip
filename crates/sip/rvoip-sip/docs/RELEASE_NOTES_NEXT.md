@@ -1,100 +1,115 @@
-# rvoip 0.3.2 Release Notes
+# rvoip 0.3.8 Release Candidate Notes
 
-Date: 2026-07-29
+Date: 2026-08-14
 
-These notes describe the unified `0.3.2` workspace release approved with one
-explicit performance exception. Behavioral and performance claims remain
-bounded by the clean full-run evidence, compatibility and RFC matrices,
-interoperability evidence, security posture, and exception report.
+These notes describe the coordinated 44-crate `0.3.8` release candidate.
+Publication requires a fresh `remote-release` qualification bound to the exact
+clean release source and to the current gate catalog. Prior `0.3.6` and
+`0.3.7` qualification evidence does not qualify this release.
 
 ## Headline
 
-All 44 publishable crates move together to `0.3.2`. The SIP product remains the
-release-gated beta surface. WebRTC, UCTP, Media over QUIC, identity, and
-optional extensions retain their documented developer-preview or experimental
-status where they are outside the SIP attestation.
+`0.3.8` is a codec and interop release. AMR-NB and AMR-WB ship end to end —
+both interface formats, DTX, redundancy, interleaving, and a negotiated
+mode-set — and every rate is proved in a live call through a record-routing
+proxy rather than only in unit vectors. Kamailio and OpenSIPS join the
+qualification matrix over TLS with SRTP through rtpengine.
 
-## Added
+Two SIP correctness repairs ride with it: secure dialogs now answer with a
+`sips:` fallback Contact, and a UAC learns its route set from the
+dialog-forming 2xx, so in-dialog requests follow the proxy path instead of
+bypassing it.
 
-- Authenticated-principal propagation and ownership checks now span SIP,
-  WebRTC, UCTP, routes, and operational events.
-- Transport-neutral data messaging covers arbitrary WebRTC DataChannels, SIP
-  MESSAGE, typed initial SIP headers, DTMF, and correlated transfer outcomes.
-- `MediaGraph` provides directional routes, codec-group transcoding, bounded
-  fanout, snapshots, and drop/eviction metrics under a single-consumer model.
-- SIP, WebRTC, and Amazon Connect support prepare/bind/activate lifecycles with
-  owned cancellation, terminal events, and bounded drain.
-- SIP outbound activation receipts linearize after the exact session becomes
-  active; established teardown waits for the peer's final BYE response while
-  retaining timeout/rejection cleanup.
-- UCTP carries complete RTP packets and supports authenticated raw QUIC and
-  WebTransport sessions, virtual publishers, direct-listener limits, and exact
-  cleanup.
-- `rvoip-moq` implements the documented draft-19/MSF-01/LOC-03 publisher,
-  subscriber, origin, relay, authorization, reconnect, health, and drain
-  abstractions.
-- Symmetric RTP, advertised SIP/RTP addresses, RFC 3581 `rport`, WebRTC ICE/NAT
-  policy, and per-exchange WHIP/WHEP versus WebSocket gathering are
-  configurable.
-- Developer-preview `rvoip-vapi` supplies a bidirectional WebSocket agent
-  adapter through the facade's opt-in `vapi` feature and the `full` profile.
-- `rvoip::app` adds voice-only SIP/WebRTC admission, transport-neutral accepted
-  call events, startup-safe event retention, explicit SIP/RTP advertisement,
-  and example 14's shared Vapi agent server.
+The media-reliability, backpressure, and inbound-auth work from `0.3.7`
+remains in force.
 
-## Fixed
+## AMR
 
-- SCIM provisioning passwords are structurally guaranteed to satisfy the
-  users-core password policy, eliminating random provisioning failures.
+- Both variants at both interface formats (IF1 and IF2), bit-exact against
+  3GPP's own reference material for TS 26.073, TS 26.101 and TS 26.201. No
+  3GPP source is vendored into this repository; the oracles fetch it.
+- VAD1 and VAD2, DTX reaching the wire, receive-side interleaving reassembly,
+  max-red redundancy with dedup, and CMR damping.
+- The SDP `mode-set` is negotiated and obeyed, and each negotiated rate is
+  attested in the release evidence rather than assumed from the top mode.
+- The media graph admits a codec by the payload type a transport reports, so
+  a peer's own dynamic numbering is honored — including the two numbers an
+  AMR session commonly negotiates at once, which no name-keyed table could
+  express. Packet times AMR cannot accept are re-framed (10 ms joined,
+  30 ms split with the remainder carried).
 
-## Compatibility Notes
+## Proxy and PBX interop
 
-- UCTP media datagrams now contain a complete RTP packet after the UCTP header.
-- MOQT draft changes are wire-incompatible at the `rvoip-moq` compatibility
-  boundary.
-- Exhaustive matches over `rvoip_core_traits::connection::Transport` must add
-  the `Vapi` variant.
-- Exhaustive matches over `rvoip::app::AppEvent` must add the
-  `InboundCallAccepted` variant.
+- Kamailio and OpenSIPS registrar-proxy labs, TLS to the proxy and SRTP
+  through rtpengine, with opt-in AMR-NB transcoding. The AMR-WB transcode
+  failure is attributed to rtpengine and recorded as such.
+- A per-rate AMR sweep bound to the gate catalog, and proxy-PBX matrix rows
+  verified in the release report.
+- New gates in the catalog: the AMR per-rate sweep family, the proxy-PBX
+  media family, and AMR decode/encode/unpack fuzz targets.
 
-These are intentional pre-1.0 compatibility changes. The private WebRTC/RTC
-TURN candidate and dynamic moq-rs publisher-lease candidate remain outside the
-consumed dependency graph.
+## SIP correctness
 
-## Beta-Scope Claims
+- RFC 3261 §12.1.1: a secure fallback Contact is generated for every trigger
+  — SIPS Request-URI, SIPS topmost Record-Route, or SIPS Contact when no
+  Record-Route is present — at the TLS-advertised address. Explicit Contact
+  and plain-SIP behavior are unchanged. This also repairs rvoip-to-rvoip
+  SIPS setup, since `Dialog::from_2xx_response` refuses a secure dialog whose
+  Contact is not `sips:` (issue #176). Bounded claim: the fallback still
+  requires a routable TLS advertisement — a wildcard TLS bind with no
+  `tls_advertised_addr` or `contact_uri` emits a syntactically correct but
+  unroutable Contact, exactly as the plain-SIP fallback always has.
+- RFC 3261 §12.1.2: the UAC learns its route set from the dialog-forming
+  2xx's Record-Route, reversed, preserving every URI parameter. Without it,
+  in-dialog requests bypassed every record-routing proxy in the path.
+- The profiled egress registration exposes its coordinator for
+  observation-only subscriptions, so an application can install security
+  evidence monitors before registration. The composite adapter remains the
+  sole signaling and lifecycle owner.
 
-- SIP APIs remain centered on `Endpoint`, `StreamPeer`, `CallbackPeer`,
-  `UnifiedCoordinator`, and `SessionHandle`.
-- Beta media support and interoperability claims are limited to the codecs,
-  transports, peers, topology, and workloads recorded by the promoted report.
-- General full-media performance claims remain capped at the documented 2,000
-  CPS beta profile and require three source-identical canonical runs.
-- Higher-CPS tuned results must retain their hardware, topology, workload, and
-  configuration caveats.
-- The full release gate includes workspace and downstream tests, documentation,
-  API compatibility, Asterisk, FreeSWITCH, SIPp, baresip strict-UA, dependency
-  audit, parser fuzz smoke, performance matrices, burst tests, and soaks.
+## Architecture and compatibility
 
-## Must Not Claim Yet
+- `Config` gains `with_amr_dtx`, `with_amr_auto_cmr`, and
+  `with_amr_mode_set` builders with matching getters. The fields are
+  private: `Config`'s constructible shape is unchanged from `0.3.7`, and
+  functional-record-update construction keeps working against it.
+- `CodecInfo` (rvoip-core-traits, re-exported by rvoip-core) carries the
+  payload type a transport negotiated: `payload_type: Option<u8>`, where
+  `None` preserves the historical name-table resolution.
 
-- Broad production readiness.
-- Carrier SBC certification.
-- Browser/WebRTC support within the SIP beta qualification.
-- DTLS-SRTP, ICE, or TURN support within the SIP beta qualification.
-- Untested codec or topology support.
-- General-user 10,000 CPS full-media capability.
+### Upgrading from 0.3.7
 
-## Evidence and Promotion
+The one source-level change for downstream code: any `CodecInfo { .. }`
+struct literal must add `payload_type: None` (or the negotiated number).
+Everything else in this release is additive — `Config` construction,
+`MediaFrame`, `SymmetricRtpPolicy`, `SipTraceConfig`, and `MediaMode` are
+shape-identical to `0.3.7`.
+- An opus↔opus bridge stays passthrough when its two legs numbered opus
+  differently. The payload type is a per-leg SDP artifact, not a property of
+  the encoded audio, so the bypass compares name, clock rate and channels,
+  and passthrough restamps the sink's payload type on egress.
+- A barge-in flush empties the re-framing accumulator as well as the sink
+  queues, so no pre-interruption audio and no dead-timeline timestamp
+  survives into the first frame after the flush.
+- The AMR claim is bounded by what was measured: the recorded lab matrix,
+  its peer versions, and the rates actually swept. It does not extend to
+  untested handsets, carriers, or transcoding gateways.
+- General-user 10,000 CPS full-media capability is not claimed. The strict
+  SIP beta envelope remains bounded by its recorded 2,000-CPS real-media
+  profile, exact host configuration, peer matrix, workloads, and soak
+  durations.
+- Browser/WebRTC edge qualification remains separate from the SIP beta
+  claim; the AMR and proxy-interop work does not broaden it to untested
+  browsers, ICE/TURN deployments, or network topologies.
 
-The owner-approved [0.3.2 release exception](BETA_RELEASE_EXCEPTION.md),
-[complete gate record](BETA_GATE_EXCEPTION.md), and
-[performance evidence](BETA_PERFORMANCE_EXCEPTION.md) are the authority for
-this release disposition. The source run remains `FAIL` / `NON-RC`: 106 of 108
-required records passed, with zero skips. The root deviation was high-density
-full-media burst ASR of 0.9928 against the 0.995 requirement; the second failed
-record is the reporting roll-up of that same miss.
+## Qualification
 
-No failed gate was changed to PASS. The immutable exception snapshot binds the
-decision to the clean, unchanged tested commit and its evidence with SHA-256.
-The last fully strict 108/108 beta candidate remains available through
-[the strict current reports](BETA_RELEASE_REPORT.md).
+The candidate must pass a fresh `remote-release` qualification from a clean,
+committed `0.3.8` source tree. The aggregate is bound to the exact candidate
+commit and to the catalog hash, and this release changes the catalog — it adds
+the AMR per-rate sweep, proxy-PBX media, and AMR fuzz families — so no earlier
+run's evidence can be reused for any gate.
+
+Historical `0.3.2` exception, `0.3.4` carry-forward, and prior `0.3.6` and
+`0.3.7` attestations remain unchanged release history. They are not presented
+as current `0.3.8` evidence.

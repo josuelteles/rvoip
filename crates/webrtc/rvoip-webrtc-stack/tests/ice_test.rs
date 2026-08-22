@@ -232,9 +232,12 @@ fn test_automatic_host_candidate_gathering() {
         let _ = gathering_rx.recv().await;
 
         // Verify that a host candidate was gathered
-        let candidate = candidate_rx.recv().await;
+        let mut candidate_count = 0;
+        if candidate_rx.recv().await.is_some() {
+            candidate_count += 1;
+        }
         assert!(
-            candidate.is_some(),
+            candidate_count > 0,
             "Should have received at least one ICE candidate"
         );
 

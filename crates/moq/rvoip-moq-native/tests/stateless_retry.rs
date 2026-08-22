@@ -7,16 +7,10 @@ use anyhow::Context;
 use moq_native_ietf::{quic, tls};
 
 mod common;
+mod support;
 
 fn development_tls() -> anyhow::Result<tls::Config> {
-    let identity = common::localhost_server_identity()?;
-    tls::Args {
-        cert: vec![identity.cert],
-        key: vec![identity.key],
-        disable_verify: true,
-        ..Default::default()
-    }
-    .load()
+    support::localhost_server_tls(tls::ClientAuthMode::Disabled, &[])
 }
 
 async fn connect(stateless_retry: bool) -> anyhow::Result<u64> {

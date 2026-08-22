@@ -25,14 +25,15 @@ use support::burst::{
     BURST_ALICE_MEDIA_END, BURST_ALICE_MEDIA_START, BURST_BOB_MEDIA_END, BURST_BOB_MEDIA_START,
 };
 use support::soak::{
-    admission_diagnostics, burst_retention_drain_wait, diagnostic_artifact_path,
-    diagnostic_sample_path, endpoint_global_retained_total, endpoint_metric,
-    endpoint_retained_total, endpoint_retention_summary, in_process_resource_sampler_enabled,
-    media_receive_diagnostics, media_setup_raw_diagnostics, media_setup_timing_diagnostics,
-    memory_diagnostic_interval, memory_diagnostic_summary, read_required_u16_env,
-    resource_sampling_diagnostics, round2, round4, sip_dialog_raw_diagnostics,
-    sip_dialog_timing_diagnostics, sip_udp_diagnostics, DhatProfile, EndpointRetentionSampler,
-    MemoryDiagnosticSampler, RssGrowthGate, MIN_RETENTION_DRAIN_WAIT_SECS,
+    admission_diagnostics, burst_retention_drain_wait, capture_endpoint_retention_sample,
+    diagnostic_artifact_path, diagnostic_sample_path, endpoint_global_retained_total,
+    endpoint_metric, endpoint_retained_total, endpoint_retention_summary,
+    in_process_resource_sampler_enabled, media_receive_diagnostics, media_setup_raw_diagnostics,
+    media_setup_timing_diagnostics, memory_diagnostic_interval, memory_diagnostic_summary,
+    read_required_u16_env, resource_sampling_diagnostics, round2, round4, rss_window_meets_minimum,
+    sample_settled_rss_window, sip_dialog_raw_diagnostics, sip_dialog_timing_diagnostics,
+    sip_udp_diagnostics, wait_for_burst_rss_quiescence, BurstRssQuiescence, DhatProfile,
+    EndpointRetentionSampler, MemoryDiagnosticSampler, RssGrowthGate,
 };
 use support::{
     CallSetupDiagnostics, LatencyHistogram, LoadProfile, ResourceSampler, ResourceSummary,
@@ -41,6 +42,7 @@ use support::{
 
 const BOB_PORT_ENV: &str = "RVOIP_PERF_BURST_BOB_PORT";
 const ALICE_PORT_ENV: &str = "RVOIP_PERF_BURST_ALICE_PORT";
+const STOP_FILE_ENV: &str = "RVOIP_PERF_BURST_STOP_FILE";
 const RUN_DIR_ENV: &str = "RVOIP_PERF_BURST_RUN_DIR";
 const SKIP_AUDIO_SOURCE_ENV: &str = "RVOIP_PERF_BURST_SKIP_AUDIO_SOURCE";
 
@@ -306,6 +308,10 @@ async fn perf_burst_caller() {
         );
         RssGrowthGate::resolve(&first_alice_cfg, &receiver_cfg)
     };
+    let rss_limit = scenario
+        .acceptance
+        .max_rss_growth_mb_per_hr
+        .unwrap_or(rss_gate.effective_mb_per_hr);
     let retention_drain_wait = burst_retention_drain_wait();
     let skip_audio_source = read_bool_env(SKIP_AUDIO_SOURCE_ENV);
     let call_timeout = Duration::from_secs(
@@ -395,19 +401,22 @@ async fn perf_burst_caller() {
     )
     .await;
     let active_wall = started.elapsed();
+    let receiver_stop_signaled = std::env::var_os(STOP_FILE_ENV)
+        .map(PathBuf::from)
+        .map(|path| {
+            std::fs::write(&path, "stop\n").unwrap_or_else(|error| {
+                panic!("write burst receiver stop file {}: {error}", path.display())
+            });
+            true
+        })
+        .unwrap_or(false);
 
-    let retention_snapshot_wait =
-        Duration::from_secs(MIN_RETENTION_DRAIN_WAIT_SECS.try_into().unwrap());
-    tokio::time::sleep(retention_snapshot_wait).await;
-    let retention_series = retention_sampler.stop().await;
-    let final_retention_all = capture_all_caller_retention(clients.as_slice()).await;
-    // Keep captured diagnostics allocated but quiescent during the final RSS
-    // tail. This measures the runtime after SIP retention expiry without
-    // measuring periodic diagnostic JSON construction.
-    tokio::time::sleep(retention_drain_wait.saturating_sub(retention_snapshot_wait)).await;
-    // End process sampling at the declared drain boundary. Retention capture
-    // and report construction allocate diagnostic data and are not part of
-    // the runtime-under-test RSS window.
+    let mut retention_series = retention_sampler.stop_periodic().await;
+    // Structural snapshots walk every owned runtime index and perturb the
+    // allocator. Keep the complete drain/RSS window quiet.
+    tokio::time::sleep(retention_drain_wait).await;
+    // End active-process sampling at the declared drain boundary. The separate
+    // settled sampler below is the authoritative memory-growth window.
     let mut resources = match sampler {
         Some(sampler) => sampler.stop().await,
         None => ResourceSummary::empty(),
@@ -417,22 +426,50 @@ async fn perf_burst_caller() {
         Some(sampler) => Some(sampler.stop().await),
         None => None,
     };
-    let retained_after_drain = final_retention_all.retained_total;
-    let rss = support::soak::rss_result_metrics(
-        &resources,
-        active_wall.as_secs_f64(),
-        active_wall.as_secs_f64(),
-        retention_drain_wait.as_secs_f64(),
-        support::soak::RssGatePolicy::PostDrainOrTail,
-    );
-    let rss_gate_enforced =
-        rss.post_drain_window_secs >= scenario.acceptance.min_rss_gate_window_secs;
-    let rss_gate_reason = if rss_gate_enforced {
-        "post_drain_window_meets_minimum"
+    let rss_quiescence = if in_process_resource_sampling {
+        wait_for_burst_rss_quiescence("burst_caller", rss_limit).await
     } else {
-        "reported_only_short_post_drain_window"
+        BurstRssQuiescence::not_sampled(rss_limit)
     };
+    let (mut settled_resources, settled_observation) =
+        if in_process_resource_sampling && rss_quiescence.achieved {
+            sample_settled_rss_window("burst_caller", scenario.acceptance.min_rss_gate_window_secs)
+                .await
+        } else {
+            (ResourceSummary::empty(), Duration::ZERO)
+        };
+    let rss = support::soak::rss_result_metrics(
+        &settled_resources,
+        0.0,
+        0.0,
+        settled_observation.as_secs_f64(),
+        support::soak::RssGatePolicy::SettledFull,
+    );
+    let rss_gate_enforced = in_process_resource_sampling
+        && rss_quiescence.achieved
+        && rss_window_meets_minimum(
+            rss.post_drain_window_secs,
+            scenario.acceptance.min_rss_gate_window_secs,
+        );
+    let rss_gate_reason = if !in_process_resource_sampling {
+        "in_process_sampling_disabled"
+    } else if !rss_quiescence.achieved {
+        "rss_quiescence_not_achieved"
+    } else if rss_gate_enforced {
+        "settled_window_meets_minimum"
+    } else {
+        "settled_window_incomplete"
+    };
+    // Capture exact structural proof only after authoritative RSS sampling has
+    // stopped so the proof cannot manufacture the growth it is meant to find.
+    let final_sample =
+        capture_endpoint_retention_sample("burst_caller", "after_drain", started, &clients[0].peer)
+            .await;
+    retention_series.record_sample("burst_caller", final_sample);
+    let final_retention_all = capture_all_caller_retention(clients.as_slice()).await;
+    let retained_after_drain = final_retention_all.retained_total;
     resources.samples.clear();
+    settled_resources.samples.clear();
     let dhat_diagnostics = dhat_profile.finish();
 
     let offered = counters.offered.load(Ordering::Relaxed);
@@ -488,6 +525,7 @@ async fn perf_burst_caller() {
     report
         .result("process_role", "caller")
         .result("scenario", scenario.name.clone())
+        .result("receiver_stop_signaled_by_caller", receiver_stop_signaled)
         .result("scenario_seed", scenario.seed)
         .result("offered_cps_peak", max_phase_cps(&scenario))
         .result("achieved_cps", round2(achieved_cps))
@@ -562,13 +600,8 @@ async fn perf_burst_caller() {
         .result("rss_gate_window", rss.gate_window)
         .result("rss_gate_enforced", rss_gate_enforced)
         .result("rss_gate_reason", rss_gate_reason)
-        .result(
-            "rss_acceptance_limit_mb_per_hr",
-            scenario
-                .acceptance
-                .max_rss_growth_mb_per_hr
-                .unwrap_or(rss_gate.effective_mb_per_hr),
-        )
+        .result("rss_quiescence_achieved", rss_quiescence.achieved)
+        .result("rss_acceptance_limit_mb_per_hr", rss_limit)
         .result_block("rss_gate", rss_gate.to_json())
         .result("retained_objects_after_drain", retained_after_drain)
         .result(
@@ -633,6 +666,7 @@ async fn perf_burst_caller() {
                 "post_drain_window_secs": round2(rss.post_drain_window_secs),
             }),
         )
+        .diagnostic_block("rss_quiescence", rss_quiescence.to_json())
         .diagnostic_block(
             "memory_diagnostics",
             memory_diagnostic_summary(memory_series.as_ref()),
@@ -640,6 +674,19 @@ async fn perf_burst_caller() {
         .diagnostic_block(
             "resource_sampling",
             resource_sampling_diagnostics("burst_caller", in_process_resource_sampling),
+        )
+        .diagnostic_block(
+            "settled_resource_sampling",
+            json!({
+                "observation_secs": round2(settled_observation.as_secs_f64()),
+                "sample_count": settled_resources.sample_count,
+                "samples_path": settled_resources
+                    .samples_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                "baseline_rss_mb": round2(settled_resources.baseline_rss_mb),
+                "peak_rss_mb": round2(settled_resources.peak_rss_mb),
+            }),
         )
         .diagnostic_block(
             "call_failure_trace",
@@ -670,10 +717,6 @@ async fn perf_burst_caller() {
     drop(clients);
 
     let mut gate_failures = Vec::new();
-    let rss_limit = scenario
-        .acceptance
-        .max_rss_growth_mb_per_hr
-        .unwrap_or(rss_gate.effective_mb_per_hr);
     if asr < scenario.acceptance.min_asr {
         gate_failures.push(format!(
             "ASR {:.4} below {:.4}",
@@ -753,6 +796,18 @@ async fn perf_burst_caller() {
     if retained_after_drain > scenario.acceptance.max_retained_after_drain {
         gate_failures.push(format!(
             "caller_retained_objects_after_drain={retained_after_drain}"
+        ));
+    }
+    if in_process_resource_sampling && !rss_quiescence.achieved {
+        gate_failures.push(format!(
+            "caller RSS did not become quiescent within {} bounded probes at {:.2} MB/hr",
+            support::soak::BURST_RSS_QUIESCENCE_MAX_PROBES,
+            rss_limit,
+        ));
+    } else if in_process_resource_sampling && !rss_gate_enforced {
+        gate_failures.push(format!(
+            "caller RSS gate captured only {:.3}s of the required {:.3}s window",
+            rss.post_drain_window_secs, scenario.acceptance.min_rss_gate_window_secs,
         ));
     }
     if rss_gate_enforced && rss.gate_growth_mb_per_hr > rss_limit {
@@ -845,6 +900,7 @@ fn terminal_json(terminal: &rvoip_sip::CallTerminalInfo) -> Value {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit inputs keep the burst load phase visible.
 async fn run_burst_load(
     clients: Arc<Vec<LoadClient>>,
     target_uri: String,
@@ -948,6 +1004,7 @@ async fn run_burst_load(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit inputs keep per-call accounting visible.
 fn spawn_call(
     tasks: &mut JoinSet<()>,
     clients: Arc<Vec<LoadClient>>,
@@ -987,6 +1044,7 @@ fn spawn_call(
     });
 }
 
+#[allow(clippy::too_many_arguments)] // Explicit inputs keep per-call accounting visible.
 async fn run_one_call(
     client: LoadClient,
     target_uri: String,
@@ -1061,7 +1119,18 @@ async fn run_one_call(
         Err(err) => {
             counters.pending_setups.fetch_sub(1, Ordering::Relaxed);
             let is_timeout = matches!(&err, rvoip_sip::SessionError::Timeout(_));
-            let looks_like_overload = looks_like_overload(&err);
+            let hangup_started = Instant::now();
+            let hangup_result = handle.hangup_and_wait(Some(call_timeout)).await;
+            let lifecycle_after_hangup = handle.lifecycle().await.ok();
+            // The immediate wait error can lose the typed SIP response while
+            // the exact call lifecycle still retains it. Classify from both
+            // sources so a terminal 503 cannot be mistaken for an unrelated
+            // failure, but never use terminal evidence to mask a timeout.
+            let looks_like_overload = !is_timeout
+                && (looks_like_overload(&err)
+                    || lifecycle_after_hangup
+                        .as_ref()
+                        .is_some_and(lifecycle_reports_overload));
             if is_timeout {
                 counters.timeout.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -1071,13 +1140,6 @@ async fn run_one_call(
                 }
             }
             phase.record_failed(in_stable_recovery, looks_like_overload, phase_elapsed);
-            let hangup_started = Instant::now();
-            let hangup_result = handle.hangup_and_wait(Some(call_timeout)).await;
-            let lifecycle_after_hangup = handle
-                .lifecycle()
-                .await
-                .ok()
-                .map(|snapshot| lifecycle_snapshot_json(&snapshot));
             call_failure_trace.record(json!({
                 "kind": if is_timeout { "answer_timeout" } else { "answer_failed" },
                 "call_seq": call_seq,
@@ -1096,7 +1158,9 @@ async fn run_one_call(
                     Ok(reason) => json!({"ok": true, "reason": reason}),
                     Err(err) => json!({"ok": false, "error": err.to_string()}),
                 },
-                "lifecycle_after_hangup": lifecycle_after_hangup,
+                "lifecycle_after_hangup": lifecycle_after_hangup
+                    .as_ref()
+                    .map(lifecycle_snapshot_json),
             }));
             return;
         }
@@ -1108,8 +1172,8 @@ async fn run_one_call(
         counters.pending_setups.load(Ordering::Relaxed)
             + counters.active_calls.load(Ordering::Relaxed),
     );
-    if !skip_audio_source {
-        if client
+    if !skip_audio_source
+        && client
             .peer
             .set_audio_source(
                 &call_id,
@@ -1120,37 +1184,36 @@ async fn run_one_call(
             )
             .await
             .is_err()
-        {
-            counters.media_setup_failed.fetch_add(1, Ordering::Relaxed);
-            phase.record_failed(in_stable_recovery, false, phase_elapsed);
-            counters.active_calls.fetch_sub(1, Ordering::Relaxed);
-            let hangup_started = Instant::now();
-            let hangup_result = handle.hangup_and_wait(Some(call_timeout)).await;
-            let lifecycle_after_hangup = handle
-                .lifecycle()
-                .await
-                .ok()
-                .map(|snapshot| lifecycle_snapshot_json(&snapshot));
-            call_failure_trace.record(json!({
-                "kind": "media_setup_failed",
-                "call_seq": call_seq,
-                "phase_index": phase_index,
-                "phase": phase.label,
-                "phase_elapsed_ms": duration_millis(phase_elapsed),
-                "from": from,
-                "to": target_uri,
-                "call_id": call_id.to_string(),
-                "wire_call_correlation": wire_call_correlation,
-                "elapsed_ms": round2(t_start.elapsed().as_secs_f64() * 1000.0),
-                "hangup_elapsed_ms": round2(hangup_started.elapsed().as_secs_f64() * 1000.0),
-                "hangup_result": match hangup_result {
-                    Ok(reason) => json!({"ok": true, "reason": reason}),
-                    Err(err) => json!({"ok": false, "error": err.to_string()}),
-                },
-                "lifecycle_after_hangup": lifecycle_after_hangup,
-            }));
-            return;
-        }
+    {
+        counters.media_setup_failed.fetch_add(1, Ordering::Relaxed);
+        phase.record_failed(in_stable_recovery, false, phase_elapsed);
+        counters.active_calls.fetch_sub(1, Ordering::Relaxed);
+        let hangup_started = Instant::now();
+        let hangup_result = handle.hangup_and_wait(Some(call_timeout)).await;
+        let lifecycle_after_hangup = handle
+            .lifecycle()
+            .await
+            .ok()
+            .map(|snapshot| lifecycle_snapshot_json(&snapshot));
+        call_failure_trace.record(json!({
+            "kind": "media_setup_failed",
+            "call_seq": call_seq,
+            "phase_index": phase_index,
+            "phase": phase.label,
+            "phase_elapsed_ms": duration_millis(phase_elapsed),
+            "from": from,
+            "to": target_uri,
+            "call_id": call_id.to_string(),
+            "wire_call_correlation": wire_call_correlation,
+            "elapsed_ms": round2(t_start.elapsed().as_secs_f64() * 1000.0),
+            "hangup_elapsed_ms": round2(hangup_started.elapsed().as_secs_f64() * 1000.0),
+            "hangup_result": match hangup_result {
+                Ok(reason) => json!({"ok": true, "reason": reason}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "lifecycle_after_hangup": lifecycle_after_hangup,
+        }));
+        return;
     }
 
     tokio::time::sleep(scenario.hold_duration(call_seq)).await;
@@ -1224,9 +1287,8 @@ fn burst_config(
     let mut performance = PerformanceConfig::profile(profile)
         .with_capacity(capacity)
         .with_signaling_only_rtp_port(9);
-    if let Some(path) = std::env::var("RVOIP_PERF_RECIPE_FILE")
+    if let Ok(path) = std::env::var("RVOIP_PERF_RECIPE_FILE")
         .or_else(|_| std::env::var("BETA_PERFORMANCE_RECIPE_FILE"))
-        .ok()
     {
         performance = performance.with_recipe_path(path);
     }
@@ -1645,6 +1707,16 @@ fn looks_like_overload(err: &rvoip_sip::SessionError) -> bool {
     text.contains("503") || text.contains("service unavailable") || text.contains("overload")
 }
 
+fn lifecycle_reports_overload(snapshot: &rvoip_sip::CallLifecycleSnapshot) -> bool {
+    matches!(
+        snapshot.terminal.as_ref(),
+        Some(rvoip_sip::CallTerminalInfo::Failed {
+            status_code: 503,
+            ..
+        })
+    )
+}
+
 fn update_atomic_max(target: &AtomicU64, value: u64) {
     let mut current = target.load(Ordering::Relaxed);
     while value > current {
@@ -1673,7 +1745,7 @@ fn soak_like_settings(scenario: &BurstScenario) -> support::soak::SoakLoadSettin
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_overload;
+    use super::{lifecycle_reports_overload, looks_like_overload};
 
     #[test]
     fn overload_classifier_uses_typed_detail_without_unredacting_reports() {
@@ -1685,6 +1757,32 @@ mod tests {
         assert!(!error.to_string().contains("503"));
         assert!(!looks_like_overload(&rvoip_sip::SessionError::Other(
             "call failed before answer: 486 Busy Here".to_string(),
+        )));
+    }
+
+    #[test]
+    fn overload_classifier_uses_authoritative_terminal_status() {
+        let snapshot = |terminal| rvoip_sip::CallLifecycleSnapshot {
+            call_id: rvoip_sip::SessionId::new(),
+            state: None,
+            progress: Vec::new(),
+            answered: None,
+            media_security: None,
+            terminal: Some(terminal),
+            latest_transfer_outcome: None,
+        };
+
+        assert!(lifecycle_reports_overload(&snapshot(
+            rvoip_sip::CallTerminalInfo::Failed {
+                status_code: 503,
+                reason: "Service Unavailable".to_string(),
+            },
+        )));
+        assert!(!lifecycle_reports_overload(&snapshot(
+            rvoip_sip::CallTerminalInfo::Failed {
+                status_code: 486,
+                reason: "Busy Here".to_string(),
+            },
         )));
     }
 }

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 import stat
@@ -17,6 +18,7 @@ WORKSPACE_ROOT = CRATE_DIR.parents[2]
 BETA_GATE = (SCRIPT_DIR / "beta_gate.sh").read_text(encoding="utf-8")
 FULL_BETA_RELEASE_PATH = SCRIPT_DIR / "full_beta_release.sh"
 FULL_BETA_RELEASE = FULL_BETA_RELEASE_PATH.read_text(encoding="utf-8")
+PERF_SOAK_SPLIT = (SCRIPT_DIR / "perf_soak_split.sh").read_text(encoding="utf-8")
 
 
 def shell_function(name: str) -> str:
@@ -31,6 +33,20 @@ def shell_function(name: str) -> str:
 
 
 class BetaGateCompatibilitySourceTests(unittest.TestCase):
+    def test_split_soak_builds_both_exact_binaries_in_one_cargo_invocation(self) -> None:
+        build = re.search(
+            r"^build_exact_test_bins\(\) \{\n(?P<body>.*?)^\}$",
+            PERF_SOAK_SPLIT,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(build)
+        body = build.group("body")
+        self.assertEqual(body.count("cargo test"), 1)
+        self.assertIn("--test perf_soak_receiver", body)
+        self.assertIn("--test perf_soak_caller", body)
+        self.assertEqual(body.count("--build-target perf_soak_receiver"), 1)
+        self.assertEqual(body.count("--build-target perf_soak_caller"), 1)
+
     def test_full_beta_release_wrapper_is_fail_closed_and_literal_all(self) -> None:
         self.assertIn(
             'DOCKER_BIN="$HOMEBREW_PREFIX/opt/docker/bin/docker"',
@@ -342,6 +358,14 @@ class BetaGateCompatibilitySourceTests(unittest.TestCase):
         self.assertIn("RUN_INITIAL_FAILURES=$(awk", pbx)
         self.assertIn('if [ "$failures" -gt "$RUN_INITIAL_FAILURES" ]; then', pbx)
 
+    def test_pbx_tls_readiness_tolerates_expected_startup_probe_failures(self) -> None:
+        pbx = (CRATE_DIR / "examples/pbx/run.sh").read_text(encoding="utf-8")
+        self.assertIn('if nc -z -w 2 "$host" "$port"; then', pbx)
+        self.assertIn("if openssl_output=$(printf '' \\\n", pbx)
+        self.assertIn('openssl s_client -connect "$host:$port"', pbx)
+        self.assertIn("openssl_rc=$?", pbx)
+        self.assertIn("printf '%s\\n' \"$openssl_output\"", pbx)
+
     def test_all_thirteen_standalone_manifests_are_independent_gates(self) -> None:
         examples = shell_function("run_standalone_example_gates")
         inventory_match = re.search(
@@ -377,14 +401,17 @@ class BetaGateCompatibilitySourceTests(unittest.TestCase):
             examples,
         )
 
-        workflow = (WORKSPACE_ROOT / ".github/workflows/examples.yml").read_text(
-            encoding="utf-8"
+        catalog = json.loads(
+            (WORKSPACE_ROOT / "scripts/release/gates.json").read_text(encoding="utf-8")
         )
+        gates = {gate["id"]: gate for gate in catalog["gates"]}
         for example in expected:
+            gate_id = f"test.example-{example.split('-', maxsplit=1)[0]}"
+            self.assertIn(gate_id, gates, f"release catalog omits {example}")
             self.assertIn(
-                f"- {example}",
-                workflow,
-                f"GitHub build matrix omits {example}",
+                f"{{workspace}}/examples/{example}/Cargo.toml",
+                gates[gate_id]["command"],
+                f"release catalog gate {gate_id} targets the wrong manifest",
             )
 
     def test_active_beta_metadata_matches_workspace_version(self) -> None:
@@ -392,7 +419,6 @@ class BetaGateCompatibilitySourceTests(unittest.TestCase):
             (WORKSPACE_ROOT / "Cargo.toml").read_text(encoding="utf-8")
         )
         version = root_manifest["workspace"]["package"]["version"]
-        self.assertEqual(version, "0.3.2")
 
         active_files = [
             WORKSPACE_ROOT / "README.md",

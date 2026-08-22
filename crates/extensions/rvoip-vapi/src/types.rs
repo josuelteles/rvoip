@@ -24,6 +24,12 @@ impl VapiAudioFormat {
         }
     }
 
+    /// Duration of one frame in milliseconds. Both formats are 20 ms; this
+    /// exists so health figures can be expressed as delay rather than counts.
+    pub const fn frame_ms(self) -> u32 {
+        20
+    }
+
     pub const fn timestamp_increment(self) -> u32 {
         match self {
             Self::MuLaw8Khz => 160,
@@ -40,17 +46,22 @@ impl VapiAudioFormat {
 
     pub fn codec(self) -> CodecInfo {
         match self {
+            // Both advertise what this transport can carry rather than
+            // reporting a negotiation, so neither names a payload type.
+            // Both are static names that `codec_to_pt` already resolves.
             Self::MuLaw8Khz => CodecInfo {
                 name: "PCMU".into(),
                 clock_rate_hz: 8_000,
                 channels: 1,
                 fmtp: None,
+                payload_type: None,
             },
             Self::PcmS16Le16Khz => CodecInfo {
                 name: "pcm_s16le".into(),
                 clock_rate_hz: 16_000,
                 channels: 1,
                 fmtp: None,
+                payload_type: None,
             },
         }
     }

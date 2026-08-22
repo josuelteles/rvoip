@@ -92,40 +92,71 @@ python3 "${CARGO_ARTIFACT_HELPER}" capture-source \
   --workspace-root "${WORKSPACE_ROOT}" \
   --output "${SOURCE_AT_BUILD}" >/dev/null
 
-build_exact_test_bin() {
-  local name="$1"
-  local messages="${BUILD_DIR}/${name}-cargo-messages.jsonl"
-  local manifest="${BUILD_DIR}/${name}-artifact.json"
-  local target_source="${CRATE_DIR}/tests/perf/${name}.rs"
+build_exact_test_bins() {
+  local messages="${BUILD_DIR}/split-soak-cargo-messages.jsonl"
+  local name manifest target_source
 
-  echo "Building exact ${name} artifact (features: ${PERF_FEATURES})..." >&2
+  echo "Building exact split-soak artifacts (features: ${PERF_FEATURES})..." >&2
   if ! cargo test \
       -p rvoip-sip \
       --release \
       --features "${PERF_FEATURES}" \
-      --test "${name}" \
+      --test perf_soak_receiver \
+      --test perf_soak_caller \
       --no-run \
       --message-format=json-render-diagnostics \
       >"${messages}"; then
-    echo "Cargo failed while building ${name}; refusing any existing binary" >&2
+    echo "Cargo failed while building split-soak artifacts; refusing existing binaries" >&2
     return 1
   fi
 
-  python3 "${CARGO_ARTIFACT_HELPER}" resolve \
-    --messages "${messages}" \
-    --manifest "${manifest}" \
-    --workspace-root "${WORKSPACE_ROOT}" \
-    --source-at-build "${SOURCE_AT_BUILD}" \
-    --target "${name}" \
-    --target-source "${target_source}" \
-    --package rvoip-sip \
-    --profile release \
-    --features "${PERF_FEATURES}" \
-    --default-features enabled
+  for name in perf_soak_receiver perf_soak_caller; do
+    manifest="${BUILD_DIR}/${name}-artifact.json"
+    target_source="${CRATE_DIR}/tests/perf/${name}.rs"
+
+    python3 "${CARGO_ARTIFACT_HELPER}" resolve \
+      --messages "${messages}" \
+      --manifest "${manifest}" \
+      --workspace-root "${WORKSPACE_ROOT}" \
+      --source-at-build "${SOURCE_AT_BUILD}" \
+      --target "${name}" \
+      --target-source "${target_source}" \
+      --package rvoip-sip \
+      --profile release \
+      --features "${PERF_FEATURES}" \
+      --build-target perf_soak_receiver \
+      --build-target perf_soak_caller \
+      --default-features enabled
+  done
 }
 
-RECEIVER_BIN="$(build_exact_test_bin perf_soak_receiver)"
-CALLER_BIN="$(build_exact_test_bin perf_soak_caller)"
+RESOLVED_EXECUTABLES="${BUILD_DIR}/resolved-executables.txt"
+if [[ -n "${RVOIP_PERF_PREBUILT_MANIFEST:-}" ]]; then
+  : "${RVOIP_RELEASE_CANDIDATE:?prebuilt performance bundle requires exact candidate}"
+  : "${RVOIP_RELEASE_ENVIRONMENT_ID:?prebuilt performance bundle requires environment ID}"
+  echo "Resolving exact split-soak artifacts from the verified candidate bundle..." >&2
+  for name in perf_soak_receiver perf_soak_caller; do
+    python3 "${WORKSPACE_ROOT}/scripts/release/prebuilt_performance.py" resolve \
+      --manifest "${RVOIP_PERF_PREBUILT_MANIFEST}" \
+      --workspace "${WORKSPACE_ROOT}" \
+      --candidate "${RVOIP_RELEASE_CANDIDATE}" \
+      --environment-id "${RVOIP_RELEASE_ENVIRONMENT_ID}" \
+      --features "${PERF_FEATURES}" \
+      --target "${name}" \
+      --artifact-manifest "${BUILD_DIR}/${name}-artifact.json" \
+      --source-at-build "${SOURCE_AT_BUILD}" \
+      --build-target perf_soak_receiver \
+      --build-target perf_soak_caller
+  done >"${RESOLVED_EXECUTABLES}"
+else
+  build_exact_test_bins >"${RESOLVED_EXECUTABLES}"
+fi
+if [[ "$(wc -l <"${RESOLVED_EXECUTABLES}" | tr -d ' ')" != "2" ]]; then
+  echo "Expected exactly two attested split-soak executables" >&2
+  exit 1
+fi
+RECEIVER_BIN="$(sed -n '1p' "${RESOLVED_EXECUTABLES}")"
+CALLER_BIN="$(sed -n '2p' "${RESOLVED_EXECUTABLES}")"
 python3 "${CARGO_ARTIFACT_HELPER}" capture-source \
   --workspace-root "${WORKSPACE_ROOT}" \
   --output "${SOURCE_AFTER_BUILD}" >/dev/null

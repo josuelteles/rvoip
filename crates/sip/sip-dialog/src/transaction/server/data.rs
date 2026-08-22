@@ -133,7 +133,12 @@ pub struct ServerTransactionData {
     pub(crate) final_response_supervision_state: AtomicU64,
     pub(crate) final_response_supervision_notify: tokio::sync::Notify,
 
-    /// Remote address to which responses are sent
+    /// Transport source that delivered the request.
+    ///
+    /// This remains distinct from `response_route`: RFC 3261 §18.2.2 may send
+    /// a UDP response to the Via sent-by port rather than the packet source
+    /// port, while `received`/`rport` stamping and ingress events still require
+    /// the transport-truth source tuple.
     pub remote_addr: SocketAddr,
 
     /// Exact route back to the ingress flow. Connection-oriented responses
@@ -559,12 +564,53 @@ impl ServerTransactionData {
                     bytes::Bytes::from(rvoip_sip_core::Message::Response(response).to_bytes()),
                     self.response_route.clone(),
                 )),
+                None,
                 self.state.clone(),
                 None,
                 self.cmd_tx.clone(),
                 self.compact_retention_reservation.get().cloned(),
                 self.transaction_admission_owner(),
                 Arc::clone(&self.terminal_event_publication),
+                std::time::Duration::ZERO,
+            )
+            .await
+    }
+
+    /// Replace an RFC 6026 Accepted INVITE server runner with a compact
+    /// manager-owned Timer L record. The request and most recent TU-supplied
+    /// 2xx are retained as immutable wire bytes; matching retransmitted
+    /// INVITEs are absorbed without waking a runner.
+    pub(crate) async fn schedule_compact_timer_l(
+        self: Arc<Self>,
+        delay: std::time::Duration,
+    ) -> bool {
+        let identity = Arc::as_ptr(&self) as usize;
+        let Some(scheduler) = self.lifecycle_scheduler.get().cloned() else {
+            return false;
+        };
+        let Some(response) = self.last_response.lock().await.clone() else {
+            return false;
+        };
+        scheduler
+            .schedule_compact_non_invite_with_reservation(
+                identity,
+                self.id.clone(),
+                crate::transaction::lifecycle_scheduler::CompactNonInviteTimer::L,
+                delay,
+                Some((
+                    bytes::Bytes::from(rvoip_sip_core::Message::Response(response).to_bytes()),
+                    self.response_route.clone(),
+                )),
+                Some(bytes::Bytes::from(
+                    rvoip_sip_core::Message::Request((*self.request).clone()).to_bytes(),
+                )),
+                self.state.clone(),
+                None,
+                self.cmd_tx.clone(),
+                self.compact_retention_reservation.get().cloned(),
+                self.transaction_admission_owner(),
+                Arc::clone(&self.terminal_event_publication),
+                std::time::Duration::ZERO,
             )
             .await
     }
@@ -650,7 +696,11 @@ impl SupervisedServerResponse {
         response: Response,
     ) -> crate::transaction::error::Result<Arc<Self>> {
         let final_response = !response.status().is_provisional();
-        let supervision_generation = if final_response {
+        let accepted_invite_2xx = final_response
+            && data.request.method() == Method::Invite
+            && response.status().is_success()
+            && data.state.is_accepted();
+        let supervision_generation = if final_response && !accepted_invite_2xx {
             Some(data.pending_final_response_generation().ok_or_else(|| {
                 crate::transaction::error::Error::Other(
                     "final response has no active supervision generation".to_string(),
@@ -659,8 +709,10 @@ impl SupervisedServerResponse {
         } else {
             None
         };
-        let wire_unknown_transition = final_response.then(|| {
+        let wire_unknown_transition = supervision_generation.map(|_| {
             if data.request.method() == Method::Invite && response.status().is_success() {
+                // RFC 6026 retains an INVITE server transaction after a 2xx,
+                // including when the transport result is wire-unknown.
                 TransactionState::Terminated
             } else {
                 TransactionState::Completed

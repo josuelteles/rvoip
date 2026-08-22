@@ -125,7 +125,7 @@ impl MediaCodec {
     /// the peer sent in `a=rtpmap` verbatim — is normalized before matching.
     pub fn is_audio(&self) -> bool {
         matches!(
-            self.name.to_ascii_uppercase().as_str(),
+            normalize_codec_name(&self.name).as_str(),
             "PCMU" | "PCMA" | "G722" | "G729" | "OPUS" | "AMR" | "AMR-WB"
         )
     }
@@ -134,10 +134,17 @@ impl MediaCodec {
     /// name is normalized before matching.
     pub fn is_video(&self) -> bool {
         matches!(
-            self.name.to_ascii_uppercase().as_str(),
-            "H264" | "H.264" | "H265" | "H.265" | "VP8" | "VP9" | "AV1"
+            normalize_codec_name(&self.name).as_str(),
+            "H264" | "H265" | "VP8" | "VP9" | "AV1"
         )
     }
+}
+
+fn normalize_codec_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| *character != '.')
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
 }
 
 /// Media stream direction
@@ -200,31 +207,23 @@ impl MediaStreamConfig {
 mod tests {
     use super::*;
 
-    // RFC 4855: RTP/SDP encoding names are case-insensitive. Real peers
-    // (e.g. Zoiper) send "OPUS" uppercase in `a=rtpmap`, which `MediaCodec`
-    // carries verbatim as `name` — `is_audio`/`is_video` must not silently
-    // reject it just because it doesn't match a hardcoded case.
-    #[test]
-    fn is_audio_is_case_insensitive() {
-        for name in ["opus", "OPUS", "Opus", "oPuS"] {
-            let codec = MediaCodec::new(name.to_string(), 111, 48000);
-            assert!(codec.is_audio(), "{name} should be recognized as audio");
-        }
-        for name in ["pcmu", "PCMU", "g722", "G722"] {
-            let codec = MediaCodec::new(name.to_string(), 0, 8000);
-            assert!(codec.is_audio(), "{name} should be recognized as audio");
-        }
-        let codec = MediaCodec::new("not-a-codec".to_string(), 99, 8000);
-        assert!(!codec.is_audio());
+    fn codec(name: &str) -> MediaCodec {
+        MediaCodec::new(name.to_string(), 96, 90_000)
     }
 
+    // RFC 4855: RTP/SDP encoding names are case-insensitive. Real peers
+    // (e.g. Zoiper) send "OPUS" uppercase in `a=rtpmap`, which `MediaCodec`
+    // carries verbatim as `name`. is_audio/is_video must not silently
+    // reject it just because it doesn't match a hardcoded case.
     #[test]
-    fn is_video_is_case_insensitive() {
-        for name in ["vp8", "VP8", "h264", "H264", "h.264", "H.264"] {
-            let codec = MediaCodec::new(name.to_string(), 96, 90000);
-            assert!(codec.is_video(), "{name} should be recognized as video");
+    fn codec_media_classification_is_ascii_case_insensitive() {
+        for name in ["opus", "Opus", "OPUS", "pcmu", "PcMa", "g722"] {
+            assert!(codec(name).is_audio(), "{name} should be audio");
         }
-        let codec = MediaCodec::new("opus".to_string(), 111, 48000);
-        assert!(!codec.is_video());
+        for name in ["h264", "H264", "H.264", "h.264", "Vp8", "AV1"] {
+            assert!(codec(name).is_video(), "{name} should be video");
+        }
+        assert!(!codec("not-a-codec").is_audio());
+        assert!(!codec("not-a-codec").is_video());
     }
 }

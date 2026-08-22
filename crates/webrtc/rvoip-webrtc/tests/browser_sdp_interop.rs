@@ -285,7 +285,7 @@ async fn same_clock_pt_remap_omitted_by_final_answer_fails_closed() {
 }
 
 #[tokio::test]
-async fn preattached_audio_offer_owns_supplemental_dtmf_encodings() {
+async fn preattached_audio_offer_uses_the_primary_ssrc_for_dtmf() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let peer = RvoipPeerConnection::new(&WebRtcConfig::loopback(), PeerRole::Offerer)
         .await
@@ -301,10 +301,10 @@ async fn preattached_audio_offer_owns_supplemental_dtmf_encodings() {
         std::sync::Arc::ptr_eq(&audio, &dtmf),
         "both clock encodings must share one negotiated sender/track"
     );
-    assert_ne!(
+    assert_eq!(
         peer.local_audio_ssrc(),
         peer.local_dtmf_ssrc(),
-        "primary audio and telephone-event require independent SSRC timelines"
+        "primary audio and telephone-event must share one RFC 4733 source timeline"
     );
 
     let offer = peer.create_offer_and_gather().await.expect("offer");
@@ -334,9 +334,9 @@ async fn offerer_accepts_a_final_pt110_48khz_answer_on_its_shared_audio_sender()
         .await
         .expect("offerer");
     let offer = offerer.create_offer_and_gather().await.expect("offer");
-    let eight_khz_ssrc = offerer
+    let primary_audio_ssrc = offerer
         .local_dtmf_ssrc()
-        .expect("pre-negotiation 8 kHz encoding");
+        .expect("pre-negotiation audio source");
 
     // A standards-compliant answer may select any mapping from the offer. Give
     // the answerer the same capabilities with 48 kHz preferred so its physical
@@ -362,10 +362,10 @@ async fn offerer_accepts_a_final_pt110_48khz_answer_on_its_shared_audio_sender()
         offerer.outbound_dtmf_negotiation(),
         OutboundDtmfNegotiation::Negotiated(TelephoneEventCodec::new(110, 48_000))
     );
-    assert_ne!(
+    assert_eq!(
         offerer.local_dtmf_ssrc(),
-        Some(eight_khz_ssrc),
-        "final PT110 must select the distinct 48 kHz SSRC encoding"
+        Some(primary_audio_ssrc),
+        "a clock-rate selection must not replace the negotiated audio source"
     );
 
     offerer.close().await.ok();
@@ -392,7 +392,7 @@ async fn receive_only_offer_rejects_outbound_dtmf_before_writing() {
 }
 
 #[tokio::test]
-async fn pending_or_midless_dtmf_fails_closed_before_writing() {
+async fn pending_dtmf_fails_closed_but_a_midless_peer_still_receives_events() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let pending = RvoipPeerConnection::new(&WebRtcConfig::loopback(), PeerRole::Offerer)
         .await
@@ -409,8 +409,10 @@ async fn pending_or_midless_dtmf_fails_closed_before_writing() {
     ));
 
     // This fixture negotiates telephone-event but deliberately has no SDES
-    // MID extmap. The track is not connected, so receiving the capability
-    // error proves rejection happened before a write was attempted.
+    // MID extmap. Telephone events ride the primary negotiated audio SSRC,
+    // which is itself written without a MID against endpoints that never
+    // offer the extension (Amazon Connect), so a missing MID must NOT reject
+    // the digit. Only an unnegotiated or unsupported codec fails closed.
     let adapter = WebRtcAdapter::new(WebRtcConfig::loopback());
     let conn_id = adapter
         .apply_remote_offer(CHROME_MULTI_CODEC_OFFER_SDP)
@@ -425,10 +427,13 @@ async fn pending_or_midless_dtmf_fails_closed_before_writing() {
         OutboundDtmfNegotiation::Negotiated(TelephoneEventCodec::new(110, 48_000))
     );
     assert_eq!(peer.negotiated_outbound_audio_mid(), None);
-    assert!(matches!(
-        rvoip_webrtc::media::dtmf::send_dtmf(&peer, "5", 120).await,
-        Err(WebRtcError::IncompatibleCapabilities)
-    ));
+    assert!(
+        rvoip_webrtc::media::dtmf::send_dtmf(&peer, "5", 120)
+            .await
+            .is_ok(),
+        "a peer that never negotiates SDES MID must still accept DTMF, \
+         because primary audio to that same peer is already written without one"
+    );
 }
 
 #[tokio::test]

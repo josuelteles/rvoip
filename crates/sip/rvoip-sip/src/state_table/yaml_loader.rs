@@ -783,6 +783,9 @@ impl YamlTableLoader {
             "DialogCANCEL" => Ok(EventType::DialogCANCEL),
             "DialogTimeout" => Ok(EventType::DialogTimeout),
             "DialogTerminated" => Ok(EventType::DialogTerminated),
+            "ConfirmedNegotiationFailure" => Ok(EventType::MediaEvent(
+                crate::state_table::types::CONFIRMED_NEGOTIATION_FAILURE_EVENT.to_string(),
+            )),
 
             // Gateway-specific BYE events
             "InboundBYE" | "OutboundBYE" => Ok(EventType::DialogBYE),
@@ -926,6 +929,9 @@ impl YamlTableLoader {
             "IsSubscribed" => Ok(Guard::IsSubscribed),
             "HasActiveSubscription" => Ok(Guard::HasActiveSubscription),
             "HasPendingReinvite" => Ok(Guard::HasPendingReinvite),
+            "HasPendingOfferAnswer" => Ok(Guard::Custom(
+                crate::state_table::types::HAS_PENDING_OFFER_ANSWER_GUARD.to_string(),
+            )),
             "OtherSessionActive" => Ok(Guard::Custom(name.to_string())),
             _ => {
                 debug!("Unknown guard '{}', treating as custom", name);
@@ -1462,8 +1468,8 @@ mod tests {
             owner: "runtime-yaml: supported guard for externally supplied tables",
         },
         VariantAllowance {
-            variant: "Custom",
-            owner: "custom: public runtime YAML extension grammar",
+            variant: "HasPendingReinvite",
+            owner: "direct: retained compatibility guard for builder-owned re-INVITE state",
         },
     ];
 

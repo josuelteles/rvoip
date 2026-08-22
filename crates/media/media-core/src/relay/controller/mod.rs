@@ -22,11 +22,6 @@ use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
-#[cfg(feature = "g729")]
-use crate::codec::audio::common::AudioCodec;
-use crate::codec::audio::G711Codec;
-#[cfg(feature = "g729")]
-use crate::codec::audio::G729Codec;
 use crate::codec::mapping::CodecMapper;
 use crate::diagnostics;
 use crate::error::{Error, Result};
@@ -52,6 +47,8 @@ use rvoip_rtp_core::transport::{
 use rvoip_rtp_core::{
     RtpSession, RtpSessionBufferConfig, RtpSessionConfig, RtpTransportBufferConfig,
 };
+
+mod codec_runtime;
 
 /// Releases a media-controller port reservation if `start_media` is cancelled
 /// before ownership is committed to the controller maps.
@@ -216,7 +213,7 @@ pub use audio_generation::{AudioSource, AudioTransmitterConfig};
 pub use bridge::{BridgeError, BridgeHandle};
 pub use types::{
     AdvancedProcessorConfig, AdvancedProcessorSet, MediaConfig, MediaSessionEvent,
-    MediaSessionInfo, MediaSessionStatus,
+    MediaSessionInfo, MediaSessionStatus, AMR_DTX_PARAMETER, NEGOTIATED_FMTP_PARAMETER,
 };
 
 use types::RtpSessionWrapper;
@@ -389,10 +386,10 @@ pub struct MediaSessionController {
     /// point for SIP hold/resume and remote direction changes.
     pub(super) media_directions: Arc<DashMap<DialogId, MediaDirection>>,
 
-    /// Per-dialog G.729 encoder state. G.729 is stateful, so unlike G.711 it
-    /// cannot be safely recreated for each outbound RTP packet.
-    #[cfg(feature = "g729")]
-    pub(super) g729_tx_codecs: Arc<DashMap<DialogId, Arc<tokio::sync::Mutex<G729Codec>>>>,
+    /// Exact negotiated codec identity and state for each dialog. Replacing
+    /// the `Arc` commits a codec update atomically for both transmit and
+    /// receive paths.
+    codec_runtimes: Arc<DashMap<DialogId, Arc<codec_runtime::DialogCodecRuntime>>>,
 
     /// RTP session queue sizing for new sessions.
     rtp_session_buffer_config: RtpSessionBufferConfig,
@@ -508,8 +505,7 @@ impl MediaSessionController {
             cn_gate_state: Arc::new(DashMap::with_capacity(capacity_hint)),
             comfort_noise_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             media_directions: Arc::new(DashMap::with_capacity(capacity_hint)),
-            #[cfg(feature = "g729")]
-            g729_tx_codecs: Arc::new(DashMap::with_capacity(capacity_hint)),
+            codec_runtimes: Arc::new(DashMap::with_capacity(capacity_hint)),
             rtp_session_buffer_config,
             rtp_transport_buffer_config,
             symmetric_rtp_policy: SymmetricRtpPolicy::default(),
@@ -835,8 +831,7 @@ impl MediaSessionController {
             cn_gate_state: Arc::new(DashMap::new()),
             comfort_noise_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             media_directions: Arc::new(DashMap::new()),
-            #[cfg(feature = "g729")]
-            g729_tx_codecs: Arc::new(DashMap::new()),
+            codec_runtimes: Arc::new(DashMap::new()),
             rtp_session_buffer_config: RtpSessionBufferConfig::default(),
             rtp_transport_buffer_config: RtpTransportBufferConfig::default(),
             symmetric_rtp_policy: SymmetricRtpPolicy::default(),
@@ -856,6 +851,14 @@ impl MediaSessionController {
             )));
         }
 
+        // Resolve and construct the complete codec generation before
+        // allocating a port or mutating any controller state. Unsupported,
+        // disabled, or malformed codec requests therefore fail atomically.
+        let codec_format = codec_runtime::resolve_codec(&config)?;
+        let codec_runtime = Arc::new(codec_runtime::DialogCodecRuntime::new(
+            codec_format.clone(),
+        )?);
+
         // Allocate RTP port using either our local allocator or the global one
         let allocator = if let Some(ref port_alloc) = self.port_allocator {
             // Use our custom port allocator with configured range
@@ -865,19 +868,8 @@ impl MediaSessionController {
             GlobalPortAllocator::instance().await
         };
 
-        // Determine payload type from preferred codec
-        let payload_type = config
-            .preferred_codec
-            .as_ref()
-            .and_then(|codec| self.codec_mapper.codec_to_payload(codec))
-            .unwrap_or(0); // Default to PCMU
-
-        // Determine clock rate based on codec
-        let clock_rate = config
-            .preferred_codec
-            .as_ref()
-            .map(|codec| self.codec_mapper.get_clock_rate(codec))
-            .unwrap_or(8000);
+        let payload_type = codec_format.payload_type;
+        let clock_rate = codec_format.clock_rate;
 
         let dialog_session_id = format!("dialog_{}", dialog_id);
         let mut last_bind_error: Option<rtp_core::Error> = None;
@@ -994,6 +986,7 @@ impl MediaSessionController {
         // Wrap RTP session
         let rtp_wrapper = RtpSessionWrapper {
             session: Arc::new(tokio::sync::Mutex::new(rtp_session)),
+            update_lock: Arc::new(tokio::sync::Mutex::new(())),
             local_addr: local_rtp_addr,
             remote_addr: config.remote_addr,
             created_at: std::time::Instant::now(),
@@ -1029,6 +1022,7 @@ impl MediaSessionController {
         );
         self.sessions.insert(dialog_id.clone(), session_info);
         self.rtp_sessions.insert(dialog_id.clone(), rtp_wrapper);
+        self.codec_runtimes.insert(dialog_id.clone(), codec_runtime);
         // The controller maps now own the RTP session and stop_media owns the
         // matching allocator release.
         reservation_guard.disarm();
@@ -1084,7 +1078,7 @@ impl MediaSessionController {
 
         // RtpSession exposes its transport via a typed accessor; we
         // need the UdpRtpTransport concrete type to reach
-        // `set_srtp_contexts`. Downcast once — the only transport
+        // the reversible SRTP context API. Downcast once — the only transport
         // type media-core constructs is UDP, so this is the
         // architecturally-correct narrowing.
         let session_guard = session_arc.lock().await;
@@ -1097,20 +1091,23 @@ impl MediaSessionController {
                     "install_srtp_contexts: RTP session is not a UdpRtpTransport".to_string(),
                 )
             })?;
-        udp_transport.set_srtp_contexts(send_ctx, recv_ctx).await;
+        let _rollback = udp_transport
+            .replace_srtp_contexts(send_ctx, recv_ctx)
+            .await
+            .map_err(|error| Error::config(format!("failed to install SRTP contexts: {error}")))?;
         info!("Installed SDES-SRTP contexts on dialog {}", dialog_id);
         Ok(())
     }
 
     /// Run a real DTLS-SRTP handshake (RFC 5764) for a dialog's RTP session
     /// and install the resulting keys the same way [`Self::install_srtp_contexts`]
-    /// installs SDES ones — this is the DTLS-SRTP equivalent of that call,
+    /// installs SDES ones. This is the DTLS-SRTP equivalent of that call,
     /// sharing the same underlying `UdpRtpTransport::set_srtp_contexts`.
     ///
     /// Must be called after [`Self::start_media`], with `remote_addr` set to
     /// the peer's RTP address from its SDP answer/offer (the handshake runs
     /// over the same socket RTP/RTCP already use, demultiplexed by the
-    /// first byte of each datagram — see `rvoip_rtp_core::transport::dtls_bridge`).
+    /// first byte of each datagram).
     /// The caller is responsible for checking the returned
     /// `remote_fingerprint_sha256` against the SDP `a=fingerprint` the peer
     /// advertised; this function only runs the handshake, it has no notion
@@ -1188,31 +1185,14 @@ impl MediaSessionController {
     }
 
     /// Create a real ICE (RFC 8445) agent bound to a dialog's shared RTP
-    /// socket and start pumping the socket's demuxed STUN datagrams into
-    /// it — the ICE equivalent of [`Self::run_dtls_handshake_and_install`]'s
-    /// scope: this is the one step that needs the live transport, so it
-    /// lives here rather than in `rvoip-sip` directly.
+    /// socket and start pumping the socket's demuxed STUN datagrams into it.
     ///
     /// `ip_filter`, when set, restricts host candidate gathering to IP
-    /// addresses it accepts — the caller passes one derived from
-    /// `Config::local_ip` when that's a concrete (non-unspecified)
-    /// address, so an operator who explicitly bound to one interface
-    /// doesn't have unrelated interfaces' addresses advertised to peers.
-    ///
-    /// The returned agent is otherwise driven entirely by its own public
-    /// API (`gather_candidates`, `add_remote_candidate`, `connect`) —
-    /// none of those need the transport, so the caller (`rvoip-sip`'s
-    /// `MediaAdapter`) calls them directly rather than routing back
-    /// through this controller, mirroring how DTLS identity generation
-    /// (`rtp_core::dtls_srtp::generate_identity`) is also called directly
-    /// by `rvoip-sip` rather than through a controller method.
-    #[cfg(feature = "ice")]
+    /// addresses it accepts.
     ///
     /// `external_ips` announces those addresses as host candidates in place of
-    /// the local interface addresses (1:1 NAT mapping). It is what makes ICE
-    /// usable behind static NAT: `stun_servers` cannot, because `webrtc-ice`
-    /// gathers no server-reflexive candidates over the shared socket this
-    /// agent multiplexes on.
+    /// the local interface addresses (1:1 NAT mapping).
+    #[cfg(feature = "ice")]
     pub async fn create_ice_agent(
         &self,
         dialog_id: &DialogId,
@@ -1256,11 +1236,6 @@ impl MediaSessionController {
             .map_err(|e| Error::config(format!("create_ice_agent: {e}")))?,
         );
 
-        // Feed inbound STUN datagrams the transport's own demux loop
-        // has already classified into the agent for the life of the
-        // dialog's socket — same "pump a channel into the agent"
-        // pattern `ice_transport_bridge_test.rs` proves works, just
-        // driven from inside the controller instead of a test body.
         let pump_agent = agent.clone();
         tokio::spawn(async move {
             while let Some((buf, addr)) = stun_rx.recv().await {
@@ -1277,9 +1252,6 @@ impl MediaSessionController {
 
     /// Override a dialog's RTP remote address with an ICE-selected
     /// candidate pair, once [`nat_core::IceAgent::connect`] resolves.
-    /// Safe to call after [`Self::establish_media_flow`] has already set
-    /// the SDP-derived address — same idempotent re-call pattern
-    /// [`Self::run_dtls_handshake_and_install`] already relies on.
     #[cfg(feature = "ice")]
     pub async fn update_ice_selected_addr(
         &self,
@@ -1310,14 +1282,70 @@ impl MediaSessionController {
         Ok(())
     }
 
+    /// Prepare a reversible directional SRTP replacement for one exact RTP
+    /// session. Dropping the returned token commits the new contexts.
+    pub async fn prepare_srtp_context_swap(
+        &self,
+        dialog_id: &DialogId,
+        send_ctx: rvoip_rtp_core::srtp::SrtpContext,
+        recv_ctx: rvoip_rtp_core::srtp::SrtpContext,
+    ) -> Result<rvoip_rtp_core::transport::SrtpContextRollback> {
+        let session_arc = self
+            .rtp_sessions
+            .get(dialog_id)
+            .map(|entry| entry.value().session.clone())
+            .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
+        let session_guard = session_arc.lock().await;
+        let transport = session_guard.transport();
+        let udp_transport = transport
+            .as_any()
+            .downcast_ref::<rvoip_rtp_core::transport::UdpRtpTransport>()
+            .ok_or_else(|| {
+                Error::config(
+                    "prepare_srtp_context_swap: RTP session is not a UdpRtpTransport".to_string(),
+                )
+            })?;
+        udp_transport
+            .replace_srtp_contexts(send_ctx, recv_ctx)
+            .await
+            .map_err(|error| Error::config(format!("failed to replace SRTP contexts: {error}")))
+    }
+
+    /// Restore a prepared SRTP replacement if its SIP commit reaches a
+    /// definite zero-wire failure.
+    pub async fn rollback_srtp_context_swap(
+        &self,
+        dialog_id: &DialogId,
+        rollback: rvoip_rtp_core::transport::SrtpContextRollback,
+    ) -> Result<()> {
+        let session_arc = self
+            .rtp_sessions
+            .get(dialog_id)
+            .map(|entry| entry.value().session.clone())
+            .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
+        let session_guard = session_arc.lock().await;
+        let transport = session_guard.transport();
+        let udp_transport = transport
+            .as_any()
+            .downcast_ref::<rvoip_rtp_core::transport::UdpRtpTransport>()
+            .ok_or_else(|| {
+                Error::config(
+                    "rollback_srtp_context_swap: RTP session is not a UdpRtpTransport".to_string(),
+                )
+            })?;
+        udp_transport
+            .rollback_srtp_contexts(rollback)
+            .await
+            .map_err(|error| Error::config(format!("failed to restore SRTP contexts: {error}")))
+    }
+
     fn cleanup_per_dialog_side_state(&self, dialog_id: &DialogId) {
         self.media_directions.remove(dialog_id);
         self.advanced_processors.remove(dialog_id);
         self.audio_frame_callbacks.remove(dialog_id);
         self.dtmf_callbacks.remove(dialog_id);
         self.cn_gate_state.remove(dialog_id);
-        #[cfg(feature = "g729")]
-        self.g729_tx_codecs.remove(dialog_id);
+        self.codec_runtimes.remove(dialog_id);
 
         let media_id = MediaSessionId::from_dialog(dialog_id);
         if let Some((_, session_id)) = self.media_to_session.remove(&media_id) {
@@ -1432,132 +1460,146 @@ impl MediaSessionController {
     pub async fn update_media(&self, dialog_id: DialogId, config: MediaConfig) -> Result<()> {
         info!("Updating media session for dialog: {}", dialog_id);
 
-        // Update the session config and snapshot the old values for
-        // change detection. The shard guard is dropped at the end of
-        // this block.
-        let (old_remote, old_codec) = {
-            let mut entry = self
-                .sessions
-                .get_mut(&dialog_id)
-                .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
-            let session_info = entry.value_mut();
-            let old_remote = session_info.config.remote_addr;
-            let old_codec = session_info.config.preferred_codec.clone();
-            session_info.config = config.clone();
-            (old_remote, old_codec)
+        let update_lock = self
+            .rtp_sessions
+            .get(&dialog_id)
+            .map(|entry| Arc::clone(&entry.value().update_lock))
+            .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
+        let _update_guard = update_lock.lock().await;
+
+        let old_config = self
+            .sessions
+            .get(&dialog_id)
+            .map(|entry| entry.value().config.clone())
+            .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
+        let old_runtime = self
+            .codec_runtimes
+            .get(&dialog_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
+
+        // A live bridge's framing guard ran once, when the bridge was made.
+        // Re-check it here, before anything is mutated, so a re-INVITE that
+        // would leave the bridge relaying a framing the far end cannot parse
+        // is refused with the previous generation intact.
+        self.revalidate_bridge_format(&dialog_id, &config)
+            .map_err(|error| Error::config(error.to_string()))?;
+
+        // Build replacement codec state before changing the RTP session or
+        // published configuration. Any unsupported codec or invalid shape
+        // leaves the preceding stable generation untouched.
+        let new_format = codec_runtime::resolve_codec(&config)?;
+        let codec_changed = old_runtime.format != new_format;
+        let replacement_runtime = if codec_changed {
+            Some(Arc::new(codec_runtime::DialogCodecRuntime::new(
+                new_format.clone(),
+            )?))
+        } else {
+            None
         };
+        let remote_changed = config.remote_addr != old_config.remote_addr;
 
-        // Extract the per-session Arc + update the wrapper's remote
-        // address in the same shard-guard scope. Drop the shard
-        // guard before we touch the RTP session itself.
-        let rtp_session_arc = {
-            let Some(mut entry) = self.rtp_sessions.get_mut(&dialog_id) else {
-                warn!(
-                    "No RTP session found for dialog {} during update",
-                    dialog_id
-                );
-                return Ok(());
-            };
-            let wrapper = entry.value_mut();
-            if config.remote_addr != old_remote {
-                wrapper.remote_addr = config.remote_addr;
-            }
-            wrapper.session.clone()
+        let rtp_session_arc = self
+            .rtp_sessions
+            .get(&dialog_id)
+            .map(|entry| entry.value().session.clone())
+            .ok_or_else(|| Error::session_not_found(dialog_id.as_str()))?;
+
+        // A generated-audio task owns one codec generation. Stop it only
+        // after the replacement runtime has been validated, then rebuild it
+        // against the new generation before publishing the update.
+        let transmitter_to_replace = if codec_changed {
+            self.rtp_sessions.get_mut(&dialog_id).and_then(|mut entry| {
+                entry
+                    .value_mut()
+                    .audio_transmitter
+                    .take()
+                    .map(|transmitter| {
+                        let config = transmitter.replacement_config();
+                        (transmitter, config)
+                    })
+            })
+        } else {
+            None
         };
+        let replacement_transmitter_config = transmitter_to_replace
+            .as_ref()
+            .map(|(_, config)| config.clone());
+        if let Some((transmitter, _)) = transmitter_to_replace {
+            transmitter.stop().await;
+        }
 
-        let mut updates_made = false;
-
-        // Apply remote-address change.
-        if config.remote_addr != old_remote {
-            if let Some(remote_addr) = config.remote_addr {
-                let mut rtp_session = rtp_session_arc.lock().await;
+        {
+            let mut rtp_session = rtp_session_arc.lock().await;
+            if let Some(remote_addr) = config.remote_addr.filter(|_| remote_changed) {
                 rtp_session.set_remote_addr(remote_addr).await;
-                drop(rtp_session);
-
-                info!(
-                    "✅ Updated RTP session remote address for dialog {}: {}",
-                    dialog_id, remote_addr
-                );
-                updates_made = true;
-
-                let _ = self.event_tx.send(MediaSessionEvent::RemoteAddressUpdated {
-                    dialog_id: dialog_id.clone(),
-                    remote_addr,
-                });
+            }
+            if codec_changed {
+                rtp_session.set_payload_type(new_format.payload_type);
+                rtp_session.set_clock_rate(new_format.clock_rate);
             }
         }
 
-        // Apply codec change.
-        if config.preferred_codec != old_codec {
-            #[cfg(feature = "g729")]
-            self.g729_tx_codecs.remove(&dialog_id);
+        // Commit the externally visible generation only after all validation
+        // and lower-layer application succeeds.
+        if let Some(runtime) = replacement_runtime.as_ref() {
+            self.codec_runtimes
+                .insert(dialog_id.clone(), Arc::clone(runtime));
+        }
+        if let Some(mut entry) = self.rtp_sessions.get_mut(&dialog_id) {
+            entry.value_mut().remote_addr = config.remote_addr;
+        } else {
+            return Err(Error::session_not_found(dialog_id.as_str()));
+        }
+        if let Some(mut entry) = self.sessions.get_mut(&dialog_id) {
+            entry.value_mut().config = config.clone();
+        } else {
+            return Err(Error::session_not_found(dialog_id.as_str()));
+        }
 
-            let new_payload_type = config
-                .preferred_codec
-                .as_ref()
-                .and_then(|codec| self.codec_mapper.codec_to_payload(codec))
-                .unwrap_or(0);
-            let new_clock_rate = config
-                .preferred_codec
-                .as_ref()
-                .map(|codec| self.codec_mapper.get_clock_rate(codec))
-                .unwrap_or(8000);
-
-            {
-                let mut rtp_session = rtp_session_arc.lock().await;
-                rtp_session.set_payload_type(new_payload_type);
-
-                if rtp_session.get_payload_type() != new_payload_type {
-                    warn!("Failed to update payload type for dialog {}", dialog_id);
-                } else {
-                    debug!(
-                        "Successfully updated payload type to {} for dialog {}",
-                        new_payload_type, dialog_id
-                    );
-                }
-
-                // TODO: Implement clock rate updates in rtp-core session
-                debug!(
-                    "Clock rate change noted for dialog {} ({}Hz), but full update requires rtp-core enhancement",
-                    dialog_id, new_clock_rate
-                );
-            }
-
-            updates_made = true;
-
-            // Log codec change with detailed information
-            let old_codec_name = old_codec.as_deref().unwrap_or("PCMU");
-            let new_codec_name = config.preferred_codec.as_deref().unwrap_or("PCMU");
-            let old_payload_type = old_codec
-                .as_ref()
-                .and_then(|codec| self.codec_mapper.codec_to_payload(codec))
-                .unwrap_or(0);
-            let old_clock_rate = old_codec
-                .as_ref()
-                .map(|codec| self.codec_mapper.get_clock_rate(codec))
-                .unwrap_or(8000);
-
-            info!(
-                "🔄 Codec changed for dialog {}: {} -> {} (PT: {} -> {}, Clock: {}Hz -> {}Hz)",
-                dialog_id,
-                old_codec_name,
-                new_codec_name,
-                old_payload_type,
-                new_payload_type,
-                old_clock_rate,
-                new_clock_rate
+        if let (Some(transmitter_config), Some(runtime)) =
+            (replacement_transmitter_config, replacement_runtime)
+        {
+            let mut replacement = audio_generation::AudioTransmitter::new_with_config(
+                Arc::clone(&rtp_session_arc),
+                transmitter_config,
+                runtime,
             );
+            replacement.start().await;
+            if let Some(mut entry) = self.rtp_sessions.get_mut(&dialog_id) {
+                entry.value_mut().audio_transmitter = Some(replacement);
+            } else {
+                return Err(Error::session_not_found(dialog_id.as_str()));
+            }
+        }
 
+        if let Some(remote_addr) = config.remote_addr.filter(|_| remote_changed) {
+            let _ = self.event_tx.send(MediaSessionEvent::RemoteAddressUpdated {
+                dialog_id: dialog_id.clone(),
+                remote_addr,
+            });
+        }
+        if codec_changed {
+            info!(
+                "🔄 Codec changed for dialog {}: {} (PT {}, {}Hz) -> {} (PT {}, {}Hz)",
+                dialog_id,
+                old_runtime.format.name,
+                old_runtime.format.payload_type,
+                old_runtime.format.clock_rate,
+                new_format.name,
+                new_format.payload_type,
+                new_format.clock_rate
+            );
             let _ = self.event_tx.send(MediaSessionEvent::CodecChanged {
                 dialog_id: dialog_id.clone(),
-                old_codec: old_codec.clone(),
+                old_codec: old_config.preferred_codec.clone(),
                 new_codec: config.preferred_codec.clone(),
-                new_payload_type,
-                new_clock_rate,
+                new_payload_type: new_format.payload_type,
+                new_clock_rate: new_format.clock_rate,
             });
         }
 
-        if updates_made {
+        if remote_changed || codec_changed || config != old_config {
             info!(
                 "✅ Media session successfully updated for dialog: {}",
                 dialog_id
@@ -1665,7 +1707,7 @@ impl MediaSessionController {
     ) {
         let audio_frame_callbacks = self.audio_frame_callbacks.clone();
         let dtmf_callbacks = self.dtmf_callbacks.clone();
-        let _codec_mapper = self.codec_mapper.clone();
+        let codec_runtimes = self.codec_runtimes.clone();
         let media_directions = self.media_directions.clone();
 
         // RFC 4733 §2.5.1.3 retransmit dedup formerly lived here as a
@@ -1676,25 +1718,8 @@ impl MediaSessionController {
         // three E=1 retransmits before they are even decoded into a
         // typed `DtmfEvent`.
 
-        // Create G.711 codecs outside the loop for efficiency
-        let mut g711_ulaw = G711Codec::mu_law(8000, 1).expect("Failed to create μ-law codec");
-        let mut g711_alaw = G711Codec::a_law(8000, 1).expect("Failed to create A-law codec");
-        #[cfg(feature = "g729")]
-        let mut g729_decoder = G729Codec::new(
-            crate::types::SampleRate::Rate8000,
-            1,
-            crate::codec::audio::G729Config::default(),
-        )
-        .expect("Failed to create G.729 decoder");
-        let mut decode_buffer = vec![0i16; 160];
         let skip_audio_frame_delivery = perf_skip_audio_frame_delivery();
         let collect_audio_quality = diagnostics::audio_quality_enabled();
-
-        #[cfg(feature = "memory-diagnostics")]
-        let _decode_buffer_guard = rvoip_infra_common::memory_diagnostics::ObjectGuard::new(
-            "media_core.audio.rx.decode_reusable_buffer",
-            decode_buffer.capacity() * std::mem::size_of::<i16>(),
-        );
 
         spawn_memory_tracked("media_core.rtp_event_handler_task", async move {
             info!("🎧 Started RTP event handler for dialog: {}", dialog_id);
@@ -1714,6 +1739,22 @@ impl MediaSessionController {
                             rtp_core::session::RtpSessionEvent::PacketReceived(packet) => {
                                 rtp_count += 1;
                                 let packet_arrival = collect_audio_quality.then(Instant::now);
+                                let Some(codec_runtime) = codec_runtimes
+                                    .get(&dialog_id)
+                                    .map(|entry| entry.value().clone())
+                                else {
+                                    debug!("No codec runtime for dialog {}", dialog_id);
+                                    continue;
+                                };
+                                if packet.header.payload_type != codec_runtime.format.payload_type {
+                                    debug!(
+                                        "Ignoring unnegotiated payload type {} for dialog {} (expected {})",
+                                        packet.header.payload_type,
+                                        dialog_id,
+                                        codec_runtime.format.payload_type
+                                    );
+                                    continue;
+                                }
 
                                 if rtp_count % 10 == 0
                                     || rtp_count == 100
@@ -1765,8 +1806,8 @@ impl MediaSessionController {
                                             .timestamp
                                             .wrapping_sub(previous_timestamp)
                                             as f64;
-                                        let rtp_delta_ns =
-                                            rtp_delta_samples * 1_000_000_000_f64 / 8_000_f64;
+                                        let rtp_delta_ns = rtp_delta_samples * 1_000_000_000_f64
+                                            / f64::from(codec_runtime.format.clock_rate);
                                         let transit_delta = (arrival_delta - rtp_delta_ns).abs();
                                         jitter_ns += (transit_delta - jitter_ns) / 16.0;
                                     }
@@ -1783,78 +1824,20 @@ impl MediaSessionController {
                                     last_rtp_arrival = Some(arrival);
                                 }
 
-                                if decode_buffer.len() < packet.payload.len() {
-                                    let old_capacity = decode_buffer.capacity();
-                                    decode_buffer.resize(packet.payload.len(), 0);
-                                    let new_capacity = decode_buffer.capacity();
-                                    if new_capacity > old_capacity {
-                                        record_transient_allocation(
-                                            "media_core.audio.rx.decode_reusable_buffer_grow",
-                                            (new_capacity - old_capacity)
-                                                * std::mem::size_of::<i16>(),
-                                        );
-                                    }
-                                }
-
-                                // Decode based on payload type into a reusable per-handler buffer.
-                                let decoded_len = match packet.header.payload_type {
-                                    0 => {
-                                        // PCMU (μ-law)
-                                        match g711_ulaw.decode_to_buffer(
-                                            &packet.payload,
-                                            &mut decode_buffer[..packet.payload.len()],
-                                        ) {
-                                            Ok(samples) => samples,
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to decode PCMU for dialog {}: {}",
-                                                    dialog_id, e
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    8 => {
-                                        // PCMA (A-law)
-                                        match g711_alaw.decode_to_buffer(
-                                            &packet.payload,
-                                            &mut decode_buffer[..packet.payload.len()],
-                                        ) {
-                                            Ok(samples) => samples,
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to decode PCMA for dialog {}: {}",
-                                                    dialog_id, e
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    #[cfg(feature = "g729")]
-                                    18 => {
-                                        match decode_g729_payload_to_buffer(
-                                            &mut g729_decoder,
-                                            &packet.payload,
-                                            &mut decode_buffer,
-                                        ) {
-                                            Ok(samples) => samples,
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to decode G.729 for dialog {}: {}",
-                                                    dialog_id, e
-                                                );
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        debug!(
-                                            "Unsupported payload type {} for dialog {}",
-                                            packet.header.payload_type, dialog_id
+                                let audio_frame = match codec_runtime
+                                    .decode(&packet.payload, packet.header.timestamp)
+                                    .await
+                                {
+                                    Ok(frame) => frame,
+                                    Err(error) => {
+                                        warn!(
+                                            "Failed to decode {} for dialog {}: {}",
+                                            codec_runtime.format.name, dialog_id, error
                                         );
                                         continue;
                                     }
                                 };
+                                let decoded_len = audio_frame.samples.len();
 
                                 let receive_enabled = media_directions
                                     .get(&dialog_id)
@@ -1893,13 +1876,10 @@ impl MediaSessionController {
                                     .map(|r| r.value().clone());
                                 if let Some(sender) = sender {
                                     decoded_audio_frame_count += 1;
-                                    let samples = decode_buffer[..decoded_len].to_vec();
                                     record_transient_allocation(
                                         "media_core.audio.rx.audio_frame.samples_vec",
-                                        samples.capacity() * std::mem::size_of::<i16>(),
+                                        audio_frame.samples.capacity() * std::mem::size_of::<i16>(),
                                     );
-                                    let audio_frame =
-                                        AudioFrame::new(samples, 8000, 1, packet.header.timestamp);
 
                                     // Use try_send to avoid blocking the RTP event handler
                                     match sender.try_send(audio_frame) {

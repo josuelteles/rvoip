@@ -24,6 +24,15 @@ pub struct NegotiatedConfig {
     pub codec: String,
     pub sample_rate: u32,
     pub channels: u8,
+    /// The peer's `a=fmtp` parameter string, when the answer carried one.
+    ///
+    /// Not decoration for every codec: AMR's `octet-align` selects the RTP
+    /// payload's bit layout, so a leg that reached the media layer without it
+    /// builds a framing the peer cannot parse. Opus's `maxaveragebitrate` and
+    /// `cbr` are quieter but real — `rvoip-core` keys its transcoding groups
+    /// on this field, so dropping it puts every SIP leg in one group.
+    #[serde(default)]
+    pub fmtp: Option<String>,
 }
 
 impl fmt::Debug for NegotiatedConfig {
@@ -35,7 +44,22 @@ impl fmt::Debug for NegotiatedConfig {
             .field("codec_bytes", &self.codec.len())
             .field("sample_rate", &self.sample_rate)
             .field("channels", &self.channels)
+            .field("fmtp_present", &self.fmtp.is_some())
             .finish()
+    }
+}
+
+#[derive(Clone)]
+struct NegotiatedPayloadIdentity {
+    payload_type: u8,
+    config: NegotiatedConfig,
+}
+
+impl NegotiatedPayloadIdentity {
+    fn matches(&self, config: &NegotiatedConfig) -> bool {
+        self.config.codec.eq_ignore_ascii_case(&config.codec)
+            && self.config.sample_rate == config.sample_rate
+            && self.config.channels == config.channels
     }
 }
 
@@ -61,6 +85,25 @@ pub enum PendingReinvite {
 pub struct PendingIncomingReinvite {
     pub transaction_id: rvoip_sip_dialog::transaction::TransactionKey,
     pub offered_sdp: String,
+}
+
+/// Stable offer/answer state retained while an outbound session modification
+/// is in flight. The new offer may have reached the wire, but it is not the
+/// dialog's stable description until the exact transaction receives and
+/// successfully applies a valid answer.
+#[derive(Clone)]
+pub(crate) struct PendingOfferAnswer {
+    pub(crate) method: rvoip_sip_core::Method,
+    pub(crate) transaction_id: Option<TransactionKey>,
+    pub(crate) local_offer: String,
+    stable_local_sdp: Option<String>,
+    stable_remote_sdp: Option<String>,
+    stable_negotiated_config: Option<NegotiatedConfig>,
+    stable_negotiated_payload: Option<NegotiatedPayloadIdentity>,
+    stable_media_security: Option<MediaSecurityState>,
+    stable_sdp_negotiated: bool,
+    stable_local_direction: MediaDirection,
+    stable_remote_direction: MediaDirection,
 }
 
 /// Private RFC 4028 refresh ownership for one exact session lifetime.
@@ -177,6 +220,12 @@ pub struct SessionStateCold {
     pub redirect_targets: Vec<String>,
     pub redirect_attempts: u8,
     pub pending_reinvite: Option<PendingReinvite>,
+    pub(crate) pending_offer_answer: Option<PendingOfferAnswer>,
+    negotiated_payload: Option<NegotiatedPayloadIdentity>,
+    /// Stable local SDP captured before an outbound re-INVITE replaces the
+    /// working offer. The outer option marks an in-flight snapshot; the inner
+    /// option preserves whether the stable dialog had local SDP at all.
+    pub(crate) stable_local_sdp_before_reinvite: Option<Option<String>>,
     pub reinvite_retry_attempts: u8,
     /// Set when `NegotiateSDPAsUAS` had no remote offer to negotiate
     /// against, an offerless INVITE/re-INVITE, and instead sent a freshly
@@ -240,6 +289,10 @@ pub struct SessionStateCold {
     pub pending_bye_reason: Option<(String, u16, Option<String>)>,
     pub pending_invite_options:
         Option<Arc<crate::api::send::outbound_call::OutboundCallOptionsSnapshot>>,
+    /// Exact body placed on the initial INVITE wire, retained through
+    /// authentication and timer retries until the final response consumes
+    /// the offer/answer exchange.
+    pub(crate) initial_invite_offer_sdp: Option<String>,
     pub pending_reinvite_options:
         Option<Arc<rvoip_sip_dialog::api::unified::ReInviteRequestOptions>>,
     pub pending_register_options:
@@ -426,6 +479,14 @@ impl fmt::Debug for SessionState {
             PendingReinvite::Resume => "resume",
             PendingReinvite::SdpUpdate(_) => "sdp_update",
         });
+        let pending_offer_answer_method = self
+            .pending_offer_answer
+            .as_ref()
+            .map(|pending| pending.method.to_string());
+        let pending_offer_answer_transaction_present = self
+            .pending_offer_answer
+            .as_ref()
+            .is_some_and(|pending| pending.transaction_id.is_some());
         let pending_auth_status = self.pending_auth.as_ref().map(|(status, _)| *status);
         let pending_auth_transport_secure = self
             .pending_auth_transport
@@ -471,8 +532,16 @@ impl fmt::Debug for SessionState {
                 &self.pending_remote_offer.is_some(),
             )
             .field(
+                "stable_local_sdp_before_reinvite_present",
+                &self.stable_local_sdp_before_reinvite.is_some(),
+            )
+            .field(
                 "negotiated_config_present",
                 &self.negotiated_config.is_some(),
+            )
+            .field(
+                "negotiated_payload_type_present",
+                &self.negotiated_payload.is_some(),
             )
             .field("media_security_keying", &media_security_keying)
             .field("media_security_suite", &media_security_suite)
@@ -554,6 +623,11 @@ impl fmt::Debug for SessionState {
             .field("redirect_target_count", &self.redirect_targets.len())
             .field("redirect_attempts", &self.redirect_attempts)
             .field("pending_reinvite", &pending_reinvite)
+            .field("pending_offer_answer_method", &pending_offer_answer_method)
+            .field(
+                "pending_offer_answer_transaction_present",
+                &pending_offer_answer_transaction_present,
+            )
             .field("reinvite_retry_attempts", &self.reinvite_retry_attempts)
             .field("session_timer_min_se", &self.session_timer_min_se)
             .field("session_timer_retry_count", &self.session_timer_retry_count)
@@ -586,6 +660,10 @@ impl fmt::Debug for SessionState {
             .field(
                 "pending_invite_options_present",
                 &self.pending_invite_options.is_some(),
+            )
+            .field(
+                "initial_invite_offer_sdp_present",
+                &self.initial_invite_offer_sdp.is_some(),
             )
             .field(
                 "pending_reinvite_options_present",
@@ -942,6 +1020,9 @@ impl SessionState {
                 redirect_targets: Vec::new(),
                 redirect_attempts: 0,
                 pending_reinvite: None,
+                pending_offer_answer: None,
+                negotiated_payload: None,
+                stable_local_sdp_before_reinvite: None,
                 reinvite_retry_attempts: 0,
                 pending_local_offer: None,
                 pending_remote_offer: None,
@@ -966,6 +1047,7 @@ impl SessionState {
                 transfer_target_last_progress: None,
                 pending_bye_reason: None,
                 pending_invite_options: None,
+                initial_invite_offer_sdp: None,
                 pending_reinvite_options: None,
                 pending_register_options: None,
                 pending_refer_options: None,
@@ -1006,6 +1088,128 @@ impl SessionState {
         }
     }
 
+    /// Return the exact negotiated RTP payload type when SDP negotiation
+    /// supplied one.
+    ///
+    /// Legacy callers can still assign [`Self::negotiated_config`] directly.
+    /// In that case this falls back to the pre-0.3.5 static mapping used by
+    /// `SipMediaStream`.
+    pub fn negotiated_payload_type(&self) -> Option<u8> {
+        self.negotiated_payload
+            .as_ref()
+            .filter(|identity| {
+                self.negotiated_config
+                    .as_ref()
+                    .is_some_and(|config| identity.matches(config))
+            })
+            .map(|identity| identity.payload_type)
+            .or_else(|| {
+                let codec = self.negotiated_config.as_ref()?.codec.as_str();
+                if matches!(
+                    codec.to_ascii_lowercase().as_str(),
+                    "pcmu" | "g.711-mu" | "g711-mu" | "g711-u"
+                ) {
+                    Some(0)
+                } else if matches!(
+                    codec.to_ascii_lowercase().as_str(),
+                    "pcma" | "g.711-a" | "g711-a"
+                ) {
+                    Some(8)
+                } else if codec.eq_ignore_ascii_case("opus") {
+                    Some(111)
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub(crate) fn set_negotiated_config(&mut self, config: NegotiatedConfig, payload_type: u8) {
+        let identity = NegotiatedPayloadIdentity {
+            payload_type,
+            config: config.clone(),
+        };
+        self.negotiated_config = Some(config);
+        self.negotiated_payload = Some(identity);
+    }
+
+    pub(crate) fn clear_negotiated_config(&mut self) {
+        self.negotiated_config = None;
+        self.negotiated_payload = None;
+    }
+
+    pub(crate) fn begin_offer_answer(
+        &mut self,
+        method: rvoip_sip_core::Method,
+        local_offer: String,
+    ) -> crate::errors::Result<()> {
+        if self.pending_offer_answer.is_some() {
+            return Err(crate::errors::SessionError::Conflict { method });
+        }
+        self.pending_offer_answer = Some(PendingOfferAnswer {
+            method,
+            transaction_id: None,
+            local_offer,
+            stable_local_sdp: self.local_sdp.clone(),
+            stable_remote_sdp: self.remote_sdp.clone(),
+            stable_negotiated_config: self.negotiated_config.clone(),
+            stable_negotiated_payload: self.negotiated_payload.clone(),
+            stable_media_security: self.media_security.clone(),
+            stable_sdp_negotiated: self.sdp_negotiated,
+            stable_local_direction: self.local_media_direction,
+            stable_remote_direction: self.remote_media_direction,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn bind_offer_answer_transaction(
+        &mut self,
+        transaction_id: TransactionKey,
+    ) -> crate::errors::Result<()> {
+        if let Some(pending) = self.pending_offer_answer.as_mut() {
+            if transaction_id.is_server() || transaction_id.method() != &pending.method {
+                return Err(crate::errors::SessionError::InvalidTransition(
+                    "outbound offer/answer transaction did not match its pending method"
+                        .to_string(),
+                ));
+            }
+            pending.transaction_id = Some(transaction_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replace_pending_local_offer(&mut self, local_offer: String) {
+        if let Some(pending) = self.pending_offer_answer.as_mut() {
+            pending.local_offer = local_offer;
+        }
+    }
+
+    pub(crate) fn commit_offer_answer(&mut self) {
+        if let Some(pending) = self.pending_offer_answer.take() {
+            self.local_sdp = Some(pending.local_offer);
+        }
+    }
+
+    pub(crate) fn discard_offer_answer_rollback_image(&mut self) {
+        self.pending_offer_answer = None;
+    }
+
+    /// Restore the preceding stable negotiation. SDP origin version is not
+    /// rolled back because a version that could have reached the wire must
+    /// never be reused.
+    pub(crate) fn rollback_offer_answer(&mut self) {
+        let Some(pending) = self.pending_offer_answer.take() else {
+            return;
+        };
+        self.local_sdp = pending.stable_local_sdp;
+        self.remote_sdp = pending.stable_remote_sdp;
+        self.negotiated_config = pending.stable_negotiated_config;
+        self.negotiated_payload = pending.stable_negotiated_payload;
+        self.media_security = pending.stable_media_security;
+        self.sdp_negotiated = pending.stable_sdp_negotiated;
+        self.local_media_direction = pending.stable_local_direction;
+        self.remote_media_direction = pending.stable_remote_direction;
+    }
+
     /// Final-state safety net for pending request options.
     ///
     /// The immutable presence check is load-bearing for the normal call path:
@@ -1014,6 +1218,7 @@ impl SessionState {
     pub(crate) fn clear_pending_request_state_for_final_transition(&mut self) {
         let cold = self.cold.as_ref();
         let needs_clear = cold.pending_invite_options.is_some()
+            || cold.initial_invite_offer_sdp.is_some()
             || !cold.invite_authorization_credentials.is_empty()
             || cold.invite_auth_retry_count != 0
             || cold.pending_auth.is_some()
@@ -1028,6 +1233,7 @@ impl SessionState {
             || cold.auth_challenge_replaces_nonce.is_some()
             || !cold.digest_nc.is_empty()
             || cold.pending_reinvite_options.is_some()
+            || cold.pending_offer_answer.is_some()
             || cold.pending_register_options.is_some()
             || cold.pending_refer_options.is_some()
             || cold.pending_bye_options.is_some()
@@ -1047,6 +1253,7 @@ impl SessionState {
 
         let cold = Arc::make_mut(&mut self.cold);
         cold.pending_invite_options = None;
+        cold.initial_invite_offer_sdp = None;
         cold.invite_authorization_credentials.clear();
         cold.invite_auth_retry_count = 0;
         cold.pending_auth = None;
@@ -1061,6 +1268,7 @@ impl SessionState {
         cold.auth_challenge_replaces_nonce = None;
         cold.digest_nc.clear();
         cold.pending_reinvite_options = None;
+        cold.pending_offer_answer = None;
         cold.pending_register_options = None;
         cold.pending_refer_options = None;
         cold.pending_bye_options = None;
@@ -1253,11 +1461,33 @@ mod tests {
         )
     }
 
+    fn negotiated_config(codec: &str) -> NegotiatedConfig {
+        NegotiatedConfig {
+            local_addr: "127.0.0.1:16000".parse().unwrap(),
+            remote_addr: "127.0.0.1:16002".parse().unwrap(),
+            codec: codec.to_string(),
+            sample_rate: 48_000,
+            channels: 2,
+            fmtp: None,
+        }
+    }
+
+    /// The hot state's inline footprint, pinned.
+    ///
+    /// The exact-equality assertion is a tripwire rather than a limit: growth
+    /// is allowed, but it must be noticed and explained rather than
+    /// accumulating a field at a time. It last moved 576 → 608 when
+    /// [`NegotiatedConfig`] gained its `fmtp`, which is an `Option<String>`
+    /// like every other fmtp field in the stack — 24 bytes plus alignment.
+    /// The alternative, a `Box<str>`, saves eight of those and costs a
+    /// representation that differs from the three layers this value is copied
+    /// into; the ratio below is what actually matters and 608 is under a third
+    /// of the pre-split budget.
     #[test]
     fn session_state_cold_split_keeps_hot_revision_below_sixty_percent() {
         const PRE_COLD_SPLIT_INLINE_BYTES: usize = 1_984;
         let current = std::mem::size_of::<SessionState>();
-        assert_eq!(current, 576, "SessionState hot layout changed unexpectedly");
+        assert_eq!(current, 608, "SessionState hot layout changed unexpectedly");
         assert!(
             current * 100 <= PRE_COLD_SPLIT_INLINE_BYTES * 60,
             "SessionState inline size regressed: before={PRE_COLD_SPLIT_INLINE_BYTES}, current={current}"
@@ -1355,6 +1585,98 @@ mod tests {
 
         assert_eq!(debug, "SdpUpdate");
         assert!(!debug.contains(SECRET));
+    }
+
+    #[test]
+    fn pending_offer_answer_commits_or_restores_stable_negotiation_atomically() {
+        let mut session = SessionState::new(SessionId::new(), Role::UAC);
+        session.local_sdp = Some("stable-local".into());
+        session.remote_sdp = Some("stable-remote".into());
+        session.sdp_negotiated = true;
+        session.local_media_direction = MediaDirection::SendRecv;
+        session.remote_media_direction = MediaDirection::SendRecv;
+        session.set_negotiated_config(negotiated_config("Opus"), 96);
+
+        session
+            .begin_offer_answer(rvoip_sip_core::Method::Invite, "hold-offer".into())
+            .expect("begin hold offer");
+        session
+            .bind_offer_answer_transaction(TransactionKey::new(
+                "z9hG4bK-pending-test".into(),
+                rvoip_sip_core::Method::Invite,
+                false,
+            ))
+            .expect("bind pending transaction");
+        session.remote_sdp = Some("invalid-answer".into());
+        session.sdp_negotiated = false;
+        session.local_media_direction = MediaDirection::SendOnly;
+        session.set_negotiated_config(negotiated_config("PCMA"), 8);
+        session.rollback_offer_answer();
+
+        assert_eq!(session.local_sdp.as_deref(), Some("stable-local"));
+        assert_eq!(session.remote_sdp.as_deref(), Some("stable-remote"));
+        assert!(session.sdp_negotiated);
+        assert_eq!(session.local_media_direction, MediaDirection::SendRecv);
+        assert_eq!(session.negotiated_payload_type(), Some(96));
+        assert_eq!(
+            session
+                .negotiated_config
+                .as_ref()
+                .map(|config| config.codec.as_str()),
+            Some("Opus")
+        );
+        assert!(session.pending_offer_answer.is_none());
+
+        session
+            .begin_offer_answer(rvoip_sip_core::Method::Invite, "committed-offer".into())
+            .expect("begin successful offer");
+        session.remote_sdp = Some("committed-answer".into());
+        session.local_media_direction = MediaDirection::SendOnly;
+        session.set_negotiated_config(negotiated_config("Opus"), 112);
+        session.commit_offer_answer();
+
+        assert_eq!(session.local_sdp.as_deref(), Some("committed-offer"));
+        assert_eq!(session.remote_sdp.as_deref(), Some("committed-answer"));
+        assert_eq!(session.local_media_direction, MediaDirection::SendOnly);
+        assert_eq!(session.negotiated_payload_type(), Some(112));
+        assert!(session.pending_offer_answer.is_none());
+    }
+
+    #[test]
+    fn negotiated_payload_type_preserves_dynamic_sdp_identity_and_legacy_fallbacks() {
+        let mut session = SessionState::new(SessionId::new(), Role::UAC);
+        session.set_negotiated_config(negotiated_config("Opus"), 96);
+        assert_eq!(session.negotiated_payload_type(), Some(96));
+
+        let rebound = session
+            .negotiated_config
+            .as_mut()
+            .expect("negotiated Opus config");
+        rebound.local_addr = "127.0.0.1:26000".parse().unwrap();
+        rebound.remote_addr = "127.0.0.1:26002".parse().unwrap();
+        assert_eq!(
+            session.negotiated_payload_type(),
+            Some(96),
+            "address-only NAT rebinding must retain the negotiated payload identity"
+        );
+
+        session.negotiated_config = Some(negotiated_config("PCMA"));
+        assert_eq!(
+            session.negotiated_payload_type(),
+            Some(8),
+            "direct public config replacement must invalidate a stale dynamic payload sidecar"
+        );
+
+        session.set_negotiated_config(negotiated_config("Opus"), 96);
+        session.clear_negotiated_config();
+        assert_eq!(session.negotiated_payload_type(), None);
+
+        session.negotiated_config = Some(negotiated_config("OPUS"));
+        assert_eq!(session.negotiated_payload_type(), Some(111));
+        session.negotiated_config = Some(negotiated_config("pcmu"));
+        assert_eq!(session.negotiated_payload_type(), Some(0));
+        session.negotiated_config = Some(negotiated_config("PcMa"));
+        assert_eq!(session.negotiated_payload_type(), Some(8));
     }
 
     #[test]

@@ -1370,10 +1370,10 @@ pub trait CallHandler: Send + Sync + 'static {
     #[allow(unused_variables)]
     async fn on_sip_trace(&self, trace: SipTrace) {}
 
-    /// Called when an outgoing call receives a 401/407 and the coordinator is
-    /// about to retry with `Authorization` / `Proxy-Authorization` (RFC 3261
-    /// §22.2). Informational — the retry proceeds automatically if credentials
-    /// are on file via [`Config.credentials`] or
+    /// Called after an outgoing call receives a 401/407 and the coordinator
+    /// successfully dispatches the authenticated retry (RFC 3261 §22.2).
+    /// Informational — the retry proceeds automatically if credentials are on
+    /// file via [`Config.credentials`] or
     /// `coord.invite(...).with_credentials(...)`; this hook does not alter
     /// flow. Useful for logging or surfacing auth activity in a UI.
     ///
@@ -1391,6 +1391,13 @@ pub struct CallbackPeerControl {
 }
 
 impl CallbackPeerControl {
+    /// Subscribe to bounded security and renegotiation diagnostics.
+    pub fn subscribe_diagnostics(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::api::events::DiagnosticEvent> {
+        self.coordinator.subscribe_diagnostics()
+    }
+
     /// Begin building an outbound REGISTER from this peer.
     ///
     /// Returns a [`RegisterBuilder`](crate::api::send::RegisterBuilder)
@@ -1552,7 +1559,7 @@ impl CallbackPeerControl {
 ///     }
 /// }
 ///
-/// let config = Config { sip_port: 5060, ..Default::default() };
+/// let config = Config::local("router", 5060);
 /// let peer = CallbackPeer::new(Router, config).await?;
 /// peer.run().await?;
 /// # Ok(())
@@ -1651,10 +1658,8 @@ impl<H: CallHandler> CallbackPeer<H> {
     /// use rvoip_sip::{CallbackPeer, Config, SipClientAuth};
     /// use rvoip_sip::api::handlers::AutoAnswerHandler;
     ///
-    /// let config = Config {
-    ///     auth: Some(SipClientAuth::digest("alice", "secret")),
-    ///     ..Config::default()
-    /// };
+    /// let mut config = Config::local("alice", 5060);
+    /// config.auth = Some(SipClientAuth::digest("alice", "secret"));
     /// let peer = CallbackPeer::new(AutoAnswerHandler, config).await?;
     /// # Ok(())
     /// # }
@@ -2558,6 +2563,7 @@ impl<H: CallHandler> CallbackPeer<H> {
                     call_id,
                     status_code,
                     realm,
+                    ..
                 } => {
                     handler.on_auth_retrying(call_id, status_code, realm).await;
                 }
@@ -2581,6 +2587,7 @@ impl<H: CallHandler> CallbackPeer<H> {
                 // can also pattern-match on the detailed variant via
                 // `handler.on_event(...)`.
                 | Event::IncomingCallAuthenticated { .. }
+                | Event::CallEstablished { .. }
                 | Event::CallProgressDetailed(_)
                 | Event::CallEstablishedDetailed(_)
                 | Event::CallFailedDetailed(_) => {}

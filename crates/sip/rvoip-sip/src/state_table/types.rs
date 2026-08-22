@@ -2,6 +2,9 @@ use crate::types::CallState;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+pub(crate) const CONFIRMED_NEGOTIATION_FAILURE_EVENT: &str = "ConfirmedNegotiationFailure";
+pub(crate) const HAS_PENDING_OFFER_ANSWER_GUARD: &str = "HasPendingOfferAnswer";
+
 /// Session ID type. The public [`CallId`](crate::CallId) is an alias for this.
 ///
 /// Round-trip a call id through a `String` (e.g. when it crosses a UI event

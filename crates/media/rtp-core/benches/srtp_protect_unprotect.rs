@@ -14,7 +14,9 @@
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rvoip_rtp_core::srtp::{SrtpContext, SrtpCryptoKey, SRTP_AES128_CM_SHA1_80};
-use rvoip_rtp_core::{RtpHeader, RtpPacket};
+use rvoip_rtp_core::{
+    RtcpApplicationDefined, RtcpCompoundPacket, RtcpReceiverReport, RtpHeader, RtpPacket,
+};
 
 const PAYLOAD_SIZES: [(&str, usize); 4] = [
     ("opus_80", 80),
@@ -91,7 +93,14 @@ fn bench_unprotect(c: &mut Criterion) {
 fn bench_protect_rtcp(c: &mut Criterion) {
     let mut group = c.benchmark_group("srtp_protect_rtcp");
     // Typical compound RTCP report ~60–100 bytes.
-    let rtcp_data: Vec<u8> = (0..96).map(|i| (i & 0xff) as u8).collect();
+    let mut compound = RtcpCompoundPacket::new_with_rr(RtcpReceiverReport::new(0xdead_beef));
+    compound.add_app(RtcpApplicationDefined::new_with_data(
+        0xdead_beef,
+        *b"LOAD",
+        make_payload(76),
+    ));
+    let rtcp_data = compound.serialize().expect("serialize valid compound RTCP");
+    assert_eq!(rtcp_data.len(), 96);
     group.throughput(Throughput::Bytes(rtcp_data.len() as u64));
     group.bench_function("compound_96", |b| {
         let mut ctx = make_context();

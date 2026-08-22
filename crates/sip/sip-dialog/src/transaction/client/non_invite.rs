@@ -252,9 +252,20 @@ impl ClientNonInviteLogic {
         data.complete_initial_send(true);
         // `request_guard` is a plain `&Request`, no lock to release.
 
-        // Start timers for Trying state
-        self.start_timer_e(data, timer_handles, command_tx.clone())
-            .await;
+        // RFC 3261 section 17.1.2.2: Timer E exists only for unreliable
+        // transports. Consult the selected route rather than the multiplexed
+        // transport's default so an explicit TCP/TLS/WS/WSS leg never
+        // retransmits a request at T1.
+        let unreliable = {
+            let route = data.request_route.lock().await;
+            timer_utils::uses_unreliable_transport(&route, data.transport.default_transport_type())
+        };
+        if unreliable {
+            self.start_timer_e(data, timer_handles, command_tx.clone())
+                .await;
+        } else {
+            timer_handles.current_timer_e_interval = None;
+        }
         self.start_timer_f(data, timer_handles, command_tx).await;
 
         Ok(())
@@ -379,8 +390,11 @@ impl ClientNonInviteLogic {
         match current_state {
             TransactionState::Completed => {
                 debug!(id=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_id), "Timer K fired in Completed state, terminating");
-                // Timer K automatically transitions to Terminated, no need to return a state
-                Ok(None)
+                // Timer firing and its state transition are one runner-owned
+                // operation.  Returning the target state avoids the former
+                // split Timer + TransitionTo delivery race at channel
+                // saturation.
+                Ok(Some(TransactionState::Terminated))
             }
             _ => {
                 trace!(id=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_id), state=?current_state, "Timer K fired in invalid state, ignoring");
@@ -791,6 +805,7 @@ impl ClientNonInviteTransaction {
             termination_cleanup_tx: std::sync::OnceLock::new(),
             lifecycle_scheduler: std::sync::OnceLock::new(),
             compact_retention_reservation: std::sync::OnceLock::new(),
+            late_2xx_total_retention: std::sync::OnceLock::new(),
             transaction_admission_owner: std::sync::OnceLock::new(),
             terminal_event_publication:
                 crate::transaction::event_sender::TerminalEventPublication::new(),
@@ -1308,6 +1323,27 @@ mod tests {
             assert!(msg.is_request());
             assert_eq!(msg.method(), Some(Method::Options));
         }
+    }
+
+    #[tokio::test]
+    async fn reliable_transport_does_not_start_timer_e() {
+        let setup = setup_test_environment_with_transport(
+            Method::Options,
+            "sip:bob@target.com",
+            Some(rvoip_sip_transport::transport::TransportType::Tcp),
+        )
+        .await;
+
+        setup.transaction.initiate().await.expect("initiate failed");
+        let initial = setup.mock_transport.get_sent_message().await;
+        assert!(initial.is_some(), "initial OPTIONS was not sent");
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            setup.mock_transport.get_sent_message().await.is_none(),
+            "reliable transport retransmitted OPTIONS at Timer E"
+        );
+        assert_eq!(setup.transaction.state(), TransactionState::Trying);
     }
 
     #[tokio::test]

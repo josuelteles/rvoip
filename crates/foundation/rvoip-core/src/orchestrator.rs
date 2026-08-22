@@ -32,7 +32,7 @@ use crate::ids::{
 };
 use crate::inbound_admission::{
     InboundAdmission, InboundAdmissionDecision, InboundAdmissionDisposition, InboundAdmissionGate,
-    ProvisionalMediaRoute, StagedInboundDataPolicy,
+    InboundAdmissionTermination, ProvisionalMediaRoute, StagedInboundDataPolicy,
 };
 use crate::media_graph::{
     start_media_graph, validate_media_graph_codec, ManagedMediaRoute, MediaGraphHandle,
@@ -60,7 +60,6 @@ use dashmap::DashMap;
 use rvoip_infra_common::events::coordinator::GlobalEventCoordinator;
 use rvoip_infra_common::events::cross_crate::RvoipCrossCrateEvent;
 use rvoip_media_core::codec::transcoding::Transcoder;
-use rvoip_media_core::processing::format::FormatConverter;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -69,7 +68,7 @@ use std::sync::Weak;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::sync::{
-    broadcast, mpsc, oneshot, Mutex as TokioMutex, Notify, OwnedSemaphorePermit,
+    broadcast, mpsc, oneshot, watch, Mutex as TokioMutex, Notify, OwnedSemaphorePermit,
     RwLock as TokioRwLock, Semaphore,
 };
 use tracing::{debug, instrument, warn};
@@ -189,6 +188,9 @@ struct ConnectionEntry {
     inbound_context: Option<InboundConnectionContext>,
     inbound_context_retired: bool,
     inbound_publication: InboundPublicationState,
+    /// Exact-generation terminal signal installed only for gated inbound
+    /// admission. Lifecycle retirement completes it before route erasure.
+    inbound_admission_terminal: Option<InboundAdmissionTerminalSignal>,
     /// Exact-generation, reserved-label control path available only while an
     /// inbound admission remains pending. Removed before final publication or
     /// rejection and never consulted by ordinary application data routing.
@@ -199,6 +201,21 @@ struct ConnectionEntry {
     normalized_lifecycle_was_visible: bool,
     deferred_authentication: Option<DeferredAuthentication>,
     deferred_principal_authentication: Option<DeferredPrincipalAuthentication>,
+}
+
+struct InboundAdmissionTerminalSignal {
+    lifecycle_generation: u64,
+    sender: watch::Sender<Option<InboundAdmissionTermination>>,
+}
+
+impl std::fmt::Debug for InboundAdmissionTerminalSignal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InboundAdmissionTerminalSignal")
+            .field("lifecycle_generation", &self.lifecycle_generation)
+            .field("completed", &self.sender.borrow().is_some())
+            .finish()
+    }
 }
 
 struct StagedInboundDataEntry {
@@ -1060,6 +1077,7 @@ struct DirectionalGraphSource {
     connection_id: ConnectionId,
     stream: Arc<dyn crate::stream::MediaStream>,
     codec: crate::capability::CodecInfo,
+    policy: MediaGraphPolicy,
 }
 
 struct ReservedDirectionalGraphSource {
@@ -1067,6 +1085,20 @@ struct ReservedDirectionalGraphSource {
     transport: Transport,
     lifecycle: ConnectionLifecycleTicket,
     receiver: MediaReceiverReservation,
+}
+
+// Amazon Connect's Chime WebRTC sender can briefly stop draining outbound
+// media while its contact and DTLS/SRTP state converge. The graph remains
+// bounded and drop-oldest during that pause; only slow-consumer eviction is
+// delayed from one second to five seconds of 20 ms audio.
+const AMAZON_CONNECT_MINIMUM_EVICTION_SAMPLES: usize = 250;
+
+fn directional_bridge_media_graph_policy(left: Transport, right: Transport) -> MediaGraphPolicy {
+    let mut policy = MediaGraphPolicy::default();
+    if matches!(left, Transport::AmazonConnect) || matches!(right, Transport::AmazonConnect) {
+        policy.minimum_eviction_samples = AMAZON_CONNECT_MINIMUM_EVICTION_SAMPLES;
+    }
+    policy
 }
 
 pub struct Orchestrator {
@@ -3070,6 +3102,7 @@ impl Orchestrator {
                     inbound_context,
                     inbound_context_retired: false,
                     inbound_publication: InboundPublicationState::NotInbound,
+                    inbound_admission_terminal: None,
                     staged_inbound_data: None,
                     normalized_lifecycle_was_visible: false,
                     deferred_authentication: None,
@@ -3242,6 +3275,7 @@ impl Orchestrator {
                     inbound_context: None,
                     inbound_context_retired: false,
                     inbound_publication: InboundPublicationState::NotInbound,
+                    inbound_admission_terminal: None,
                     staged_inbound_data: None,
                     normalized_lifecycle_was_visible: false,
                     deferred_authentication: None,
@@ -3485,6 +3519,7 @@ impl Orchestrator {
                 inbound_context: None,
                 inbound_context_retired: true,
                 inbound_publication: InboundPublicationState::NotInbound,
+                inbound_admission_terminal: None,
                 staged_inbound_data: None,
                 normalized_lifecycle_was_visible: false,
                 deferred_authentication: None,
@@ -3608,6 +3643,38 @@ impl Orchestrator {
         }
     }
 
+    fn complete_inbound_admission_terminal(
+        entry: &ConnectionEntry,
+        lifecycle_generation: u64,
+        termination: InboundAdmissionTermination,
+    ) {
+        let Some(signal) = entry.inbound_admission_terminal.as_ref() else {
+            return;
+        };
+        if signal.lifecycle_generation != lifecycle_generation {
+            return;
+        }
+        if signal.sender.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(termination);
+                true
+            }
+        }) {
+            let result = match termination {
+                InboundAdmissionTermination::Cancelled => "cancelled",
+                InboundAdmissionTermination::RemoteEnded => "remote_ended",
+                InboundAdmissionTermination::Failed => "failed",
+            };
+            metrics::counter!(
+                "rvoip_core_inbound_admission_terminal_total",
+                "result" => result
+            )
+            .increment(1);
+        }
+    }
+
     fn begin_ticketed_connection_teardown(
         &self,
         ticket: &ConnectionLifecycleTicket,
@@ -3627,6 +3694,13 @@ impl Orchestrator {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !lifecycle.active || lifecycle.retired || lifecycle.generation != ticket.generation {
                 return None;
+            }
+            if let Some(entry) = self.connections.get(&ticket.connection_id) {
+                Self::complete_inbound_admission_terminal(
+                    &entry,
+                    ticket.generation,
+                    InboundAdmissionTermination::Failed,
+                );
             }
             let removed = self.connections.remove(&ticket.connection_id)?;
             lifecycle.active = false;
@@ -4311,7 +4385,11 @@ impl Orchestrator {
         }
     }
 
-    fn begin_connection_teardown(&self, conn: &ConnectionId) -> ForgottenConnection {
+    fn begin_connection_teardown(
+        &self,
+        conn: &ConnectionId,
+        termination: InboundAdmissionTermination,
+    ) -> ForgottenConnection {
         let removed = {
             let _registry = self
                 .connection_registry_lock
@@ -4324,8 +4402,16 @@ impl Orchestrator {
                 let mut state = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let lifecycle_generation = state.generation;
                 state.active = false;
                 state.retired = true;
+                if let Some(entry) = self.connections.get(conn) {
+                    Self::complete_inbound_admission_terminal(
+                        &entry,
+                        lifecycle_generation,
+                        termination,
+                    );
+                }
                 state.generation = state.generation.saturating_add(1);
             } else if self.connection_lifecycles.len()
                 < self.connection_id_budget.load(Ordering::Relaxed)
@@ -4389,6 +4475,18 @@ impl Orchestrator {
             {
                 return None;
             }
+            let entry = self.connections.get(&claimed.connection_id)?;
+            if entry.inbound_publication
+                != InboundPublicationState::Rejecting(claimed.lifecycle.generation)
+            {
+                return None;
+            }
+            Self::complete_inbound_admission_terminal(
+                &entry,
+                claimed.lifecycle.generation,
+                InboundAdmissionTermination::Failed,
+            );
+            drop(entry);
             let removed = self
                 .connections
                 .remove_if(&claimed.connection_id, |_, entry| {
@@ -4418,10 +4516,11 @@ impl Orchestrator {
         &self,
         conn: &ConnectionId,
         transport: Transport,
+        termination: InboundAdmissionTermination,
     ) -> ForgottenConnection {
         let admission_notification =
             self.claim_current_inbound_admission_notification(conn, transport, false, true);
-        let forgotten = self.begin_connection_teardown(conn);
+        let forgotten = self.begin_connection_teardown(conn, termination);
         if let Some(notification) = admission_notification {
             notification.deliver();
         }
@@ -5873,7 +5972,7 @@ impl Orchestrator {
             return;
         };
 
-        let pending_committed = {
+        let termination = {
             let _registry = self
                 .connection_registry_lock
                 .lock()
@@ -5901,16 +6000,21 @@ impl Orchestrator {
             if entry.transport != pending.transport
                 || entry.inbound_publication != InboundPublicationState::Unseen
             {
-                false
+                None
             } else {
+                let (sender, receiver) = watch::channel(None);
                 entry.inbound_publication =
                     InboundPublicationState::Pending(pending.lifecycle.generation);
-                true
+                entry.inbound_admission_terminal = Some(InboundAdmissionTerminalSignal {
+                    lifecycle_generation: pending.lifecycle.generation,
+                    sender,
+                });
+                Some(receiver)
             }
         };
-        if !pending_committed {
+        let Some(termination) = termination else {
             return;
-        }
+        };
 
         let permit = match Arc::clone(&gate.permits).try_acquire_owned() {
             Ok(permit) => permit,
@@ -5932,6 +6036,7 @@ impl Orchestrator {
             pending.lifecycle.generation,
             Arc::downgrade(self),
             decision,
+            termination,
         );
         if let Err(error) = gate.sender.try_send(admission) {
             drop(resolved);
@@ -6515,8 +6620,12 @@ impl Orchestrator {
                     return;
                 }
                 if !self.adapter_connection_is_live(transport, &connection.id) {
-                    self.forget_inbound_connection(&connection.id, transport)
-                        .await;
+                    self.forget_inbound_connection(
+                        &connection.id,
+                        transport,
+                        InboundAdmissionTermination::RemoteEnded,
+                    )
+                    .await;
                     return;
                 }
                 let at = Utc::now();
@@ -6750,8 +6859,12 @@ impl Orchestrator {
                     return;
                 }
                 if !self.adapter_connection_is_live(transport, &connection.id) {
-                    self.forget_inbound_connection(&connection.id, transport)
-                        .await;
+                    self.forget_inbound_connection(
+                        &connection.id,
+                        transport,
+                        InboundAdmissionTermination::RemoteEnded,
+                    )
+                    .await;
                     return;
                 }
                 let observed_at = Utc::now();
@@ -6874,8 +6987,15 @@ impl Orchestrator {
                     .operational_event_stream
                     .get()
                     .map(OperationalEventStream::delivery_guard);
+                let termination = match &reason {
+                    EndReason::Cancelled => InboundAdmissionTermination::Cancelled,
+                    EndReason::Normal => InboundAdmissionTermination::RemoteEnded,
+                    EndReason::Failed { .. } | EndReason::Timeout | EndReason::BridgeTorn => {
+                        InboundAdmissionTermination::Failed
+                    }
+                };
                 let forgotten = self
-                    .forget_inbound_connection(&connection_id, transport)
+                    .forget_inbound_connection(&connection_id, transport, termination)
                     .await;
                 self.resolve_adapter_cleanup_quarantine_from_terminal(&connection_id, transport);
                 if forgotten.was_tracked && forgotten.normalized_lifecycle_was_visible {
@@ -6913,7 +7033,11 @@ impl Orchestrator {
                     .get()
                     .map(OperationalEventStream::delivery_guard);
                 let forgotten = self
-                    .forget_inbound_connection(&connection_id, transport)
+                    .forget_inbound_connection(
+                        &connection_id,
+                        transport,
+                        InboundAdmissionTermination::Failed,
+                    )
                     .await;
                 self.resolve_adapter_cleanup_quarantine_from_terminal(&connection_id, transport);
                 if forgotten.was_tracked && forgotten.normalized_lifecycle_was_visible {
@@ -9486,6 +9610,10 @@ impl Orchestrator {
         b_stream: Arc<dyn crate::stream::MediaStream>,
         media_plan: DirectionalMediaBridgePlan,
     ) -> Result<(Option<MediaGraphHandle>, Option<MediaGraphHandle>)> {
+        let bridge_policy = directional_bridge_media_graph_policy(
+            self.connection_transport(&a)?,
+            self.connection_transport(&b)?,
+        );
         let mut sources = Vec::with_capacity(2);
         if media_plan.a_to_b() {
             sources.push(DirectionalGraphSource {
@@ -9493,6 +9621,7 @@ impl Orchestrator {
                 connection_id: a,
                 codec: a_stream.codec(),
                 stream: a_stream,
+                policy: bridge_policy.clone(),
             });
         }
         if media_plan.b_to_a() {
@@ -9501,6 +9630,7 @@ impl Orchestrator {
                 connection_id: b,
                 codec: b_stream.codec(),
                 stream: b_stream,
+                policy: bridge_policy,
             });
         }
         sources.sort_by(|left, right| left.connection_id.cmp(&right.connection_id));
@@ -9580,8 +9710,9 @@ impl Orchestrator {
         for reserved_source in reserved {
             let connection_id = reserved_source.source.connection_id.clone();
             let codec = reserved_source.source.codec;
+            let policy = reserved_source.source.policy;
             let receiver = reserved_source.receiver.commit();
-            let graph = start_media_graph(receiver, codec, MediaGraphPolicy::default())
+            let graph = start_media_graph(receiver, codec, policy)
                 .expect("directional graph codec was validated before receiver commit");
             self.media_graphs
                 .insert(connection_id.clone(), graph.clone());
@@ -9812,6 +9943,24 @@ impl Orchestrator {
     /// Return the latest retained operational snapshot for a connection's
     /// reusable source graph. The snapshot is aggregate-safe and contains no
     /// tenant, participant, or packet payload data.
+    /// Discard queued media on a connection's graph — barge-in.
+    ///
+    /// Audio already queued for playout is stale the moment the far party
+    /// starts speaking. Without this the jitter-buffer depth becomes the
+    /// barge-in latency floor: the agent keeps talking for the buffer's worth
+    /// of time after the caller interrupts. Asterisk (`FLUSH_MEDIA`), Twilio
+    /// (`clear`) and jambonz (`killAudio`) all expose the same primitive.
+    ///
+    /// Returns the number of frames discarded, or `None` if the connection has
+    /// no media graph.
+    pub async fn flush_media_graph(&self, connection_id: &ConnectionId) -> Option<usize> {
+        let graph = self
+            .media_graphs
+            .get(connection_id)
+            .map(|entry| entry.value().clone())?;
+        graph.flush_sinks_and_wait().await.ok()
+    }
+
     pub fn media_graph_latest_snapshot(
         &self,
         connection_id: &ConnectionId,
@@ -10119,9 +10268,7 @@ async fn await_media_route(graph: &MediaGraphHandle, route_id: &MediaRouteId) ->
 /// otherwise leaves the transcoder slot empty (passthrough).
 fn make_swap(from_pt: u8, to_pt: u8) -> frame_pump::TranscoderSwap {
     let transcoder = if from_pt != to_pt {
-        Some(Transcoder::new(Arc::new(TokioRwLock::new(
-            FormatConverter::new(),
-        ))))
+        Some(Transcoder::new())
     } else {
         None
     };
@@ -10142,6 +10289,44 @@ mod cross_crate_publisher_tests {
     use rvoip_infra_common::events::cross_crate::RvoipCoreCrossCrateEvent;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore as TokioSemaphore;
+
+    #[test]
+    fn amazon_connect_directional_bridges_tolerate_startup_backpressure() {
+        for (left, right) in [
+            (Transport::Sip, Transport::AmazonConnect),
+            (Transport::AmazonConnect, Transport::Sip),
+        ] {
+            let default = MediaGraphPolicy::default();
+            let policy = directional_bridge_media_graph_policy(left, right);
+            assert_eq!(
+                policy.minimum_eviction_samples,
+                AMAZON_CONNECT_MINIMUM_EVICTION_SAMPLES
+            );
+            // The Connect policy overrides only minimum_eviction_samples, so the
+            // queue sizes must track the default rather than a literal. Asserting
+            // the v0.3.5 values here is what broke when the default moved to 25.
+            assert_eq!(policy.sink_queue_frames, default.sink_queue_frames);
+            assert_eq!(
+                policy.pre_sink_buffer_frames,
+                default.pre_sink_buffer_frames
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_directional_bridges_retain_default_eviction_policy() {
+        let default = MediaGraphPolicy::default();
+        let policy = directional_bridge_media_graph_policy(Transport::Sip, Transport::WebRtc);
+        assert_eq!(
+            policy.minimum_eviction_samples,
+            default.minimum_eviction_samples
+        );
+        assert_eq!(policy.sink_queue_frames, default.sink_queue_frames);
+        assert_eq!(
+            policy.pre_sink_buffer_frames,
+            default.pre_sink_buffer_frames
+        );
+    }
 
     struct RecordingSink {
         events: Mutex<Vec<String>>,

@@ -9,6 +9,7 @@ use rtc::rtp::extension::HeaderExtension;
 use rtc::shared::marshal::{Marshal, MarshalSize};
 use tokio::sync::Mutex;
 use webrtc::media_stream::track_local::static_rtp::TrackLocalStaticRTP;
+use webrtc::media_stream::track_local::TrackLocal;
 
 use crate::peer::builder::HDREXT_SDES_MID;
 
@@ -94,6 +95,39 @@ impl OutboundAudioRtpState {
         self.last_wire_timestamp = Some(timestamp);
         timestamp
     }
+
+    fn reserve_telephone_event_timestamp(
+        &mut self,
+        audio_clock_rate_hz: u32,
+        event_clock_rate_hz: u32,
+        event_duration_samples: u16,
+    ) -> u32 {
+        let samples_per_audio_frame = (audio_clock_rate_hz / 50).max(1);
+        let start_audio = self
+            .last_wire_timestamp
+            .map_or_else(initial_rtp_timestamp, |last| {
+                last.wrapping_add(samples_per_audio_frame)
+            });
+        let duration_audio = ((u64::from(event_duration_samples) * u64::from(audio_clock_rate_hz)
+            + u64::from(event_clock_rate_hz).saturating_sub(1))
+            / u64::from(event_clock_rate_hz))
+        .max(1) as u32;
+        self.last_wire_timestamp = Some(start_audio.wrapping_add(duration_audio));
+        self.last_source_timestamp = None;
+
+        // RFC 4733 requires named events to use the regular audio channel's
+        // timestamp base. Only the duration field uses the telephone-event
+        // clock when its negotiated rate differs from primary audio.
+        start_audio
+    }
+}
+
+fn initial_rtp_timestamp() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos()
+        | 1
 }
 
 /// The single enqueue boundary for primary audio RTP.
@@ -164,7 +198,71 @@ impl OutboundAudioRtpWriter {
     }
 
     pub(crate) fn set_mid(&self, mid: Option<String>) {
-        *self.mid.lock().expect("outbound audio MID mutex poisoned") = mid;
+        *self
+            .mid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = mid;
+    }
+
+    pub(crate) fn ssrc(&self) -> u32 {
+        self.ssrc
+    }
+
+    pub(crate) async fn reserve_telephone_event_timestamp(
+        &self,
+        event_clock_rate_hz: u32,
+        event_duration_samples: u16,
+    ) -> u32 {
+        self.state.lock().await.reserve_telephone_event_timestamp(
+            self.clock_rate_hz,
+            event_clock_rate_hz,
+            event_duration_samples,
+        )
+    }
+
+    pub(crate) async fn write_supplemental_audio(
+        &self,
+        payload_type: u8,
+        timestamp: u32,
+        marker: bool,
+        payload: Bytes,
+    ) -> webrtc::error::Result<()> {
+        // Keep the owner locked through the actual enqueue so audio and
+        // telephone-event packets cannot reach the track out of sequence.
+        let mut state = self.state.lock().await;
+        let sequence_number = state.next_sequence_number();
+        let packet = rtp::Packet {
+            header: rtp::Header {
+                version: 2,
+                padding: false,
+                extension: false,
+                marker,
+                payload_type,
+                sequence_number,
+                timestamp,
+                ssrc: self.ssrc,
+                ..Default::default()
+            },
+            payload,
+        };
+        let mid = self
+            .mid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        // Telephone events share the primary negotiated audio SSRC, so they
+        // are exactly as demuxable as primary audio and must degrade the same
+        // way when the peer does not negotiate SDES MID.
+        let extension = mid.as_deref().map(sdes_mid_header_extension);
+        let result = if let Some(extension) = extension.as_ref() {
+            self.track
+                .write_rtp_with_extensions(packet, std::slice::from_ref(extension))
+                .await
+        } else {
+            self.track.write_rtp(packet).await
+        };
+        drop(state);
+        result
     }
 
     pub(crate) async fn write_audio(
@@ -194,20 +292,22 @@ impl OutboundAudioRtpWriter {
         let mid = self
             .mid
             .lock()
-            .expect("outbound audio MID mutex poisoned")
-            .clone()
-            .ok_or_else(|| {
-                webrtc::error::Error::Other(
-                    "outbound audio MID is not committed by final SDP".into(),
-                )
-            })?;
-        let extension = sdes_mid_header_extension(&mid);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let extension = mid.as_deref().map(sdes_mid_header_extension);
         loop {
-            match self
-                .track
-                .write_rtp_with_extensions(packet.clone(), std::slice::from_ref(&extension))
-                .await
-            {
+            let result = if let Some(extension) = extension.as_ref() {
+                self.track
+                    .write_rtp_with_extensions(packet.clone(), std::slice::from_ref(extension))
+                    .await
+            } else {
+                // The primary audio SSRC is declared by the negotiated
+                // sender and remains unambiguous without SDES MID. Some
+                // endpoints, including Amazon Connect, do not negotiate the
+                // MID header extension.
+                self.track.write_rtp(packet.clone()).await
+            };
+            match result {
                 Err(error) if error.to_string().contains("not binding") => {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
@@ -265,5 +365,61 @@ mod tests {
         assert_eq!(state.allocate_audio_timestamp(10_000, 960), 10_000);
         assert_eq!(state.allocate_audio_timestamp(10_960, 960), 10_960);
         assert_eq!(state.allocate_audio_timestamp(100, 960), 11_920);
+    }
+
+    #[test]
+    fn telephone_event_reservation_advances_the_primary_audio_timeline() {
+        let mut state = OutboundAudioRtpState {
+            next_sequence_number: 40,
+            last_wire_timestamp: Some(48_000),
+            last_source_timestamp: Some(48_000),
+        };
+        let event_timestamp = state.reserve_telephone_event_timestamp(48_000, 48_000, 5_760);
+        assert_eq!(event_timestamp, 48_960);
+        assert_eq!(state.last_wire_timestamp, Some(54_720));
+        assert_eq!(state.last_source_timestamp, None);
+        assert_eq!(state.next_sequence_number(), 40);
+
+        let event_timestamp = state.reserve_telephone_event_timestamp(48_000, 8_000, 960);
+        assert_eq!(
+            event_timestamp, 55_680,
+            "8 kHz events retain the audio timestamp base"
+        );
+        assert_eq!(state.last_wire_timestamp, Some(61_440));
+    }
+
+    #[tokio::test]
+    async fn telephone_events_without_negotiated_mid_are_not_rejected_outright() {
+        let track = audio_track(0x5060_7081);
+        let writer = OutboundAudioRtpWriter::new(track, 0x5060_7081, 48_000);
+        // No `set_mid`, so the writer is in the state produced by an endpoint
+        // that never negotiates the SDES MID extension.
+        let error = writer
+            .write_supplemental_audio(101, 0, true, Bytes::from_static(&[7, 0x0a, 0, 0]))
+            .await
+            .expect_err("an unbound test track cannot complete the write");
+        let error = error.to_string();
+        assert!(
+            !error.contains("MID"),
+            "a missing MID must not reject the telephone event itself; got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_audio_without_negotiated_mid_waits_for_track_binding() {
+        let track = audio_track(0x5060_7080);
+        let writer = OutboundAudioRtpWriter::new(track, 0x5060_7080, 48_000);
+        let write = tokio::spawn(async move {
+            writer
+                .write_audio(111, 0, Bytes::from_static(&[0xf8, 0xff, 0xfe]))
+                .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !write.is_finished(),
+            "missing MID must not terminate primary audio before the track binds"
+        );
+        write.abort();
     }
 }

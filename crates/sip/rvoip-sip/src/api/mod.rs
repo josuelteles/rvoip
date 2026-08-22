@@ -327,16 +327,18 @@ pub use crate::types::CallState;
 pub use unified::{
     Config, MediaMode, MediaSessionControllerConfig, RegistrationHandle, RegistrationInfo,
     RegistrationStatus, ReinvitePolicy, RtpSessionBufferConfig, RtpTransportBufferConfig,
-    SipContactMode, SipNatConfig, SipTlsMode, SrtpSuitePolicy, SymmetricRtpPolicy,
-    UnifiedCoordinator,
+    SdesBase64Mode, SipContactMode, SipNatConfig, SipRuntimeConfig, SipTlsMode, SrtpSuitePolicy,
+    SymmetricRtpPolicy, UnifiedCoordinator,
 };
 
 // Re-export event types
 pub use dialog_package::{DialogInfo, DialogInfoDocument, DialogPackageEvent, DialogPackageState};
 pub use dialog_subscription::DialogSubscriptionHandle;
 pub use events::{
-    CallId, Event, MediaSecurityKeying, MediaSecurityProfile, MediaSecurityState, SipTrace,
-    SipTraceConfig, SipTraceDirection, SubscriptionState, TransferKind, TransferTargetEvidence,
+    CallAuthRetryDetails, CallId, DiagnosticEvent, Event, MediaSecurityKeying,
+    MediaSecurityProfile, MediaSecurityState, RenegotiationFailure, SdesNegotiationFailure,
+    SipTrace, SipTraceConfig, SipTraceDirection, SubscriptionState, TransferKind,
+    TransferTargetEvidence,
 };
 
 // Re-export builder

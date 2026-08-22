@@ -33,7 +33,10 @@ dashmap.workspace = true
 # Crate-specific dependencies
 config = "0.14"
 once_cell = "1.18.0"
-mimalloc = { version = "0.1", default-features = false }
+# Linux transparent huge-page promotion can commit partially used mimalloc
+# regions long after a burst has drained. Keep mimalloc's performance and
+# disable only its MADV_HUGEPAGE path so RSS follows live 4 KiB pages.
+mimalloc = { version = "0.1", default-features = false, features = ["no_thp"] }
 libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"], optional = true }
 anyhow = "1.0"
 tokio-util = "0.7.16"
@@ -44,12 +47,12 @@ bytes = { workspace = true }
 
 # P12.7 — OpenTelemetry span hierarchy. Optional, gated on the
 # `otel` feature so consumers that don't want the OTLP exporter
-# don't pay the dep cost. Pinned to the 0.27 line which matches
-# the current `tracing-opentelemetry` API surface.
-opentelemetry = { version = "0.27", default-features = false, features = ["trace"], optional = true }
-opentelemetry_sdk = { version = "0.27", default-features = false, features = ["trace", "rt-tokio"], optional = true }
-opentelemetry-otlp = { version = "0.27", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"], optional = true }
-tracing-opentelemetry = { version = "0.28", default-features = false, optional = true }
+# don't pay the dep cost. Keep the API, SDK, OTLP exporter, and tracing bridge
+# on their mutually compatible 0.32/0.33 lines.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "trace", "reqwest-blocking-client"], optional = true }
+tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
 
 [features]
 # Disable the mimalloc `#[global_allocator]` in `lib.rs`. Required by

@@ -52,7 +52,6 @@ anyhow.workspace = true
 
 # Error handling
 thiserror = "1.0"
-async-std = "1.0"
 
 # Bytes handling
 bytes = "1.5"
@@ -75,8 +74,8 @@ num-complex = "0.4"          # Used in AEC v2 implementation
 apodize = "1.0"              # Used in VAD v2 for windowing functions
 biquad = "0.4"               # Used in AGC v2 for digital filters
 
-# Media codecs (optional)
-# g729 = { version = "0.3", optional = true }  # Commented out due to missing dependency
+# Media codecs are implemented by codec-core. media-core only provides the
+# media-frame adapter and negotiation/capability plumbing.
 
 # WAV file support
 hound = "3.5"
@@ -85,6 +84,9 @@ hound = "3.5"
 default = ["pcmu", "pcma"]
 pcmu = []
 pcma = []
+# Compatibility feature retained for callers that previously enabled it.
+# G.722 payload formatting remains available, but no encoder/decoder is
+# advertised or constructed.
 g722 = []
 memory-diagnostics = [
     "rvoip-infra-common/memory-diagnostics",
@@ -100,7 +102,12 @@ g729 = ["rvoip-codec-core/g729"]
 # Real Opus encode/decode, forwarded from rvoip-codec-core (the sole crate
 # that implements it - see crates/media/codec-core/src/codecs/opus.rs).
 opus = ["rvoip-codec-core/opus"]
-all-codecs = ["pcmu", "pcma", "g722", "g729", "opus"]
+# Deprecated compatibility alias. It enables the real Opus backend.
+opus-sim = ["opus"]
+amr-nb = ["rvoip-codec-core/amr-nb"]
+amr-wb = ["rvoip-codec-core/amr-wb"]
+amr = ["amr-nb", "amr-wb"]
+all-codecs = ["pcmu", "pcma", "g722", "g729", "opus", "amr"]
 
 [dev-dependencies]
 serial_test = "3.0"

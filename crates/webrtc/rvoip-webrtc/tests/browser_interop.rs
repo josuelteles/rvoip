@@ -31,8 +31,8 @@ use axum::{
     Router,
 };
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::page::EventLoadEventFired;
 use futures::StreamExt;
+use rvoip_core::adapter::ConnectionAdapter;
 use rvoip_webrtc::{WebRtcConfig, WebRtcServerBuilder};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
@@ -139,17 +139,14 @@ async fn headless_chromium_whip_publish_round_trip() {
     };
     let page_url =
         format!("http://{static_addr}/whip-publish.html?whip=http://{whip}/whip/browser-test");
-    let page = browser.new_page(&page_url).await.expect("open page");
-
-    // Wait for the load event.
-    let mut load_events = page
-        .event_listener::<EventLoadEventFired>()
-        .await
-        .expect("subscribe load");
-    tokio::time::timeout(Duration::from_secs(10), load_events.next())
+    // Subscribe/navigation ordering inside `new_page(url)` can let the load
+    // event fire before a separate listener is registered. Start from a blank
+    // target and use `goto`, whose completion is tied to that navigation.
+    let page = browser.new_page("about:blank").await.expect("open page");
+    tokio::time::timeout(Duration::from_secs(10), page.goto(&page_url))
         .await
         .expect("page load timeout")
-        .expect("page load stream closed");
+        .expect("page navigation failed");
 
     // 4. Click the Start button; the page handles getUserMedia + WHIP POST.
     page.find_element("#start")
@@ -188,6 +185,50 @@ async fn headless_chromium_whip_publish_round_trip() {
     assert!(
         connected,
         "browser RTCPeerConnection never reached `connected` (last status: {last_status})"
+    );
+
+    // 7. Prove Chromium receives the outbound RFC 4733 packets. This guards
+    // against reporting send success for an unadvertised supplemental SSRC,
+    // which Chromium discards before its inbound RTP statistics advance.
+    let route_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let conn_id = loop {
+        if let Some(route) = adapter.routes().iter().next() {
+            break route.key().clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < route_deadline,
+            "browser WHIP connection never appeared in the adapter route table"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let before: u64 = page
+        .evaluate_function("async () => window.__inboundAudioPacketCount()")
+        .await
+        .expect("read Chromium inbound audio stats before DTMF")
+        .into_value()
+        .expect("decode Chromium inbound audio packet count");
+    adapter
+        .send_dtmf(conn_id, "7", 140)
+        .await
+        .expect("send negotiated RFC 4733 DTMF to Chromium");
+
+    let packet_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut after = before;
+    while tokio::time::Instant::now() < packet_deadline {
+        after = page
+            .evaluate_function("async () => window.__inboundAudioPacketCount()")
+            .await
+            .expect("read Chromium inbound audio stats after DTMF")
+            .into_value()
+            .expect("decode Chromium inbound audio packet count");
+        if after > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        after > before,
+        "Chromium received no outbound RFC 4733 RTP packets (before={before}, after={after})"
     );
 
     // Teardown.

@@ -4,7 +4,8 @@ use crate::adapters::dialog_adapter::{
 use crate::adapters::outbound_request_tracker::{TrackedInDialogMethod, TrackedInDialogOptions};
 use crate::session_registry::SessionRegistryHandle;
 use crate::state_machine::executor::{
-    InboundResponseStateInput, PendingOptionsSlot, PendingOptionsSlotKind, StageDispatchClaim,
+    InboundResponseStateInput, Invite2xxAckStateInput, PendingOptionsSlot, PendingOptionsSlotKind,
+    StageDispatchClaim,
 };
 use crate::state_table::types::{EventType, SessionId};
 use rvoip_sip_core::types::{HeaderName, TypedHeader};
@@ -47,6 +48,28 @@ fn exact_request_tracker_handle(
             "outbound request tracking requires exact session authority".to_string(),
         )
     })
+}
+
+async fn send_tracked_reinvite_lane_owned(
+    session: &mut SessionState,
+    dialog_adapter: &Arc<DialogAdapter>,
+    options: ReInviteRequestOptions,
+) -> crate::errors::Result<rvoip_sip_dialog::transaction::TransactionKey> {
+    let tracked_options = Arc::new(options.clone());
+    let lease = dialog_adapter.outbound_request_tracker.prepare(
+        exact_request_tracker_handle(session)?,
+        TrackedInDialogOptions::Reinvite(tracked_options),
+    )?;
+    let transaction_id = dialog_adapter
+        .send_reinvite_with_options_lane_owned(session, options)
+        .await?;
+    // Bind before activation flushes any response/auth event that raced the
+    // transport write.
+    session.bind_offer_answer_transaction(transaction_id.clone())?;
+    dialog_adapter
+        .outbound_request_tracker
+        .activate(lease, transaction_id.clone())?;
+    Ok(transaction_id)
 }
 
 fn next_session_refresh_generation(session: &mut SessionState) -> u64 {
@@ -116,7 +139,7 @@ fn session_refresh_headers(session: &SessionState) -> crate::errors::Result<Vec<
     };
     Ok(vec![
         TypedHeader::SessionExpires(SessionExpires::new(interval, Some(refresher))),
-        TypedHeader::MinSE(MinSE::new(interval.min(90).max(1))),
+        TypedHeader::MinSE(MinSE::new(interval.clamp(1, 90))),
         TypedHeader::Supported(Supported::new(vec!["timer".to_string()])),
     ])
 }
@@ -151,6 +174,14 @@ fn prepare_session_refresh_update(
     Ok(ActionOutcome::with_event(EventType::SendOutboundUpdate))
 }
 
+fn response_sdp_for_event(event: &EventType, local_sdp: &Option<String>) -> Option<String> {
+    if matches!(event, EventType::UpdateReceived { sdp: None }) {
+        None
+    } else {
+        local_sdp.clone()
+    }
+}
+
 fn prepare_session_refresh_reinvite(
     session: &mut SessionState,
 ) -> crate::errors::Result<ActionOutcome> {
@@ -173,6 +204,49 @@ fn prepare_session_refresh_reinvite(
     Ok(ActionOutcome::with_event(EventType::SendOutboundReInvite))
 }
 
+pub(crate) fn stage_reinvite_local_sdp(session: &mut SessionState, offer: String) {
+    if session.stable_local_sdp_before_reinvite.is_none() {
+        session.stable_local_sdp_before_reinvite = Some(session.local_sdp.clone());
+    }
+    session.local_sdp = Some(offer);
+}
+
+fn begin_reinvite_offer(session: &mut SessionState, offer: String) -> crate::errors::Result<()> {
+    session.begin_offer_answer(rvoip_sip_core::Method::Invite, offer.clone())?;
+    stage_reinvite_local_sdp(session, offer);
+    Ok(())
+}
+
+fn commit_reinvite_local_sdp(session: &mut SessionState) {
+    session.commit_offer_answer();
+    session.stable_local_sdp_before_reinvite = None;
+}
+
+fn rollback_reinvite_local_sdp(session: &mut SessionState) {
+    session.rollback_offer_answer();
+    if let Some(stable) = session.stable_local_sdp_before_reinvite.take() {
+        session.local_sdp = stable;
+    }
+}
+
+fn rollback_reinvite_with_media(session: &mut SessionState, media_adapter: &MediaAdapter) {
+    rollback_reinvite_local_sdp(session);
+    media_adapter.discard_pending_srtp_offer_for_session(session);
+    media_adapter.discard_staged_media_negotiation_for_session(session);
+}
+
+fn initial_invite_used_delayed_offer(session: &SessionState, event: &EventType) -> bool {
+    matches!(event, EventType::Dialog200OK)
+        && session.role == crate::state_table::Role::UAC
+        && !session.dialog_established
+        && session.pending_offer_answer.is_none()
+        && session
+            .pending_invite_options
+            .as_ref()
+            .and_then(|options| options.sdp.as_deref())
+            .is_some_and(|sdp| sdp.trim().is_empty())
+}
+
 /// Retire every lifecycle attachment derived from one media allocation in the
 /// lane-owned working state. The executor publishes this mutation exactly once
 /// after all ordered actions have finished.
@@ -181,7 +255,8 @@ fn retire_lane_owned_media_identity(session: &mut SessionState) {
     session.media_session_ready = false;
     session.sdp_negotiated = false;
     session.local_sdp = None;
-    session.negotiated_config = None;
+    session.stable_local_sdp_before_reinvite = None;
+    session.clear_negotiated_config();
 }
 
 /// Run lower cleanup without publishing `SessionStore`, then retire the
@@ -214,6 +289,7 @@ async fn release_lane_owned_resources(
     cleanup_lane_owned_media(session, media_adapter).await
 }
 
+#[cfg(test)]
 fn negotiated_audio_shape(codec: &str) -> (u32, u8) {
     if codec.eq_ignore_ascii_case("opus") {
         // The SIP SDP profile advertises `opus/48000/2`; preserve that exact
@@ -904,6 +980,38 @@ pub(crate) enum DeferredActionEffect {
     Registration(RegistrationPostCommitEffect),
     TransferNotify(TransferNotifyEffect),
     SessionRefreshTimer(SessionRefreshTimerEffect),
+    AuthRetryObservation(AuthRetryObservation),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthRetryObservation {
+    call_id: SessionId,
+    status_code: u16,
+    realm: String,
+    algorithm: rvoip_auth_core::DigestAlgorithm,
+    qop: Option<String>,
+}
+
+impl AuthRetryObservation {
+    pub(crate) fn event(&self) -> Event {
+        Event::CallAuthRetrying {
+            call_id: self.call_id.clone(),
+            status_code: self.status_code,
+            realm: self.realm.clone(),
+        }
+    }
+
+    pub(crate) fn into_diagnostic(self) -> crate::api::events::DiagnosticEvent {
+        crate::api::events::DiagnosticEvent::CallAuthRetrying(
+            crate::api::events::CallAuthRetryDetails {
+                call_id: self.call_id,
+                status_code: self.status_code,
+                realm: self.realm,
+                algorithm: self.algorithm,
+                qop: self.qop,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1642,12 +1750,12 @@ pub(crate) async fn execute_action(
     action: &Action,
     triggering_event: &EventType,
     session: &mut SessionState,
-    dialog_adapter: &Arc<DialogAdapter>,
-    media_adapter: &Arc<MediaAdapter>,
-    _simple_peer_event_tx: &Option<tokio::sync::mpsc::Sender<Event>>, // Unused - events handled by SessionCrossCrateEventHandler
+    adapters: (&Arc<DialogAdapter>, &Arc<MediaAdapter>),
     stage_claim: Option<&StageDispatchClaim>,
     mut inbound_response: Option<&mut InboundResponseStateInput>,
+    invite_2xx_ack: Option<&Invite2xxAckStateInput>,
 ) -> Result<ActionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let (dialog_adapter, media_adapter) = adapters;
     debug!("Executing action: {:?}", action);
 
     match action {
@@ -1828,7 +1936,7 @@ pub(crate) async fn execute_action(
             }
         }
         Action::SendSIPResponse(code, _reason) => {
-            let response_code = session.pending_response_status_override.unwrap_or(*code);
+            let mut response_code = session.pending_response_status_override.unwrap_or(*code);
             let extras = session
                 .reject_response_extras
                 .clone()
@@ -1843,6 +1951,7 @@ pub(crate) async fn execute_action(
                     "YAML UAS response status is outside the SIP response range",
                 ));
             }
+            let mut response_sdp = response_sdp_for_event(triggering_event, &session.local_sdp);
 
             let initial_invite_event = matches!(
                 triggering_event,
@@ -1860,63 +1969,91 @@ pub(crate) async fn execute_action(
             let initial_invite_response = initial_invite_event
                 || (inbound_response.is_none()
                     && session.pending_inbound_invite_transaction_id.is_some());
-            // A bodyless UPDATE (RFC 4028 §9 session-timer refresh) must get
-            // a bodyless 200 OK back. Attaching `session.local_sdp` here
-            // would turn the response into an unsolicited offer with no
-            // ACK or further request to carry an answer back on.
-            let response_body =
-                if matches!(triggering_event, EventType::UpdateReceived { sdp: None }) {
-                    None
-                } else {
-                    session.local_sdp.clone()
-                };
+            let mut prepared_media = None;
+            let mut media_preparation_error = None;
+            let response_commits_media = (response_is_final && (200..300).contains(&response_code))
+                || (response_is_provisional && response_sdp.is_some());
+            if response_commits_media && media_adapter.has_staged_media_negotiation(session) {
+                match media_adapter
+                    .prepare_staged_media_negotiation_lane_owned(session)
+                    .await
+                {
+                    Ok(prepared) => prepared_media = Some(prepared),
+                    Err(error) if response_is_final => {
+                        response_code = 488;
+                        response_sdp = None;
+                        media_preparation_error = Some(error);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
             let mut terminal_error = None;
-            if response_is_final && initial_invite_response {
-                let terminal = send_exact_initial_invite_final_response(
-                    session,
-                    dialog_adapter,
-                    response_code,
-                    response_body,
-                    extras,
-                )
-                .await?;
-                consume_exact_initial_invite_response_authority(
-                    session,
-                    dialog_adapter,
-                    &terminal,
-                    response_code == 200,
-                );
-                terminal_error = terminal.terminal_error;
-            } else if response_is_final {
-                let terminal = send_exact_inbound_final_response(
-                    &session.session_id,
-                    inbound_response.as_deref_mut(),
-                    dialog_adapter,
-                    response_code,
-                    response_body,
-                    extras,
-                )
-                .await?;
-                terminal_error = terminal.terminal_error;
-            } else if initial_invite_response {
-                send_exact_initial_invite_provisional_response(
-                    session,
-                    dialog_adapter,
-                    response_code,
-                    response_body,
-                    extras,
-                )
-                .await?;
-            } else {
-                send_exact_inbound_provisional_response(
-                    &session.session_id,
-                    inbound_response.as_deref_mut(),
-                    dialog_adapter,
-                    response_code,
-                    response_body,
-                    extras,
-                )
-                .await?;
+            let dispatch_result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+                if response_is_final && initial_invite_response {
+                    let terminal = send_exact_initial_invite_final_response(
+                        session,
+                        dialog_adapter,
+                        response_code,
+                        response_sdp.clone(),
+                        extras,
+                    )
+                    .await?;
+                    consume_exact_initial_invite_response_authority(
+                        session,
+                        dialog_adapter,
+                        &terminal,
+                        response_code == 200,
+                    );
+                    terminal_error = terminal.terminal_error;
+                } else if response_is_final {
+                    let terminal = send_exact_inbound_final_response(
+                        &session.session_id,
+                        inbound_response.as_deref_mut(),
+                        dialog_adapter,
+                        response_code,
+                        response_sdp.clone(),
+                        extras,
+                    )
+                    .await?;
+                    terminal_error = terminal.terminal_error;
+                } else if initial_invite_response {
+                    send_exact_initial_invite_provisional_response(
+                        session,
+                        dialog_adapter,
+                        response_code,
+                        response_sdp.clone(),
+                        extras,
+                    )
+                    .await?;
+                } else {
+                    send_exact_inbound_provisional_response(
+                        &session.session_id,
+                        inbound_response.as_deref_mut(),
+                        dialog_adapter,
+                        response_code,
+                        response_sdp,
+                        extras,
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = dispatch_result {
+                if let Some(prepared) = prepared_media.take() {
+                    if let Err(rollback_error) = media_adapter
+                        .rollback_prepared_media_negotiation_lane_owned(session, prepared)
+                        .await
+                    {
+                        return Err(Box::new(ExactSipResponseActionError::new(
+                            exact_sip_response_failure_disposition(error.as_ref()).unwrap_or(
+                                rvoip_sip_dialog::FinalResponseCompletionDisposition::ZeroWireRetryable,
+                            ),
+                            rollback_error,
+                        )));
+                    }
+                }
+                return Err(error);
             }
 
             // The event-local response input remains intact across every
@@ -1932,6 +2069,44 @@ pub(crate) async fn execute_action(
                     "Dialog established (UAS sent {} final response) for session {}",
                     response_code, session.session_id
                 );
+            }
+            let committed_disposition = terminal_error
+                .as_ref()
+                .and_then(|error| exact_sip_response_failure_disposition(error.as_ref()))
+                .unwrap_or(
+                    rvoip_sip_dialog::FinalResponseCompletionDisposition::WrittenSuccessTerminal,
+                );
+            if let Some(prepared) = prepared_media.take() {
+                if let Err(error) = media_adapter
+                    .finalize_prepared_media_negotiation_lane_owned(session, prepared)
+                    .await
+                {
+                    return Err(Box::new(ExactSipResponseActionError::new(
+                        committed_disposition,
+                        error,
+                    )));
+                }
+            }
+            if let Some(error) = media_preparation_error {
+                media_adapter.discard_staged_media_negotiation_for_session(session);
+                if initial_invite_response {
+                    let cleanup_result =
+                        release_lane_owned_resources(session, dialog_adapter, media_adapter).await;
+                    session.call_state =
+                        crate::types::CallState::Failed(crate::types::FailureReason::MediaError);
+                    if let Err(cleanup_error) = cleanup_result {
+                        return Err(Box::new(ExactSipResponseActionError::new(
+                            committed_disposition,
+                            crate::errors::SessionError::MediaError(format!(
+                                "initial answer media preparation failed and cleanup was incomplete: {cleanup_error}"
+                            )),
+                        )));
+                    }
+                }
+                return Err(Box::new(ExactSipResponseActionError::new(
+                    committed_disposition,
+                    error,
+                )));
             }
             if let Some(error) = terminal_error {
                 return Err(error);
@@ -1998,6 +2173,7 @@ pub(crate) async fn execute_action(
             // extras OR an outbound proxy is configured (E4 — that path
             // injects the pre-loaded Route header at the adapter layer).
             let use_extra_path = !extras.is_empty() || dialog_adapter.outbound_proxy_uri.is_some();
+            session.initial_invite_offer_sdp = session.local_sdp.clone();
             if !use_extra_path {
                 dialog_adapter
                     .send_invite_with_details(
@@ -2029,6 +2205,56 @@ pub(crate) async fn execute_action(
             }
         }
         Action::ClearPendingReinvite => {
+            match triggering_event {
+                EventType::Dialog4xxFailure(_)
+                | EventType::Dialog5xxFailure(_)
+                | EventType::Dialog6xxFailure(_)
+                | EventType::DialogTimeout => {
+                    rollback_reinvite_with_media(session, media_adapter);
+                }
+                EventType::MediaEvent(name)
+                    if name
+                        == crate::state_machine::executor::SESSION_REFRESH_REINVITE_FAILED_EVENT =>
+                {
+                    rollback_reinvite_with_media(session, media_adapter);
+                }
+                EventType::Dialog200OK => {
+                    if media_adapter.has_staged_media_negotiation(session) {
+                        if let Err(error) = media_adapter
+                            .commit_staged_media_negotiation_lane_owned(session)
+                            .await
+                        {
+                            rollback_reinvite_with_media(session, media_adapter);
+                            session.pending_reinvite = None;
+                            session.reinvite_retry_attempts = 0;
+                            return Err(error.into());
+                        }
+                    }
+                    commit_reinvite_local_sdp(session);
+                }
+                _ => {
+                    if matches!(triggering_event, EventType::ReinviteReceived { .. }) {
+                        let superseded_transaction = session
+                            .pending_offer_answer
+                            .as_ref()
+                            .filter(|pending| pending.method == rvoip_sip_core::Method::Invite)
+                            .and_then(|pending| pending.transaction_id.clone());
+                        if let Some(transaction) = superseded_transaction {
+                            let handle = exact_request_tracker_handle(session)?;
+                            dialog_adapter.outbound_request_tracker.abort_matching(
+                                handle,
+                                TrackedInDialogMethod::Reinvite,
+                                &transaction,
+                            );
+                            session.clear_tracked_auth_if_transaction(&transaction.to_string());
+                        }
+                    }
+                    session.discard_offer_answer_rollback_image();
+                    session.stable_local_sdp_before_reinvite = None;
+                    media_adapter.discard_pending_srtp_offer_for_session(session);
+                    media_adapter.discard_staged_media_negotiation_for_session(session);
+                }
+            }
             session.pending_reinvite = None;
             session.reinvite_retry_attempts = 0;
             debug!(
@@ -2046,6 +2272,7 @@ pub(crate) async fn execute_action(
             use crate::state_table::types::Role;
             const MAX_GLARE_RETRIES: u8 = 3;
             if session.reinvite_retry_attempts >= MAX_GLARE_RETRIES {
+                rollback_reinvite_with_media(session, media_adapter);
                 session.pending_reinvite = None;
                 return Err(format!(
                     "491 glare retry limit ({}) exceeded for session {}",
@@ -2136,28 +2363,34 @@ pub(crate) async fn execute_action(
                 "Following 3xx redirect"
             );
 
-            let (invite_opts, apply_global_proxy) = if let Some(snapshot) =
+            let (invite_opts, apply_global_proxy, exact_offer_sdp) = if let Some(snapshot) =
                 session.pending_invite_options.as_ref()
             {
                 let mut redirected = (**snapshot).clone();
                 redirected.to = next_target.clone();
                 redirected.precomputed_auth = None;
                 let sdp = authoritative_invite_sdp(Some(&redirected), session.local_sdp.as_deref());
-                let (options, suppress_global_proxy) =
-                    materialize_invite_options(&redirected, session.pai_uri.as_deref(), sdp)?;
+                let (options, suppress_global_proxy) = materialize_invite_options(
+                    &redirected,
+                    session.pai_uri.as_deref(),
+                    sdp.clone(),
+                )?;
                 session.pending_invite_options = Some(Arc::new(redirected));
-                (options, !suppress_global_proxy)
+                (options, !suppress_global_proxy, sdp)
             } else {
+                let sdp = session.local_sdp.clone();
                 (
                     rvoip_sip_dialog::api::unified::InviteRequestOptions {
                         from_uri: from,
                         to_uri: next_target,
-                        sdp: session.local_sdp.clone(),
+                        sdp: sdp.clone(),
                         ..Default::default()
                     },
                     true,
+                    sdp,
                 )
             };
+            session.initial_invite_offer_sdp = exact_offer_sdp;
 
             dialog_adapter
                 .send_invite_with_options(&session.session_id, invite_opts, apply_global_proxy)
@@ -2167,13 +2400,97 @@ pub(crate) async fn execute_action(
             }
         }
         Action::SendACK => {
-            // NO-OP for SIP: dialog-core sends ACK automatically per RFC 3261
-            // However, we still set dialog_established = true here because for UAC,
-            // the dialog is considered established when ACK is sent
+            let delayed_offer = initial_invite_used_delayed_offer(session, triggering_event);
+            let mut prepared_media = None;
+            let mut media_preparation_error = None;
+            let mut ack_negotiation_error = None;
+            if invite_2xx_ack.is_some() && media_adapter.has_staged_media_negotiation(session) {
+                match media_adapter
+                    .prepare_staged_media_negotiation_lane_owned(session)
+                    .await
+                {
+                    Ok(prepared) => prepared_media = Some(prepared),
+                    Err(error) => media_preparation_error = Some(error),
+                }
+            }
+            if let Some(ack) = invite_2xx_ack {
+                let ack_result = if delayed_offer {
+                    if let Some(answer) = session.local_sdp.as_deref() {
+                        dialog_adapter
+                            .send_delayed_offer_ack_exact(
+                                exact_request_tracker_handle(session)?,
+                                &ack.transaction_id,
+                                &ack.response,
+                                answer,
+                            )
+                            .await
+                    } else {
+                        ack_negotiation_error =
+                            Some(crate::errors::SessionError::SDPNegotiationFailed(
+                                "delayed-offer ACK has no generated SDP answer".to_string(),
+                            ));
+                        // A 2xx INVITE response must still be ACKed even when
+                        // its offer cannot be answered. Stop retransmissions,
+                        // preserve stable negotiation state, and surface the
+                        // explicit failure after the write completes.
+                        dialog_adapter
+                            .send_invite_2xx_ack_exact(
+                                exact_request_tracker_handle(session)?,
+                                &ack.transaction_id,
+                                &ack.response,
+                            )
+                            .await
+                    }
+                } else {
+                    dialog_adapter
+                        .send_invite_2xx_ack_exact(
+                            exact_request_tracker_handle(session)?,
+                            &ack.transaction_id,
+                            &ack.response,
+                        )
+                        .await
+                };
+                if let Err(ack_error) = ack_result {
+                    if let Some(prepared) = prepared_media.take() {
+                        if let Err(rollback_error) = media_adapter
+                            .rollback_prepared_media_negotiation_lane_owned(session, prepared)
+                            .await
+                        {
+                            return Err(crate::errors::SessionError::MediaError(format!(
+                                "INVITE 2xx ACK write failed and prepared media rollback failed: {rollback_error}"
+                            ))
+                            .into());
+                        }
+                    }
+                    return Err(ack_error.into());
+                }
+            }
+            if let Some(prepared) = prepared_media.take() {
+                media_adapter
+                    .finalize_prepared_media_negotiation_lane_owned(session, prepared)
+                    .await?;
+            } else if invite_2xx_ack.is_none()
+                && session.pending_offer_answer.is_none()
+                && media_adapter.has_staged_media_negotiation(session)
+            {
+                media_adapter
+                    .commit_staged_media_negotiation_lane_owned(session)
+                    .await?;
+            }
+            if let Some(error) = ack_negotiation_error {
+                media_adapter.discard_pending_srtp_offer_for_session(session);
+                media_adapter.discard_staged_media_negotiation_for_session(session);
+                return Err(error.into());
+            }
+            if let Some(error) = media_preparation_error {
+                media_adapter.discard_pending_srtp_offer_for_session(session);
+                media_adapter.discard_staged_media_negotiation_for_session(session);
+                return Err(error.into());
+            }
             session.dialog_established = true;
             info!(
-                "SendACK action: dialog-core handles ACK sending, dialog marked as established for UAC session {}",
-                session.session_id
+                delayed_offer,
+                "SendACK action completed for UAC session {}", session.session_id
             );
         }
         Action::SendBYE => {
@@ -2234,17 +2551,22 @@ pub(crate) async fn execute_action(
                 .create_hold_sdp_for_session_lane_owned(session)
                 .await
                 .map_err(|e| format!("create_hold_sdp failed: {}", e))?;
-            session.local_sdp = Some(hold_sdp.clone());
+            begin_reinvite_offer(session, hold_sdp.clone())?;
             session.pending_reinvite = Some(crate::session_store::state::PendingReinvite::Hold);
-            dialog_adapter
-                .send_reinvite_with_options_lane_owned(
-                    session,
-                    ReInviteRequestOptions {
-                        sdp: Some(hold_sdp),
-                        ..Default::default()
-                    },
-                )
-                .await?;
+            if let Err(error) = send_tracked_reinvite_lane_owned(
+                session,
+                dialog_adapter,
+                ReInviteRequestOptions {
+                    sdp: Some(hold_sdp),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                rollback_reinvite_with_media(session, media_adapter);
+                session.pending_reinvite = None;
+                return Err(error.into());
+            }
         }
         Action::ResumeCall => {
             // Send re-INVITE with sendrecv SDP.
@@ -2252,17 +2574,22 @@ pub(crate) async fn execute_action(
                 .create_active_sdp_for_session_lane_owned(session)
                 .await
                 .map_err(|e| format!("create_active_sdp failed: {}", e))?;
-            session.local_sdp = Some(active_sdp.clone());
+            begin_reinvite_offer(session, active_sdp.clone())?;
             session.pending_reinvite = Some(crate::session_store::state::PendingReinvite::Resume);
-            dialog_adapter
-                .send_reinvite_with_options_lane_owned(
-                    session,
-                    ReInviteRequestOptions {
-                        sdp: Some(active_sdp),
-                        ..Default::default()
-                    },
-                )
-                .await?;
+            if let Err(error) = send_tracked_reinvite_lane_owned(
+                session,
+                dialog_adapter,
+                ReInviteRequestOptions {
+                    sdp: Some(active_sdp),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                rollback_reinvite_with_media(session, media_adapter);
+                session.pending_reinvite = None;
+                return Err(error.into());
+            }
         }
         Action::TransferCall(target) => {
             session.transfer_target = Some(target.clone());
@@ -2295,15 +2622,26 @@ pub(crate) async fn execute_action(
         // Media actions
         Action::StartMediaSession => {
             if session.needs_teardown_after_failed_ack_negotiation {
-                // `CompleteAckNegotiation` couldn't complete a delayed-offer
+                // CompleteAckNegotiation couldn't complete a delayed-offer
                 // exchange (see that action). There's no negotiated media
-                // to start a session for; the caller is about to hang this
+                // to start a session for, the caller is about to hang this
                 // call up.
                 info!(
                     "Action::StartMediaSession for session {}: skipped, delayed-offer negotiation failed",
                     session.session_id
                 );
                 return Ok(ActionOutcome::default());
+            }
+            // A received provisional answer (for example 183 early media) has
+            // no ACK boundary. Likewise, an offerless UAS completes the
+            // exchange when it receives the ACK answer. Commit either staged
+            // negotiation on this exact-session lane before exposing media as
+            // started. Ordinary final UAC answers have already crossed their
+            // wire boundary in SendACK, so this is a no-op for that path.
+            if media_adapter.has_staged_media_negotiation(session) {
+                media_adapter
+                    .commit_staged_media_negotiation_lane_owned(session)
+                    .await?;
             }
             media_adapter.start_session(&session.session_id).await?;
             // Mark media as ready after successfully starting
@@ -2341,33 +2679,75 @@ pub(crate) async fn execute_action(
             }
         }
         Action::NegotiateSDPAsUAC => {
-            if let Some(remote_sdp) = session.remote_sdp.clone() {
-                let config = media_adapter
-                    .negotiate_sdp_as_uac_lane_owned(session, &remote_sdp)
-                    .await?;
-
-                // Convert to session_store NegotiatedConfig
-                let (sample_rate, channels) = negotiated_audio_shape(&config.codec);
-                let session_config = crate::session_store::state::NegotiatedConfig {
-                    local_addr: config.local_addr,
-                    remote_addr: config.remote_addr,
-                    codec: config.codec,
-                    sample_rate,
-                    channels,
-                };
-                session.negotiated_config = Some(session_config);
-                session.local_media_direction = config.local_direction;
-                session.remote_media_direction = config.remote_direction;
-                session.sdp_negotiated = true;
-                info!("SDP negotiated as UAC for session {}", session.session_id);
+            if matches!(triggering_event, EventType::Dialog200OK)
+                && session.media_session_ready
+                && session.sdp_negotiated
+                && session.pending_offer_answer.is_none()
+            {
+                info!(
+                    "Action::NegotiateSDPAsUAC for session {}: final response confirms committed early-media answer",
+                    session.session_id
+                );
+                return Ok(ActionOutcome::default());
             }
+            if matches!(triggering_event, EventType::DialogACK { .. }) && session.sdp_negotiated {
+                info!(
+                    "Action::NegotiateSDPAsUAC for session {}: ordinary ACK has no new offer/answer",
+                    session.session_id
+                );
+                return Ok(ActionOutcome::default());
+            }
+            let remote_sdp = session.remote_sdp.clone().ok_or_else(|| {
+                crate::errors::SessionError::SDPNegotiationFailed(
+                    "received a successful offer/answer response without SDP".to_string(),
+                )
+            })?;
+            let delayed_offer = initial_invite_used_delayed_offer(session, triggering_event);
+            let negotiation = if delayed_offer {
+                media_adapter
+                    .negotiate_sdp_as_uas_lane_owned(session, &remote_sdp)
+                    .await
+                    .map(|(answer, config)| (Some(answer), config))
+            } else {
+                media_adapter
+                    .negotiate_sdp_as_uac_lane_owned(session, &remote_sdp)
+                    .await
+                    .map(|config| (None, config))
+            };
+            let (local_answer, config) = match negotiation {
+                Ok(negotiated) => negotiated,
+                Err(error) => {
+                    if session.pending_offer_answer.is_some() {
+                        rollback_reinvite_with_media(session, media_adapter);
+                    }
+                    return Err(error);
+                }
+            };
+
+            // Convert to session_store NegotiatedConfig
+            let session_config = crate::session_store::state::NegotiatedConfig {
+                local_addr: config.local_addr,
+                remote_addr: config.remote_addr,
+                codec: config.codec,
+                sample_rate: config.clock_rate,
+                channels: config.channels,
+                fmtp: config.negotiated_fmtp.clone(),
+            };
+            session.set_negotiated_config(session_config, config.payload_type);
+            session.local_media_direction = config.local_direction;
+            session.remote_media_direction = config.remote_direction;
+            session.sdp_negotiated = true;
+            if let Some(local_answer) = local_answer {
+                session.local_sdp = Some(local_answer);
+            }
+            info!("SDP negotiated as UAC for session {}", session.session_id);
         }
         Action::NegotiateSDPAsUAS => {
             let guard = cleanup_diag::stage_guard(
                 CleanupStage::ActionNegotiateSdpUas,
                 &session.session_id.0,
             );
-            // An UPDATE with no body is a pure RFC 4028 §9 session-timer
+            // An UPDATE with no body is a pure RFC 4028 session-timer
             // refresh signal, not an offer. There's nothing to negotiate,
             // and unlike a bodyless re-INVITE there's no ACK to carry a
             // later answer in either, so this can't go through the
@@ -2412,14 +2792,13 @@ pub(crate) async fn execute_action(
                     .await
                 {
                     Ok((local_sdp, config)) => {
-                        // Convert to session_store NegotiatedConfig
-                        let (sample_rate, channels) = negotiated_audio_shape(&config.codec);
                         let session_config = crate::session_store::state::NegotiatedConfig {
                             local_addr: config.local_addr,
                             remote_addr: config.remote_addr,
                             codec: config.codec,
-                            sample_rate,
-                            channels,
+                            sample_rate: config.clock_rate,
+                            channels: config.channels,
+                            fmtp: config.negotiated_fmtp.clone(),
                         };
                         session.local_sdp = Some(local_sdp);
                         // Negotiation actually succeeded at this point, so
@@ -2428,7 +2807,7 @@ pub(crate) async fn execute_action(
                         // at its previous (pre-offer) value untouched.
                         session.remote_sdp = Some(remote_sdp);
                         session.pending_remote_offer = None;
-                        session.negotiated_config = Some(session_config);
+                        session.set_negotiated_config(session_config, config.payload_type);
                         session.local_media_direction = config.local_direction;
                         session.remote_media_direction = config.remote_direction;
                         session.sdp_negotiated = true;
@@ -2469,7 +2848,7 @@ pub(crate) async fn execute_action(
                                 // an error here (rather than falling
                                 // through as a success) so the executor's
                                 // per-transition action loop stops instead
-                                // of running `SendSIPResponse(200)` right
+                                // of running SendSIPResponse(200) right
                                 // after and sending a second response for
                                 // the same transaction.
                                 return Err(error.into());
@@ -2487,12 +2866,12 @@ pub(crate) async fn execute_action(
                     }
                 }
             } else {
-                // RFC 3261 §14.2 delayed offer: the triggering INVITE/
+                // RFC 3261 delayed offer: the triggering INVITE/
                 // re-INVITE had no SDP, so there's no remote offer to
-                // negotiate against here. `GenerateLocalSDP` (which always
+                // negotiate against here. GenerateLocalSDP (which always
                 // runs before this action in the same transition) already
                 // put a freshly generated offer in `session.local_sdp`;
-                // mark it pending so `CompleteAckNegotiation` knows to
+                // mark it pending so CompleteAckNegotiation knows to
                 // finish this exchange once the peer's answer arrives in
                 // the ACK, instead of the transition claiming
                 // `sdp_negotiated` for an offer nobody has answered yet.
@@ -2520,15 +2899,14 @@ pub(crate) async fn execute_action(
                             .await
                         {
                             Ok(config) => {
-                                let (sample_rate, channels) = negotiated_audio_shape(&config.codec);
-                                session.negotiated_config =
-                                    Some(crate::session_store::state::NegotiatedConfig {
-                                        local_addr: config.local_addr,
-                                        remote_addr: config.remote_addr,
-                                        codec: config.codec,
-                                        sample_rate,
-                                        channels,
-                                    });
+                                let session_config = crate::session_store::state::NegotiatedConfig {
+                                    local_addr: config.local_addr,
+                                    remote_addr: config.remote_addr,
+                                    codec: config.codec,
+                                    sample_rate: config.clock_rate,
+                                    channels: config.channels,
+                                    fmtp: config.negotiated_fmtp.clone(),
+                                };
                                 session.local_media_direction = config.local_direction;
                                 session.remote_media_direction = config.remote_direction;
                                 // The peer's answer has now actually been
@@ -2538,6 +2916,7 @@ pub(crate) async fn execute_action(
                                 // remote SDP.
                                 session.local_sdp = Some(local_offer);
                                 session.remote_sdp = Some(answer_sdp);
+                                session.set_negotiated_config(session_config, config.payload_type);
                                 session.sdp_negotiated = true;
                                 info!(
                                     "Delayed-offer negotiation completed from ACK answer for session {}",
@@ -2564,13 +2943,13 @@ pub(crate) async fn execute_action(
                         }
                     }
                     None => {
-                        // RFC 3261 §14.2 requires the answer to be in this
+                        // RFC 3261 requires the answer to be in this
                         // ACK when the offer was in our 2xx. A peer that
                         // omits it has violated the offer/answer contract;
                         // same handling as a failed negotiation above.
                         warn!(
                             "ACK for session {} completed a delayed offer with no answer body \
-                             (RFC 3261 §14.2 violation), leaving sdp_negotiated unset",
+                             (RFC 3261 violation), leaving sdp_negotiated unset",
                             session.session_id
                         );
                         session.needs_teardown_after_failed_ack_negotiation = true;
@@ -2591,16 +2970,16 @@ pub(crate) async fn execute_action(
                 let (local_sdp, config) = media_adapter
                     .negotiate_sdp_as_uas_lane_owned(session, &remote_sdp)
                     .await?;
-                let (sample_rate, channels) = negotiated_audio_shape(&config.codec);
                 let session_config = crate::session_store::state::NegotiatedConfig {
                     local_addr: config.local_addr,
                     remote_addr: config.remote_addr,
                     codec: config.codec,
-                    sample_rate,
-                    channels,
+                    sample_rate: config.clock_rate,
+                    channels: config.channels,
+                    fmtp: config.negotiated_fmtp.clone(),
                 };
                 session.local_sdp = Some(local_sdp);
-                session.negotiated_config = Some(session_config);
+                session.set_negotiated_config(session_config, config.payload_type);
                 session.local_media_direction = config.local_direction;
                 session.remote_media_direction = config.remote_direction;
                 session.sdp_negotiated = true;
@@ -2717,7 +3096,7 @@ pub(crate) async fn execute_action(
                     .await
                     .map_err(|e| format!("create_active_sdp failed: {}", e))?
             };
-            session.local_sdp = Some(sdp.clone());
+            begin_reinvite_offer(session, sdp.clone())?;
             session.pending_reinvite = Some(kind);
             // A 491/ReinviteGlare response is queued on the same exact-session
             // lane. It observes this SDP and retry intent only after the
@@ -2726,15 +3105,20 @@ pub(crate) async fn execute_action(
                 "Sending re-INVITE for session {} (hold={})",
                 session.session_id, hold_direction
             );
-            dialog_adapter
-                .send_reinvite_with_options_lane_owned(
-                    session,
-                    ReInviteRequestOptions {
-                        sdp: Some(sdp),
-                        ..Default::default()
-                    },
-                )
-                .await?;
+            if let Err(error) = send_tracked_reinvite_lane_owned(
+                session,
+                dialog_adapter,
+                ReInviteRequestOptions {
+                    sdp: Some(sdp),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                rollback_reinvite_with_media(session, media_adapter);
+                session.pending_reinvite = None;
+                return Err(error.into());
+            }
         }
 
         Action::PlayAudioFile(file) => {
@@ -3015,22 +3399,22 @@ pub(crate) async fn execute_action(
                         Some(("SIP".to_string(), 408, Some("Session expired".to_string())));
                 }
                 "SuspendMedia" => {
+                    let direction = crate::types::MediaDirection::SendOnly;
                     if let Some(media_id) = &session.media_session_id {
-                        let direction = crate::types::MediaDirection::SendOnly;
                         media_adapter
                             .set_media_direction(media_id.clone(), direction)
                             .await?;
-                        session.local_media_direction = direction;
                     }
+                    session.local_media_direction = direction;
                 }
                 "ResumeMedia" => {
+                    let direction = crate::types::MediaDirection::SendRecv;
                     if let Some(media_id) = &session.media_session_id {
-                        let direction = crate::types::MediaDirection::SendRecv;
                         media_adapter
                             .set_media_direction(media_id.clone(), direction)
                             .await?;
-                        session.local_media_direction = direction;
                     }
+                    session.local_media_direction = direction;
                 }
                 "CheckReadiness" => {
                     return Ok(ActionOutcome::with_event(EventType::CheckConditions));
@@ -3236,7 +3620,7 @@ pub(crate) async fn execute_action(
             }
         }
         Action::SendINVITEWithAuth => {
-            Box::pin(async {
+            let observation = Box::pin(async {
                 // RFC 3261 §22.2 — compute an Authorization header and
                 // re-issue the INVITE on the same dialog (same Call-ID, bumped
                 // CSeq) via DialogAdapter::resend_invite_with_auth. Origin and
@@ -3296,10 +3680,9 @@ pub(crate) async fn execute_action(
                 // The builder-supplied body snapshot is the wire authority. SDP
                 // generation may also populate `session.local_sdp`, but an
                 // auth-int retry must hash and retransmit the exact original bytes.
-                let body_owned = authoritative_invite_sdp(
-                    invite_snapshot.as_ref(),
-                    session.local_sdp.as_deref(),
-                );
+                let body_owned = session.initial_invite_offer_sdp.clone().or_else(|| {
+                    authoritative_invite_sdp(invite_snapshot.as_ref(), session.local_sdp.as_deref())
+                });
                 let body_bytes = body_owned.as_deref().map(|s| s.as_bytes());
                 let transport_context =
                     session.pending_auth_transport.clone().unwrap_or_else(|| {
@@ -3362,6 +3745,12 @@ pub(crate) async fn execute_action(
                 } else {
                     preview_auth
                 };
+                let auth_retry_observation = digest_auth_retry_observation(
+                    session.session_id.clone(),
+                    status,
+                    &selected_auth,
+                    body_bytes,
+                );
                 session.invite_auth_retry_count = session.invite_auth_retry_count.saturating_add(1);
                 let header_value = selected_auth.value;
 
@@ -3471,9 +3860,16 @@ pub(crate) async fn execute_action(
                     "Auth-retry INVITE sent for session {} (retry #{}, header {})",
                     session.session_id, session.invite_auth_retry_count, header_name
                 );
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                Ok::<Option<AuthRetryObservation>, Box<dyn std::error::Error + Send + Sync>>(
+                    auth_retry_observation,
+                )
             })
             .await?;
+            if let Some(observation) = observation {
+                return Ok(ActionOutcome::with_deferred_effect(
+                    DeferredActionEffect::AuthRetryObservation(observation),
+                ));
+            }
         }
 
         Action::SendRequestWithAuth => {
@@ -3827,6 +4223,9 @@ pub(crate) async fn execute_action(
                             header_value,
                         )
                         .await?;
+                    // Rebind before activation can flush a response that raced
+                    // the authenticated transport write.
+                    session.bind_offer_answer_transaction(transaction_id.clone())?;
                     dialog_adapter
                         .outbound_request_tracker
                         .activate(lease, transaction_id.clone())?;
@@ -3863,6 +4262,9 @@ pub(crate) async fn execute_action(
                             header_value,
                         )
                         .await?;
+                    // Rebind before activation can flush a response that raced
+                    // the authenticated transport write.
+                    session.bind_offer_answer_transaction(transaction_id.clone())?;
                     dialog_adapter
                         .outbound_request_tracker
                         .activate(lease, transaction_id.clone())?;
@@ -3983,7 +4385,9 @@ pub(crate) async fn execute_action(
                 .pending_invite_options
                 .as_ref()
                 .map(|snapshot| (**snapshot).clone());
-            let body = authoritative_invite_sdp(snapshot.as_ref(), session.local_sdp.as_deref());
+            let body = session.initial_invite_offer_sdp.clone().or_else(|| {
+                authoritative_invite_sdp(snapshot.as_ref(), session.local_sdp.as_deref())
+            });
             let proxy_target =
                 invite_proxy_protection_target(snapshot.as_ref(), dialog_adapter, &request_uri);
             let mut authorization_headers =
@@ -4521,26 +4925,60 @@ pub(crate) async fn execute_action(
                 )
                 .into());
             };
-            let lease = dialog_adapter.outbound_request_tracker.prepare(
+            let snapshot = (*options).clone();
+            let local_offer = match snapshot.sdp.as_ref() {
+                Some(sdp) if sdp.trim().is_empty() => {
+                    return Err(crate::errors::SessionError::InvalidTransition(
+                        "an SDP-bearing UPDATE requires a non-empty local offer".to_string(),
+                    )
+                    .into());
+                }
+                Some(sdp) => Some(sdp.clone()),
+                None => None,
+            };
+            if let Some(local_offer) = local_offer.as_ref() {
+                media_adapter.validate_local_sdp_offer(local_offer)?;
+                session.begin_offer_answer(rvoip_sip_core::Method::Update, local_offer.clone())?;
+                stage_reinvite_local_sdp(session, local_offer.clone());
+            }
+            let lease = match dialog_adapter.outbound_request_tracker.prepare(
                 exact_request_tracker_handle(session)?,
                 TrackedInDialogOptions::Update(Arc::clone(&options)),
-            )?;
+            ) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    rollback_reinvite_with_media(session, media_adapter);
+                    return Err(error.into());
+                }
+            };
             let transaction_id = match dialog_adapter
-                .send_update_with_options_lane_owned(session, (*options).clone())
+                .send_update_with_options_lane_owned(session, snapshot)
                 .await
             {
                 Ok(transaction_id) => transaction_id,
                 Err(_) if options.session_timer_refresh => {
+                    rollback_reinvite_with_media(session, media_adapter);
                     return Ok(session_refresh_immediate_effect(
                         session,
                         SessionRefreshDeadlineKind::UpdateFailed,
                     ));
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    rollback_reinvite_with_media(session, media_adapter);
+                    return Err(error.into());
+                }
             };
-            dialog_adapter
+            if let Err(error) = session.bind_offer_answer_transaction(transaction_id.clone()) {
+                rollback_reinvite_with_media(session, media_adapter);
+                return Err(error.into());
+            }
+            if let Err(error) = dialog_adapter
                 .outbound_request_tracker
-                .activate(lease, transaction_id)?;
+                .activate(lease, transaction_id)
+            {
+                rollback_reinvite_with_media(session, media_adapter);
+                return Err(error.into());
+            }
             if options.session_timer_refresh {
                 return Ok(session_refresh_transaction_deadline_effect(
                     session,
@@ -4563,33 +5001,67 @@ pub(crate) async fn execute_action(
                 )
                 .into());
             };
-            let lease = dialog_adapter.outbound_request_tracker.prepare(
+            let snapshot = (*options).clone();
+            let local_offer = snapshot.sdp.clone().filter(|sdp| !sdp.trim().is_empty());
+            if local_offer.is_none() && !snapshot.session_timer_refresh {
+                return Err(crate::errors::SessionError::InvalidTransition(
+                    "offerless in-dialog re-INVITE is unsupported; supply an SDP offer".to_string(),
+                )
+                .into());
+            }
+            if let Some(local_offer) = local_offer.as_ref() {
+                media_adapter.validate_local_sdp_offer(local_offer)?;
+                begin_reinvite_offer(session, local_offer.clone())?;
+            }
+            let lease = match dialog_adapter.outbound_request_tracker.prepare(
                 exact_request_tracker_handle(session)?,
                 TrackedInDialogOptions::Reinvite(Arc::clone(&options)),
-            )?;
-            let snapshot = (*options).clone();
+            ) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    rollback_reinvite_with_media(session, media_adapter);
+                    return Err(error.into());
+                }
+            };
             // RFC 3261 §14.1 — track the in-flight builder-API
             // re-INVITE so `HasPendingReinvite` fires the UAS-side glare path.
-            let sdp_snapshot = snapshot.sdp.clone().unwrap_or_default();
-            session.pending_reinvite = Some(
-                crate::session_store::state::PendingReinvite::SdpUpdate(sdp_snapshot),
-            );
+            if let Some(local_offer) = local_offer {
+                session.pending_reinvite = Some(
+                    crate::session_store::state::PendingReinvite::SdpUpdate(local_offer),
+                );
+            }
             let transaction_id = match dialog_adapter
                 .send_reinvite_with_options_lane_owned(session, snapshot)
                 .await
             {
                 Ok(transaction_id) => transaction_id,
                 Err(_) if options.session_timer_refresh => {
+                    rollback_reinvite_with_media(session, media_adapter);
+                    session.pending_reinvite = None;
                     return Ok(session_refresh_immediate_effect(
                         session,
                         SessionRefreshDeadlineKind::ReinviteFailed,
                     ));
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    rollback_reinvite_with_media(session, media_adapter);
+                    session.pending_reinvite = None;
+                    return Err(error.into());
+                }
             };
-            dialog_adapter
+            if let Err(error) = session.bind_offer_answer_transaction(transaction_id.clone()) {
+                rollback_reinvite_with_media(session, media_adapter);
+                session.pending_reinvite = None;
+                return Err(error.into());
+            }
+            if let Err(error) = dialog_adapter
                 .outbound_request_tracker
-                .activate(lease, transaction_id)?;
+                .activate(lease, transaction_id)
+            {
+                rollback_reinvite_with_media(session, media_adapter);
+                session.pending_reinvite = None;
+                return Err(error.into());
+            }
             if options.session_timer_refresh {
                 return Ok(session_refresh_transaction_deadline_effect(
                     session,
@@ -4681,6 +5153,7 @@ pub(crate) async fn execute_action(
                 // preceding `GenerateLocalSDP` action.
                 let sdp_for_wire =
                     authoritative_invite_sdp(Some(&snapshot), session.local_sdp.as_deref());
+                session.initial_invite_offer_sdp = sdp_for_wire.clone();
 
                 // `with_topology_hiding(true)` is a no-op on the fresh-INVITE
                 // build path (Via/Contact are stamped from scratch); the flag
@@ -4741,6 +5214,7 @@ pub(crate) async fn execute_action(
         // ──────────────────────────────────────────────────────────────
         Action::ClearPendingINVITEOptions => {
             session.pending_invite_options = None;
+            session.initial_invite_offer_sdp = None;
             // Keep the credentials negotiated by the successful initial
             // INVITE for method-specific requests in this exact dialog. BYE,
             // MESSAGE, and other listener-authenticated requests cannot reuse
@@ -4900,6 +5374,29 @@ fn selected_invite_auth_realm(selected: &crate::auth::ClientAuthHeader) -> Strin
         crate::auth::SipAuthScheme::Aka => "aka".to_string(),
         crate::auth::SipAuthScheme::Other(_) => "other".to_string(),
     }
+}
+
+fn digest_auth_retry_observation(
+    call_id: SessionId,
+    status_code: u16,
+    selected: &crate::auth::ClientAuthHeader,
+    body: Option<&[u8]>,
+) -> Option<AuthRetryObservation> {
+    let challenge = selected.digest_challenge.as_ref()?;
+    let qop = match challenge.qop.as_ref() {
+        Some(options) if body.is_some() && options.iter().any(|qop| qop == "auth-int") => {
+            Some("auth-int".to_string())
+        }
+        Some(options) if options.iter().any(|qop| qop == "auth") => Some("auth".to_string()),
+        _ => None,
+    };
+    Some(AuthRetryObservation {
+        call_id,
+        status_code,
+        realm: challenge.realm.clone(),
+        algorithm: challenge.algorithm,
+        qop,
+    })
 }
 
 fn redacted_invite_auth_error<E>(source: E) -> crate::errors::SessionError {
@@ -5190,6 +5687,82 @@ mod negotiated_audio_shape_tests {
 }
 
 #[cfg(test)]
+mod authenticated_offer_activation_order_tests {
+    #[test]
+    fn authenticated_sdp_retries_rebind_before_deferred_response_activation() {
+        let source = include_str!("actions.rs");
+        let authenticated = source
+            .split("Action::SendRequestWithAuth =>")
+            .nth(1)
+            .expect("authenticated request action");
+        for (method, next_method, send_call) in [
+            ("UPDATE", "INVITE", "send_update_with_auth_lane_owned"),
+            ("INVITE", "MESSAGE", "send_reinvite_with_auth_lane_owned"),
+        ] {
+            let branch = authenticated
+                .split(&format!("\"{method}\" => {{"))
+                .nth(1)
+                .and_then(|tail| tail.split(&format!("\"{next_method}\" => {{")).next())
+                .unwrap_or_else(|| panic!("authenticated {method} retry branch"));
+            let send = branch.find(send_call).expect("authenticated wire send");
+            let bind = branch
+                .find("bind_offer_answer_transaction")
+                .expect("pending offer transaction rebind");
+            let activate = branch
+                .find(".activate(lease, transaction_id.clone())")
+                .expect("tracked request activation");
+            assert!(
+                send < bind && bind < activate,
+                "authenticated {method} must bind the pending offer before activation can flush a deferred response"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reinvite_sdp_snapshot_tests {
+    use super::{commit_reinvite_local_sdp, rollback_reinvite_local_sdp, stage_reinvite_local_sdp};
+    use crate::session_store::state::SessionState;
+    use crate::state_table::{Role, SessionId};
+
+    #[test]
+    fn failed_reinvite_restores_the_preceding_stable_local_sdp() {
+        let mut session = SessionState::new(SessionId::new(), Role::UAC);
+        session.local_sdp = Some("stable".to_string());
+
+        stage_reinvite_local_sdp(&mut session, "hold-offer".to_string());
+        stage_reinvite_local_sdp(&mut session, "hold-retry".to_string());
+        rollback_reinvite_local_sdp(&mut session);
+
+        assert_eq!(session.local_sdp.as_deref(), Some("stable"));
+        assert!(session.stable_local_sdp_before_reinvite.is_none());
+    }
+
+    #[test]
+    fn successful_reinvite_commits_the_new_local_sdp() {
+        let mut session = SessionState::new(SessionId::new(), Role::UAC);
+        session.local_sdp = Some("stable".to_string());
+
+        stage_reinvite_local_sdp(&mut session, "resume-offer".to_string());
+        commit_reinvite_local_sdp(&mut session);
+
+        assert_eq!(session.local_sdp.as_deref(), Some("resume-offer"));
+        assert!(session.stable_local_sdp_before_reinvite.is_none());
+    }
+
+    #[test]
+    fn failed_reinvite_preserves_an_absent_stable_local_sdp() {
+        let mut session = SessionState::new(SessionId::new(), Role::UAC);
+
+        stage_reinvite_local_sdp(&mut session, "offer".to_string());
+        rollback_reinvite_local_sdp(&mut session);
+
+        assert!(session.local_sdp.is_none());
+        assert!(session.stable_local_sdp_before_reinvite.is_none());
+    }
+}
+
+#[cfg(test)]
 mod registration_lane_state_tests {
     use super::*;
     use crate::state_table::Role;
@@ -5328,6 +5901,7 @@ mod lane_owned_action_state_tests {
             codec: "PCMU".to_string(),
             sample_rate: 8_000,
             channels: 1,
+            fmtp: None,
         });
 
         retire_lane_owned_media_identity(&mut session);
@@ -5457,11 +6031,27 @@ mod lane_owned_action_state_tests {
 
         assert_eq!(
             production
-                .matches("release_lane_owned_resources(session, dialog_adapter, media_adapter)")
+                .matches("async fn release_lane_owned_resources(")
                 .count(),
-            2,
-            "ReleaseAllResources and CleanupResources must share one implementation"
+            1,
+            "resource cleanup must have exactly one implementation"
         );
+        for action in [
+            "Action::ReleaseAllResources =>",
+            "Action::CleanupResources =>",
+        ] {
+            let body = production
+                .split(action)
+                .nth(1)
+                .and_then(|tail| tail.split("\n        Action::").next())
+                .unwrap_or_else(|| panic!("missing {action}"));
+            assert!(
+                body.contains(
+                    "release_lane_owned_resources(session, dialog_adapter, media_adapter)"
+                ),
+                "{action} must delegate to the one cleanup implementation"
+            );
+        }
     }
 
     #[test]
@@ -6003,5 +6593,75 @@ mod invite_option_diagnostic_tests {
                 .map(|challenge| challenge.nonce.as_str()),
             Some("strong")
         );
+    }
+
+    #[test]
+    fn digest_retry_observation_covers_all_algorithms_and_both_qop_modes() {
+        use rvoip_auth_core::{DigestAlgorithm, DigestChallenge};
+
+        for algorithm in [
+            DigestAlgorithm::MD5,
+            DigestAlgorithm::MD5Sess,
+            DigestAlgorithm::SHA256,
+            DigestAlgorithm::SHA256Sess,
+            DigestAlgorithm::SHA512256,
+            DigestAlgorithm::SHA512256Sess,
+        ] {
+            let selected = crate::auth::ClientAuthHeader {
+                value: "Digest response=secret-hash".to_string(),
+                scheme: crate::auth::SipAuthScheme::Digest,
+                digest_challenge: Some(DigestChallenge {
+                    realm: "private-realm".to_string(),
+                    nonce: "private-nonce".to_string(),
+                    algorithm,
+                    qop: Some(vec!["auth".to_string(), "auth-int".to_string()]),
+                    opaque: None,
+                }),
+                stale: false,
+            };
+            let with_body = digest_auth_retry_observation(
+                SessionId("auth-observation".to_string()),
+                401,
+                &selected,
+                Some(b"v=0\r\n"),
+            )
+            .expect("Digest retry observation");
+            match with_body.clone().into_diagnostic() {
+                crate::api::events::DiagnosticEvent::CallAuthRetrying(details) => {
+                    assert_eq!(details.status_code, 401);
+                    assert_eq!(details.realm, "private-realm");
+                    assert_eq!(details.algorithm, algorithm);
+                    assert_eq!(details.qop.as_deref(), Some("auth-int"));
+                }
+                _ => panic!("unexpected authentication diagnostic"),
+            }
+            let event = with_body.event();
+            assert!(matches!(
+                event,
+                Event::CallAuthRetrying {
+                    status_code: 401,
+                    ref realm,
+                    ..
+                } if realm == "private-realm"
+            ));
+            let debug = format!("{event:?}");
+            assert!(!debug.contains("private-realm"));
+            assert!(!debug.contains("private-nonce"));
+            assert!(!debug.contains("secret-hash"));
+
+            let bodyless = digest_auth_retry_observation(
+                SessionId("auth-observation".to_string()),
+                407,
+                &selected,
+                None,
+            )
+            .expect("bodyless Digest retry observation");
+            assert!(matches!(
+                bodyless.into_diagnostic(),
+                crate::api::events::DiagnosticEvent::CallAuthRetrying(details)
+                    if details.status_code == 407
+                        && details.qop.as_deref() == Some("auth")
+            ));
+        }
     }
 }

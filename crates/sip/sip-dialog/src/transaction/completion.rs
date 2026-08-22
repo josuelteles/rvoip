@@ -153,6 +153,18 @@ impl RetainedClientTransactionCompletion {
         self._admission_owner = owner;
         self
     }
+
+    pub(crate) fn response_route_owner(&self) -> Option<usize> {
+        self._admission_owner
+            .as_ref()
+            .and_then(crate::transaction::manager::TransactionAdmissionOwner::response_route_owner)
+    }
+
+    pub(crate) fn admission_owner(
+        &self,
+    ) -> Option<crate::transaction::manager::TransactionAdmissionOwner> {
+        self._admission_owner.clone()
+    }
     pub(crate) fn deadline(&self) -> (Instant, u64) {
         (self.expires_at, self.version)
     }
@@ -187,7 +199,6 @@ impl RetainedClientTransactionCompletion {
         self.auth_challenge_request_uri.as_deref().cloned()
     }
 
-    #[cfg(test)]
     pub(crate) fn set_deadline(&mut self, expires_at: Instant, version: u64) {
         self.expires_at = expires_at;
         self.version = version;

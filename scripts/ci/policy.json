@@ -1,0 +1,284 @@
+{
+  "schema": "rvoip-ci-impact-policy-v1",
+  "max_shards": 4,
+  "target_shard_weight": 12,
+  "full_paths": [
+    "Cargo.toml",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    ".cargo/**",
+    "deny.toml"
+  ],
+  "scoped_full_paths": [
+    "Cargo.lock"
+  ],
+  "known_policy_paths": [
+    ".config/nextest.toml",
+    ".github/CODEOWNERS",
+    ".github/dependabot.yml",
+    ".github/pull_request_template.md",
+    ".github/release.yml",
+    ".github/workflows/**",
+    "scripts/ci/**",
+    "scripts/test_all.sh",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "README.md"
+  ],
+  "specialty_only_paths": [
+    "crates/sip/sip-proxy/tests/interop/scripts/**"
+  ],
+  "example_projects": [
+    "01-quickstart-p2p",
+    "02-softphone-audio",
+    "03-register-to-pbx",
+    "04-call-control",
+    "05-blind-transfer",
+    "06-attended-transfer",
+    "07-secure-call-srtp",
+    "08-tls-transport",
+    "09-ivr-server",
+    "10-call-center-b2bua",
+    "11-ai-harness-demo",
+    "12-customer-escalation-sip-webrtc",
+    "13-sip-to-amazon-connect",
+    "14-vapi-agent"
+  ],
+  "pr_example_projects": [
+    "01-quickstart-p2p",
+    "06-attended-transfer",
+    "11-ai-harness-demo"
+  ],
+  "pr_example_smoke_projects": [
+    "01-quickstart-p2p",
+    "02-softphone-audio",
+    "06-attended-transfer",
+    "07-secure-call-srtp",
+    "10-call-center-b2bua"
+  ],
+  "pr_sip_partitions": 3,
+  "pr_deferred_sip_targets": [
+    "audio_roundtrip_integration"
+  ],
+  "pr_sip_fixture_examples": {
+    "audio_roundtrip_integration": [
+      "stream_peer_audio_alice",
+      "stream_peer_audio_bob"
+    ],
+    "blind_transfer_integration": [
+      "stream_peer_blind_transfer_alice",
+      "stream_peer_blind_transfer_bob",
+      "stream_peer_blind_transfer_charlie"
+    ],
+    "bridge_roundtrip_integration": [
+      "unified_b2bua_bridge_alice",
+      "unified_b2bua_bridge_carol",
+      "unified_b2bua_bridge_peer"
+    ],
+    "cancel_integration": [
+      "regression_cancel_alice",
+      "regression_cancel_bob"
+    ],
+    "endpoint_audio_roundtrip_integration": [
+      "endpoint_audio_roundtrip"
+    ],
+    "glare_retry_integration": [
+      "regression_glare_retry_alice",
+      "regression_glare_retry_bob"
+    ],
+    "notify_send_integration": [
+      "regression_notify_send_alice",
+      "regression_notify_send_bob"
+    ],
+    "prack_integration": [
+      "regression_prack_alice",
+      "regression_prack_bob"
+    ],
+    "session_timer_failure_integration": [
+      "regression_session_timer_failure_alice",
+      "regression_session_timer_failure_bob"
+    ],
+    "session_timer_integration": [
+      "regression_session_timer_alice",
+      "regression_session_timer_bob"
+    ]
+  },
+  "pr_sip_target_weights": {
+    "endpoint_unified_auth": 90,
+    "invite_planner_retention_qualification": 20
+  },
+  "specialty_rules": [
+    {
+      "gate": "amazon-connect-aws-control",
+      "patterns": [
+        "Cargo.lock",
+        "crates/webrtc/rvoip-amazon-connect/**",
+        "examples/Cargo.lock",
+        "examples/13-sip-to-amazon-connect/**"
+      ]
+    },
+    {
+      "gate": "browser-smoke",
+      "patterns": [
+        "tests/browser-smoke/**",
+        "crates/uctp/rvoip-uctp/**",
+        "crates/uctp/rvoip-websocket/**",
+        "crates/uctp/rvoip-quic/**",
+        "crates/uctp/rvoip-webtransport/**"
+      ]
+    },
+    {
+      "gate": "codec-features-codec-core",
+      "patterns": [
+        "Cargo.lock",
+        "crates/media/codec-core/**",
+        "crates/media/media-core/src/codec/**",
+        "crates/media/media-core/src/rtp_processing/payload/**",
+        "crates/media/media-core/src/relay/controller/bridge.rs",
+        "crates/media/media-core/src/relay/controller/codec_runtime.rs",
+        "crates/media/media-core/src/relay/controller/dtmf_transmitter.rs",
+        "crates/media/media-core/Cargo.toml",
+        "crates/sip/rvoip-sip/src/adapters/media_adapter.rs",
+        "crates/sip/rvoip-sip/src/media_stream.rs",
+        "crates/sip/rvoip-sip/Cargo.toml",
+        "crates/foundation/rvoip-core/src/media_graph.rs",
+        "crates/foundation/rvoip-core/src/bridge/mod.rs",
+        "crates/foundation/rvoip-core/Cargo.toml"
+      ]
+    },
+    {
+      "gate": "codec-features-core",
+      "patterns": [
+        "Cargo.lock",
+        "crates/media/codec-core/**",
+        "crates/media/media-core/src/codec/**",
+        "crates/media/media-core/src/rtp_processing/payload/**",
+        "crates/media/media-core/src/relay/controller/bridge.rs",
+        "crates/media/media-core/src/relay/controller/codec_runtime.rs",
+        "crates/media/media-core/src/relay/controller/dtmf_transmitter.rs",
+        "crates/media/media-core/Cargo.toml",
+        "crates/sip/rvoip-sip/src/adapters/media_adapter.rs",
+        "crates/sip/rvoip-sip/src/media_stream.rs",
+        "crates/sip/rvoip-sip/Cargo.toml",
+        "crates/foundation/rvoip-core/src/media_graph.rs",
+        "crates/foundation/rvoip-core/src/bridge/mod.rs",
+        "crates/foundation/rvoip-core/Cargo.toml"
+      ]
+    },
+    {
+      "gate": "codec-features-media-core",
+      "patterns": [
+        "Cargo.lock",
+        "crates/media/codec-core/**",
+        "crates/media/media-core/src/codec/**",
+        "crates/media/media-core/src/rtp_processing/payload/**",
+        "crates/media/media-core/src/relay/controller/bridge.rs",
+        "crates/media/media-core/src/relay/controller/codec_runtime.rs",
+        "crates/media/media-core/src/relay/controller/dtmf_transmitter.rs",
+        "crates/media/media-core/Cargo.toml",
+        "crates/sip/rvoip-sip/src/adapters/media_adapter.rs",
+        "crates/sip/rvoip-sip/src/media_stream.rs",
+        "crates/sip/rvoip-sip/Cargo.toml",
+        "crates/foundation/rvoip-core/src/media_graph.rs",
+        "crates/foundation/rvoip-core/src/bridge/mod.rs",
+        "crates/foundation/rvoip-core/Cargo.toml"
+      ]
+    },
+    {
+      "gate": "codec-features-sip",
+      "patterns": [
+        "Cargo.lock",
+        "crates/media/codec-core/**",
+        "crates/media/media-core/src/codec/**",
+        "crates/media/media-core/src/rtp_processing/payload/**",
+        "crates/media/media-core/src/relay/controller/bridge.rs",
+        "crates/media/media-core/src/relay/controller/codec_runtime.rs",
+        "crates/media/media-core/src/relay/controller/dtmf_transmitter.rs",
+        "crates/media/media-core/Cargo.toml",
+        "crates/sip/rvoip-sip/src/adapters/media_adapter.rs",
+        "crates/sip/rvoip-sip/src/media_stream.rs",
+        "crates/sip/rvoip-sip/Cargo.toml",
+        "crates/foundation/rvoip-core/src/media_graph.rs",
+        "crates/foundation/rvoip-core/src/bridge/mod.rs",
+        "crates/foundation/rvoip-core/Cargo.toml"
+      ]
+    },
+    {
+      "gate": "examples",
+      "patterns": [
+        "examples/**",
+        "crates/rvoip/**",
+        "crates/sip/rvoip-sip/src/api/**"
+      ]
+    },
+    {
+      "gate": "examples-smoke",
+      "patterns": [
+        "examples/**"
+      ]
+    },
+    {
+      "gate": "infra-otel",
+      "patterns": [
+        "Cargo.lock",
+        "crates/foundation/infra-common/Cargo.toml",
+        "crates/foundation/infra-common/src/logging/**"
+      ]
+    },
+    {
+      "gate": "release-tooling",
+      "patterns": [
+        "crates/sip/sip-proxy/tests/interop/scripts/**",
+        "scripts/release.py",
+        "scripts/release.sh",
+        "scripts/release/**",
+        "scripts/release_*.py",
+        "scripts/test_release*.py",
+        "infra/release-runners/**",
+        "docs/RELEASING.md"
+      ]
+    },
+    {
+      "gate": "rtp-interop",
+      "patterns": [
+        "scripts/test_libsrtp_interop.sh",
+        "crates/media/rtp-core/src/security/**",
+        "crates/media/rtp-core/src/srtp/**",
+        "crates/media/rtp-core/tests/srtp_*.rs"
+      ]
+    },
+    {
+      "gate": "vcon-postgres",
+      "patterns": [
+        "crates/extensions/rvoip-vcon/**",
+        "crates/extensions/rvoip-vcon-postgres/**",
+        "crates/foundation/rvoip-core/src/vcon.rs",
+        "crates/foundation/rvoip-core/src/store/vcon_store.rs"
+      ]
+    },
+    {
+      "gate": "webrtc-runtime",
+      "patterns": [
+        "crates/webrtc/rvoip-rtc/**",
+        "crates/webrtc/rvoip-webrtc-stack/**",
+        "crates/webrtc/rvoip-webrtc/**"
+      ]
+    }
+  ],
+  "package_weights": {
+    "rvoip-sip": 14,
+    "rvoip-rtp-core": 12,
+    "rvoip-media-core": 10,
+    "rvoip-rtc": 10,
+    "rvoip-webrtc-stack": 9,
+    "rvoip-webrtc": 8,
+    "rvoip-core": 8,
+    "rvoip-codec-core": 7,
+    "rvoip-sip-dialog": 6,
+    "rvoip-sip-core": 5,
+    "rvoip-uctp": 5,
+    "rvoip-quic": 5
+  }
+}

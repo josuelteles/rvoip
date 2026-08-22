@@ -263,7 +263,7 @@ impl Drop for AbortOutboundDispatchTaskOnDrop {
         let abort = self
             .stage_claim
             .as_ref()
-            .map_or(true, |claim| claim.cancel_before_claim());
+            .is_none_or(|claim| claim.cancel_before_claim());
         if abort {
             self.handle.abort();
         }
@@ -435,6 +435,20 @@ pub enum SrtpSuitePolicy {
     FreeSwitchCompatible,
 }
 
+/// Validation policy for Base64 key material in RFC 4568 `a=crypto` lines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SdesBase64Mode {
+    /// Accept canonical Base64 and the interoperable form that omits only the
+    /// trailing `=` padding. All other malformed encodings and decoded-length
+    /// mismatches remain errors.
+    #[default]
+    Compatible,
+    /// Require the canonical RFC 4648 representation, including any trailing
+    /// `=` padding required by the selected SDES suite.
+    Strict,
+}
+
 impl SrtpSuitePolicy {
     /// Suites to advertise for this policy, in local preference order.
     pub fn suites(self) -> Vec<CryptoSuite> {
@@ -513,6 +527,44 @@ impl SipNatConfig {
         self.symmetric_rtp
             .validate()
             .map_err(|detail| SessionError::ConfigError(detail.to_string()))
+    }
+}
+
+/// Construction-time options that cannot be added to the literal-friendly
+/// [`Config`] struct without breaking existing 0.3.x callers.
+///
+/// The default preserves the existing bounded NAT policy and accepts canonical
+/// SDES Base64 plus the interoperable form that omits trailing padding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct SipRuntimeConfig {
+    nat: SipNatConfig,
+    sdes_base64_mode: SdesBase64Mode,
+}
+
+impl SipRuntimeConfig {
+    /// Replace the SIP/RTP NAT policy.
+    pub const fn with_nat(mut self, nat: SipNatConfig) -> Self {
+        self.nat = nat;
+        self
+    }
+
+    /// Select the inbound RFC 4568 SDES Base64 validation policy.
+    ///
+    /// Outbound SDP remains canonical in both modes.
+    pub const fn with_sdes_base64_mode(mut self, mode: SdesBase64Mode) -> Self {
+        self.sdes_base64_mode = mode;
+        self
+    }
+
+    /// Return the configured SIP/RTP NAT policy.
+    pub const fn nat(self) -> SipNatConfig {
+        self.nat
+    }
+
+    /// Return the configured inbound SDES Base64 policy.
+    pub const fn sdes_base64_mode(self) -> SdesBase64Mode {
+        self.sdes_base64_mode
     }
 }
 
@@ -2364,6 +2416,65 @@ pub struct Config {
     /// behaviour).
     pub media_public_addr: Option<SocketAddr>,
 
+    /// Enable AMR discontinuous transmission: replace silence with SID
+    /// (comfort-noise) frames and gaps rather than coding it as speech.
+    ///
+    /// Local sender policy, not a negotiated parameter. RFC 4867 defines no
+    /// fmtp for DTX and a sender may use it without telling the peer, because
+    /// every conforming AMR receiver must handle SID and NO_DATA frames
+    /// regardless. It therefore needs no offer/answer support and cannot be
+    /// refused by the far end — but it does change what goes on the wire, so
+    /// it is off unless a deployment asks for it.
+    ///
+    /// Ignored by every codec but AMR. Default: `false`.
+    ///
+    /// Private with a builder on purpose: `Config`'s constructible shape is
+    /// frozen for the 0.3.x line, and this is media policy, not signaling —
+    /// set it with [`Config::with_amr_dtx`].
+    amr_dtx: bool,
+
+    /// Let AMR sessions ask the peer to change rate on their own.
+    ///
+    /// A damper watches which modes actually arrive and, at most once every
+    /// five seconds, asks for one step toward a mode the peer is not using —
+    /// the shape rtpengine documents. Like [`Config::with_amr_dtx`] this is
+    /// local policy: a codec mode request is advice to the sender and needs
+    /// no negotiation.
+    ///
+    /// Off by default, and deliberately so: an automatic requester that damps
+    /// badly oscillates the peer's rate, which is worse than never asking.
+    /// Explicit `request_peer_codec_mode` calls always outrank it.
+    ///
+    /// Ignored by every codec but AMR. Default: `false`. Set with
+    /// [`Config::with_amr_auto_cmr`].
+    amr_auto_cmr: bool,
+
+    /// Restrict AMR to these modes, offered as RFC 4867 `mode-set`.
+    ///
+    /// Unlike [`Config::with_amr_dtx`] and [`Config::with_amr_auto_cmr`],
+    /// this one is negotiated rather than local policy. `mode-set` is
+    /// bi-directional
+    /// (RFC 4867 §8.1): one active set governs both directions, so naming
+    /// modes here constrains what the peer may send as well as what this
+    /// endpoint sends, and a conforming answerer must echo the set or reject
+    /// the payload type.
+    ///
+    /// Members are mode *indices*, not bitrates: 0..=7 for narrowband
+    /// (4.75 – 12.2 kbit/s) and 0..=8 for wideband (6.6 – 23.85 kbit/s).
+    /// Members outside the variant's range are dropped rather than offered,
+    /// since a set naming a mode the variant lacks is one a peer may reject
+    /// the whole payload type over. The rendered list is sorted and
+    /// deduplicated so an offer and its echo compare byte for byte.
+    ///
+    /// Empty or `None` offers no `mode-set` at all, which is the correct
+    /// thing for an endpoint that supports every mode — and is the default.
+    /// Set it when a deployment or a conformance run needs a specific rate,
+    /// such as pinning AMR-WB to 12.65 kbit/s with `Some(vec![2])`.
+    ///
+    /// Ignored by every codec but AMR. Default: `None`. Set with
+    /// [`Config::with_amr_mode_set`].
+    amr_mode_set: Option<Vec<u8>>,
+
     /// Media allocation behavior.
     ///
     /// Default: [`MediaMode::Enabled`], which allocates real media-core RTP
@@ -2470,10 +2581,10 @@ pub struct Config {
     /// Beta validation intentionally rejects audio payload types that
     /// media-core cannot encode/decode end to end. The advertised full-media
     /// set is limited to PCMU (`0`), PCMA (`8`), telephone-event (`101`),
-    /// comfort noise (`13`) when `comfort_noise_enabled = true`, and G.729
-    /// (`18`) when the `g729` feature is enabled. Opus (`111`) and G.722 (`9`)
-    /// remain post-beta or signaling-only experiments until media-core support
-    /// is wired through and covered by interop/perf tests.
+    /// comfort noise (`13`) when `comfort_noise_enabled = true`, G.729 (`18`)
+    /// when the `g729` feature is enabled, and Opus (`111`) when the `opus`
+    /// feature is enabled. G.722 (`9`) retains wire metadata support but is
+    /// rejected because no working encoder/decoder is implemented.
     ///
     /// Default: `vec![0, 8, 101]`.
     pub offered_codecs: Vec<u8>,
@@ -2864,6 +2975,9 @@ impl std::fmt::Debug for Config {
             )
             .field("offer_srtp", &self.offer_srtp)
             .field("srtp_required", &self.srtp_required)
+            .field("amr_dtx", &self.amr_dtx)
+            .field("amr_auto_cmr", &self.amr_auto_cmr)
+            .field("amr_mode_set", &self.amr_mode_set)
             .field("srtp_suite_count", &self.srtp_offered_suites.len())
             .field(
                 "media_public_address_configured",
@@ -3025,6 +3139,9 @@ impl Config {
             tls_insecure_skip_verify: false,
             offer_srtp: false,
             srtp_required: false,
+            amr_dtx: false,
+            amr_auto_cmr: false,
+            amr_mode_set: None,
             srtp_offered_suites: SrtpSuitePolicy::Default.suites(),
             srtp_keying: SrtpKeyingMode::Sdes,
             media_public_addr: None,
@@ -3145,6 +3262,9 @@ impl Config {
             tls_insecure_skip_verify: false,
             offer_srtp: false,
             srtp_required: false,
+            amr_dtx: false,
+            amr_auto_cmr: false,
+            amr_mode_set: None,
             srtp_offered_suites: SrtpSuitePolicy::Default.suites(),
             srtp_keying: SrtpKeyingMode::Sdes,
             media_public_addr: None,
@@ -3419,6 +3539,56 @@ impl Config {
     pub fn with_g729_annex_b(mut self, enabled: bool) -> Self {
         self.g729_annex_b = enabled;
         self
+    }
+
+    /// Enable AMR discontinuous transmission (silence as SID/comfort noise).
+    ///
+    /// Local sender policy, never negotiated — see the field's documentation
+    /// for the RFC 4867 reasoning. Ignored by every codec but AMR.
+    pub fn with_amr_dtx(mut self, enabled: bool) -> Self {
+        self.amr_dtx = enabled;
+        self
+    }
+
+    /// The configured AMR DTX policy.
+    pub fn amr_dtx(&self) -> bool {
+        self.amr_dtx
+    }
+
+    /// Let AMR sessions issue automatic damped codec-mode requests.
+    ///
+    /// Local policy; explicit `request_peer_codec_mode` calls always outrank
+    /// it. Ignored by every codec but AMR.
+    pub fn with_amr_auto_cmr(mut self, enabled: bool) -> Self {
+        self.amr_auto_cmr = enabled;
+        self
+    }
+
+    /// The configured automatic-CMR policy.
+    pub fn amr_auto_cmr(&self) -> bool {
+        self.amr_auto_cmr
+    }
+
+    /// Restrict AMR to these mode indices, offered as RFC 4867 `mode-set`.
+    ///
+    /// Bi-directional and negotiated: one active set governs both directions.
+    /// An empty slice clears the restriction (no `mode-set` is offered, the
+    /// correct shape for an endpoint supporting every mode). Out-of-range
+    /// members are dropped at offer time rather than offered; the rendered
+    /// list is sorted and deduplicated so an offer and its echo compare byte
+    /// for byte. Ignored by every codec but AMR.
+    pub fn with_amr_mode_set(mut self, modes: &[u8]) -> Self {
+        self.amr_mode_set = if modes.is_empty() {
+            None
+        } else {
+            Some(modes.to_vec())
+        };
+        self
+    }
+
+    /// The configured AMR `mode-set` restriction, if any.
+    pub fn amr_mode_set(&self) -> Option<&[u8]> {
+        self.amr_mode_set.as_deref()
     }
 
     /// Set the legacy incoming-call compatibility channel capacity.
@@ -4772,11 +4942,17 @@ fn validate_beta_media_codecs(offered_codecs: &[u8], comfort_noise_enabled: bool
         ));
     }
 
-    let supported_payloads = match (cfg!(feature = "g729"), cfg!(feature = "opus")) {
+    let base_payloads = match (cfg!(feature = "g729"), cfg!(feature = "opus")) {
         (true, true) => "0, 8, 18, 111, 101, and 13 when comfort_noise_enabled=true",
         (true, false) => "0, 8, 18, 101, and 13 when comfort_noise_enabled=true",
         (false, true) => "0, 8, 111, 101, and 13 when comfort_noise_enabled=true",
         (false, false) => "0, 8, 101, and 13 when comfort_noise_enabled=true",
+    };
+    let supported_payloads = match (cfg!(feature = "amr-wb"), cfg!(feature = "amr-nb")) {
+        (true, true) => format!("{base_payloads}, plus 104/105 (AMR-WB) and 106/107 (AMR-NB)"),
+        (true, false) => format!("{base_payloads}, plus 104/105 (AMR-WB)"),
+        (false, true) => format!("{base_payloads}, plus 106/107 (AMR-NB)"),
+        (false, false) => base_payloads.to_string(),
     };
     let mut has_audio = false;
     let mut seen = std::collections::BTreeSet::new();
@@ -4811,6 +4987,40 @@ fn validate_beta_media_codecs(offered_codecs: &[u8], comfort_noise_enabled: bool
                 {
                     return Err(SessionError::ConfigError(
                         "payload type 111 requires the rvoip-sip `opus` feature".to_string(),
+                    ));
+                }
+            }
+            // AMR, on the payload types this stack assigns in
+            // `adapters/media_adapter.rs`: 104/105 are AMR-WB
+            // (bandwidth-efficient / octet-aligned) and 106/107 are AMR-NB.
+            //
+            // Everything below this validation already handled them — the
+            // offer builder emits their rtpmap and fmtp, the answerer
+            // resolves them from `a=rtpmap`, and media-core builds an
+            // `AmrAdapter` for each — but the gate here had no arm for
+            // them, so the whole path was unreachable from `Config` and
+            // every AMR offer was rejected before a socket was opened.
+            104 | 105 => {
+                #[cfg(feature = "amr-wb")]
+                {
+                    has_audio = true;
+                }
+                #[cfg(not(feature = "amr-wb"))]
+                {
+                    return Err(SessionError::ConfigError(
+                        "payload types 104/105 require the rvoip-sip `amr-wb` feature".to_string(),
+                    ));
+                }
+            }
+            106 | 107 => {
+                #[cfg(feature = "amr-nb")]
+                {
+                    has_audio = true;
+                }
+                #[cfg(not(feature = "amr-nb"))]
+                {
+                    return Err(SessionError::ConfigError(
+                        "payload types 106/107 require the rvoip-sip `amr-nb` feature".to_string(),
                     ));
                 }
             }
@@ -7655,12 +7865,8 @@ pub(crate) async fn release_exact_local_resources(
     let dialog_result = dialog_adapter.cleanup_session_exact(&handle).await;
     let media_result = media_adapter.cleanup_session_exact(&handle).await;
     helpers.cleanup_session(handle.session_id()).await;
-    if let Err(error) = dialog_result {
-        return Err(error);
-    }
-    if let Err(error) = media_result {
-        return Err(error);
-    }
+    dialog_result?;
+    media_result?;
     let removal = match session_store.remove_quiesced_session_exact(&handle) {
         Ok(()) => Ok(()),
         Err(_)
@@ -7991,6 +8197,7 @@ impl UnifiedCoordinator {
                 "invite_2xx_response_cache": transaction_counts.invite_2xx_response_cache,
                 "invite_2xx_response_due_queue": transaction_counts.invite_2xx_response_due_queue,
                 "transaction_destinations": transaction_counts.transaction_destinations,
+                "orphaned_transaction_destinations": transaction_manager.orphaned_transaction_destination_count(),
                 "retired_client_transactions": transaction_manager.retired_client_transaction_count(),
                 "event_subscribers": transaction_counts.event_subscribers,
                 "subscriber_to_transactions": transaction_counts.subscriber_to_transactions,
@@ -8555,20 +8762,30 @@ impl UnifiedCoordinator {
     /// # }
     /// ```
     pub async fn new(config: Config) -> Result<Arc<Self>> {
-        Self::new_with_listener_auth_and_nat(
+        Self::new_with_listener_auth_and_runtime(
             config,
             crate::auth::SipListenerAuthPolicy::disabled(),
-            SipNatConfig::default(),
+            SipRuntimeConfig::default(),
         )
         .await
     }
 
     /// Create a coordinator with explicit SIP/RTP NAT behavior.
     pub async fn new_with_nat(config: Config, nat: SipNatConfig) -> Result<Arc<Self>> {
-        Self::new_with_listener_auth_and_nat(
+        Self::new_with_listener_auth_and_runtime(
             config,
             crate::auth::SipListenerAuthPolicy::disabled(),
-            nat,
+            SipRuntimeConfig::default().with_nat(nat),
+        )
+        .await
+    }
+
+    /// Create a coordinator with source-compatible construction-time options.
+    pub async fn new_with_runtime(config: Config, runtime: SipRuntimeConfig) -> Result<Arc<Self>> {
+        Self::new_with_listener_auth_and_runtime(
+            config,
+            crate::auth::SipListenerAuthPolicy::disabled(),
+            runtime,
         )
         .await
     }
@@ -8579,17 +8796,39 @@ impl UnifiedCoordinator {
         config: Config,
         listener_auth_policy: crate::auth::SipListenerAuthPolicy,
     ) -> Result<Arc<Self>> {
-        Self::new_with_listener_auth_and_nat(config, listener_auth_policy, SipNatConfig::default())
-            .await
+        Self::new_with_listener_auth_and_runtime(
+            config,
+            listener_auth_policy,
+            SipRuntimeConfig::default(),
+        )
+        .await
     }
 
     /// Create a coordinator with listener authentication and explicit NAT
     /// behavior installed before any signaling or media task starts.
     pub async fn new_with_listener_auth_and_nat(
-        mut config: Config,
+        config: Config,
         listener_auth_policy: crate::auth::SipListenerAuthPolicy,
         nat: SipNatConfig,
     ) -> Result<Arc<Self>> {
+        Self::new_with_listener_auth_and_runtime(
+            config,
+            listener_auth_policy,
+            SipRuntimeConfig::default().with_nat(nat),
+        )
+        .await
+    }
+
+    /// Create a coordinator with listener authentication and source-compatible
+    /// construction-time options installed before any signaling or media task
+    /// starts.
+    pub async fn new_with_listener_auth_and_runtime(
+        mut config: Config,
+        listener_auth_policy: crate::auth::SipListenerAuthPolicy,
+        runtime: SipRuntimeConfig,
+    ) -> Result<Arc<Self>> {
+        let nat = runtime.nat();
+        let sdes_base64_mode = runtime.sdes_base64_mode();
         // Treat an explicitly absent policy as the safe default too. Verbatim
         // tracing requires `trace_passthrough_for_development` or an explicit
         // `PassthroughRedactor`; absence is never a credential-leaking mode.
@@ -8829,8 +9068,14 @@ impl UnifiedCoordinator {
         // when configured. No-op without the `ice` feature. Reuses
         // `Config::stun_server` for server-reflexive candidates.
         media_adapter_inner.set_ice_policy(config.enable_ice, config.stun_server.clone());
+        media_adapter_inner.set_sdes_base64_mode(sdes_base64_mode);
         // Sprint 3 C1 — propagate Comfort Noise opt-in.
         media_adapter_inner.set_comfort_noise(config.comfort_noise_enabled);
+        // AMR discontinuous transmission — sender-side policy, nothing to
+        // negotiate (RFC 4867 defines no fmtp for DTX).
+        media_adapter_inner.set_amr_dtx(config.amr_dtx);
+        media_adapter_inner.set_amr_auto_cmr(config.amr_auto_cmr);
+        media_adapter_inner.set_amr_mode_set(config.amr_mode_set.clone());
         // Sprint 3.5 — propagate strict codec matching policy.
         media_adapter_inner.set_strict_codec_matching(config.strict_codec_matching);
         // NEXT_STEPS C2 — propagate the configured offered codec list.
@@ -9400,6 +9645,18 @@ impl UnifiedCoordinator {
             })
     }
 
+    /// Subscribe to bounded, opt-in security and renegotiation diagnostics.
+    ///
+    /// This stream carries details that cannot be added to the exhaustive
+    /// 0.3.x [`Event`](crate::api::events::Event) enum without breaking
+    /// existing pattern matches. Lagging receivers may lose observations;
+    /// diagnostics never block signaling or call-state transitions.
+    pub fn subscribe_diagnostics(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::api::events::DiagnosticEvent> {
+        self.app_event_publisher.subscribe_diagnostics()
+    }
+
     /// Return a typed, unfiltered [`EventReceiver`](crate::api::stream_peer::EventReceiver) that yields
     /// [`crate::api::events::Event`] values across all sessions and
     /// registration lifecycles owned by this coordinator.
@@ -9548,10 +9805,7 @@ impl UnifiedCoordinator {
             .state_machine
             .store
             .with_session(id, |session| {
-                (
-                    Some(session.call_state.clone()),
-                    session.media_security.clone(),
-                )
+                (Some(session.call_state), session.media_security.clone())
             })
             .unwrap_or((None, None));
         let mut snapshot = self.lifecycle.snapshot(id, state);
@@ -9575,7 +9829,7 @@ impl UnifiedCoordinator {
             .store
             .get_session_snapshot_exact(handle)
             .ok();
-        let state = current.as_ref().map(|session| session.call_state.clone());
+        let state = current.as_ref().map(|session| session.call_state);
         let media_security = current
             .as_ref()
             .and_then(|session| session.media_security.clone());
@@ -9868,7 +10122,7 @@ impl UnifiedCoordinator {
             .store
             .get_session_snapshot_exact(handle)
             .ok()
-            .map(|session| session.call_state.clone());
+            .map(|session| session.call_state);
         // Fence the per-session retained transaction before dispatch. A BYE
         // send can complete and retain its exact transaction, then lose the
         // final state-store revision race to a synchronous peer response. In
@@ -10011,7 +10265,7 @@ impl UnifiedCoordinator {
             .with_session(session_id, |session| {
                 (
                     session.role,
-                    session.call_state.clone(),
+                    session.call_state,
                     session.lifecycle_handle.clone(),
                     session.entered_state_at,
                 )
@@ -10139,7 +10393,7 @@ impl UnifiedCoordinator {
             .store
             .with_session(session_id, |session| {
                 (
-                    session.call_state.clone(),
+                    session.call_state,
                     session.lifecycle_handle.clone(),
                     session.entered_state_at,
                 )
@@ -10530,13 +10784,25 @@ impl UnifiedCoordinator {
         handle: &SessionRegistryHandle,
         slot: crate::state_machine::executor::PendingOptionsSlot,
     ) -> Result<()> {
-        let _bye_wait_owner = self.dialog_adapter.begin_outgoing_bye_wait_exact(handle)?;
+        // The state-machine task retains this same logical wait owner until
+        // it has either stopped before claim or completed the claimed
+        // wire-to-receipt handoff. If the public builder is cancelled after
+        // claim, its alias disappears but the detached task's alias prevents
+        // the last-owner cleanup from running just before a late receipt is
+        // published.
+        let bye_wait_owner = Arc::new(self.dialog_adapter.begin_outgoing_bye_wait_exact(handle)?);
         let generation_before_dispatch = self
             .dialog_adapter
             .outgoing_bye_generation_exact(handle)
             .unwrap_or(0);
         let dispatch = self
-            .dispatch_outbound_with_options_exact(handle, EventType::SendOutboundBye, slot)
+            .dispatch_outbound_with_options_and_input_exact(
+                handle,
+                EventType::SendOutboundBye,
+                slot,
+                None,
+                Some(Arc::clone(&bye_wait_owner)),
+            )
             .await
             .map(|_| ());
         let retained_new_bye = self
@@ -10616,6 +10882,32 @@ impl UnifiedCoordinator {
         self.media_adapter
             .bridge_rtp_sessions(session_a, session_b)
             .await
+    }
+
+    /// Ask the peer of `session` to change the codec mode it transmits.
+    ///
+    /// AMR only for now: this emits a Codec Mode Request (RFC 4867 §3.4.1) on
+    /// the next outgoing payload, asking the peer to switch to `mode_index`.
+    /// The peer may decline. Returns `Ok(false)` when the session has no
+    /// active media; other codecs accept the call and no-op.
+    ///
+    /// Confirm the peer honoured it with [`peer_codec_mode`](Self::peer_codec_mode).
+    pub async fn request_peer_codec_mode(
+        &self,
+        session: &SessionId,
+        mode_index: u8,
+    ) -> std::result::Result<bool, SessionError> {
+        self.media_adapter
+            .request_peer_codec_mode(session, mode_index)
+            .await
+    }
+
+    /// The codec mode of the last speech frame decoded from `session`'s peer,
+    /// or `None` when there is no media or the codec tracks no mode. For AMR
+    /// this is how a caller sees whether a
+    /// [`request_peer_codec_mode`](Self::request_peer_codec_mode) took effect.
+    pub async fn peer_codec_mode(&self, session: &SessionId) -> Option<u8> {
+        self.media_adapter.peer_codec_mode(session).await
     }
 
     /// Send a reliable 183 Session Progress with early-media SDP (RFC 3262).
@@ -11261,7 +11553,7 @@ impl UnifiedCoordinator {
     pub(crate) async fn negotiated_media_config(
         &self,
         session_id: &SessionId,
-    ) -> Result<Option<crate::session_store::state::NegotiatedConfig>> {
+    ) -> Result<Option<(crate::session_store::state::NegotiatedConfig, u8)>> {
         self.helpers.negotiated_media_config(session_id).await
     }
 
@@ -11696,6 +11988,9 @@ impl UnifiedCoordinator {
                 .sip_transaction_command_channel_capacity
                 .unwrap_or(Config::DEFAULT_SIP_TRANSACTION_COMMAND_CHANNEL_CAPACITY),
         );
+        transaction_manager.set_stateless_overload_retry_after_secs(
+            config.server_overload_retry_after_secs.unwrap_or(1),
+        );
         if let Some(max_burst) = config.sip_transaction_dispatch_priority_burst_max {
             transaction_manager.set_transaction_dispatch_priority_burst_max(max_burst);
         }
@@ -11911,7 +12206,7 @@ impl UnifiedCoordinator {
             .store
             .lifecycle_handle(session_id)
             .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
-        self.dispatch_outbound_with_options_and_input_exact(&handle, event, slot, None)
+        self.dispatch_outbound_with_options_and_input_exact(&handle, event, slot, None, None)
             .await
     }
 
@@ -11922,7 +12217,7 @@ impl UnifiedCoordinator {
         event: crate::state_table::EventType,
         slot: crate::state_machine::executor::PendingOptionsSlot,
     ) -> Result<crate::state_machine::executor::ProcessEventResult> {
-        self.dispatch_outbound_with_options_and_input_exact(handle, event, slot, None)
+        self.dispatch_outbound_with_options_and_input_exact(handle, event, slot, None, None)
             .await
     }
 
@@ -11997,6 +12292,7 @@ impl UnifiedCoordinator {
             crate::state_table::EventType::SendOutboundInvite,
             crate::state_machine::executor::PendingOptionsSlot::Invite(snapshot),
             Some(input),
+            None,
         )
         .await
     }
@@ -12007,6 +12303,7 @@ impl UnifiedCoordinator {
         event: crate::state_table::EventType,
         slot: crate::state_machine::executor::PendingOptionsSlot,
         outbound_session: Option<crate::state_machine::executor::OutboundSessionStateInput>,
+        task_bye_wait_owner: Option<Arc<crate::adapters::dialog_adapter::OutgoingByeWaitOwner>>,
     ) -> Result<crate::state_machine::executor::ProcessEventResult> {
         let state_machine = Arc::clone(&self.helpers.state_machine);
         let task_handle = handle.clone();
@@ -12016,7 +12313,7 @@ impl UnifiedCoordinator {
         let task_claim = Arc::clone(&stage_claim);
         let task = AbortOutboundDispatchTaskOnDrop::with_stage_claim(
             tokio::spawn(async move {
-                state_machine
+                let result = state_machine
                     .process_event_with_staged_options_exact(
                         &task_handle,
                         event,
@@ -12024,7 +12321,12 @@ impl UnifiedCoordinator {
                         task_claim,
                         outbound_session,
                     )
-                    .await
+                    .await;
+                // Keep a claimed BYE's cancellation owner alive through the
+                // complete state-machine action, including publication of its
+                // exact transaction receipt.
+                drop(task_bye_wait_owner);
+                result
             }),
             stage_claim,
         );
