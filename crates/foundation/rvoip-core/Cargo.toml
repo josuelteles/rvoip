@@ -26,7 +26,7 @@ rvoip-infra-common.workspace = true
 # media) must be able to build without linking libopus. Without the `opus`
 # feature, `MediaGraph`'s Opus codec path still compiles and cleanly errors
 # at runtime instead of encoding/decoding.
-rvoip-media-core.workspace = true
+rvoip-media-core = { workspace = true, features = ["opus"] }
 # V2.A — the pure-type/trait surface that consumer crates depend on.
 # rvoip-core re-exports from it so existing `use rvoip_core::ids::*`
 # and `use rvoip_core::identity::*` call sites keep working unchanged.

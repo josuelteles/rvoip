@@ -6801,13 +6801,6 @@ impl DialogManager {
                                     ),
                                 });
                             }
-                            warn!(error=%crate::transaction::safe_diagnostics::SafeTransactionError::new(&e), status, "Failed to send automatic ACK for INVITE 2xx");
-                            return Err(crate::errors::DialogError::TransactionError {
-                                message: safe_operation_failure(
-                                    "automatic_invite_2xx_ack",
-                                    "transaction_error",
-                                ),
-                            });
                         }
                     }
                 }
