@@ -2768,6 +2768,26 @@ mod tests {
             .unwrap_or(false)
     }
 
+    #[test]
+    fn udp_wire_size_projection_includes_automatic_rport() {
+        let request = SimpleRequestBuilder::new(Method::Options, "sip:192.0.2.200:5060")
+            .unwrap()
+            .from("User", "sip:1001@192.0.2.200", Some("from-tag"))
+            .to("Peer", "sip:1002@192.0.2.200", None)
+            .call_id("udp-wire-size-rport-test")
+            .cseq(1)
+            .via("192.0.2.10:5071", "UDP", Some("z9hG4bK-wire-size"))
+            .max_forwards(70)
+            .header(TypedHeader::ContentLength(ContentLength::new(0)))
+            .build();
+        let size_without_rport = Message::Request(request.clone()).to_bytes().len();
+
+        let projected_size = super::super::client_request_wire_size_for_transport(&request, "UDP");
+
+        assert_eq!(projected_size, size_without_rport + ";rport".len());
+        assert!(!top_via_has_rport(&request));
+    }
+
     #[tokio::test]
     async fn client_transaction_preserves_tls_register_via() -> Result<()> {
         let request = RegisterBuilder::new()
@@ -2789,7 +2809,7 @@ mod tests {
         assert!(top_via_branch(&sent_request)
             .as_deref()
             .is_some_and(|branch| branch.starts_with(RFC3261_BRANCH_MAGIC_COOKIE)));
-        assert!(top_via_has_rport(&sent_request));
+        assert!(!top_via_has_rport(&sent_request));
         Ok(())
     }
 
@@ -2809,7 +2829,7 @@ mod tests {
 
         assert_eq!(sent_request.first_via_transport(), Some("TLS"));
         assert_eq!(top_via_port(&sent_request), Some(5071));
-        assert!(top_via_has_rport(&sent_request));
+        assert!(!top_via_has_rport(&sent_request));
         Ok(())
     }
 
@@ -2833,7 +2853,7 @@ mod tests {
 
         assert_eq!(sent_request.first_via_transport(), Some("TLS"));
         assert_eq!(top_via_port(&sent_request), Some(5071));
-        assert!(top_via_has_rport(&sent_request));
+        assert!(!top_via_has_rport(&sent_request));
         Ok(())
     }
 
@@ -2859,7 +2879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_transaction_adds_branch_and_rport_without_changing_tls_via() -> Result<()> {
+    async fn client_transaction_adds_branch_without_rport_to_tls_via() -> Result<()> {
         let request =
             SimpleRequestBuilder::new(Method::Options, "sips:192.0.2.200:5061;transport=tls")
                 .map_err(|e| Error::Other(e.to_string()))?
@@ -2879,6 +2899,152 @@ mod tests {
         assert!(top_via_branch(&sent_request)
             .as_deref()
             .is_some_and(|branch| branch.starts_with(RFC3261_BRANCH_MAGIC_COOKIE)));
+        assert!(!top_via_has_rport(&sent_request));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_transaction_omits_automatic_rport_on_connection_transports() -> Result<()> {
+        for (transport, request_uri, identity_uri) in [
+            (
+                "TCP",
+                "sip:192.0.2.200:5060;transport=tcp",
+                "sip:1001@192.0.2.200",
+            ),
+            (
+                "WS",
+                "sip:192.0.2.200:5060;transport=ws",
+                "sip:1001@192.0.2.200",
+            ),
+            (
+                "WSS",
+                "sips:192.0.2.200:5061;transport=wss",
+                "sips:1001@192.0.2.200",
+            ),
+        ] {
+            let request = SimpleRequestBuilder::new(Method::Options, request_uri)
+                .map_err(|e| Error::Other(e.to_string()))?
+                .from("User", identity_uri, Some("from-tag"))
+                .to("Peer", identity_uri, None)
+                .call_id(&format!(
+                    "{}-options-rport-test",
+                    transport.to_ascii_lowercase()
+                ))
+                .cseq(1)
+                .via("192.0.2.10:5071", transport, None)
+                .max_forwards(70)
+                .header(TypedHeader::ContentLength(ContentLength::new(0)))
+                .build();
+
+            let sent_request = send_through_client_transaction(request).await?;
+
+            assert_eq!(sent_request.first_via_transport(), Some(transport));
+            assert!(top_via_branch(&sent_request).is_some());
+            assert!(!top_via_has_rport(&sent_request));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_transaction_preserves_explicit_rport_on_tcp_without_duplication() -> Result<()>
+    {
+        let via = Via::new(
+            "SIP",
+            "2.0",
+            "TCP",
+            "192.0.2.10",
+            Some(5071),
+            vec![Param::branch("z9hG4bK-explicit-rport"), Param::Rport(None)],
+        )?;
+        let request =
+            SimpleRequestBuilder::new(Method::Options, "sip:192.0.2.200:5060;transport=tcp")
+                .map_err(|e| Error::Other(e.to_string()))?
+                .from("User", "sip:1001@192.0.2.200", Some("from-tag"))
+                .to("Peer", "sip:1002@192.0.2.200", None)
+                .call_id("tcp-explicit-rport-test")
+                .cseq(1)
+                .header(TypedHeader::Via(via))
+                .max_forwards(70)
+                .header(TypedHeader::ContentLength(ContentLength::new(0)))
+                .build();
+
+        let sent_request = send_through_client_transaction(request).await?;
+        let sent_via = sent_request.first_via().expect("sent request has Via");
+        let rport_count = sent_via
+            .headers()
+            .iter()
+            .flat_map(|entry| &entry.params)
+            .filter(|param| match param {
+                Param::Rport(_) => true,
+                Param::Other(name, _) => name.eq_ignore_ascii_case("rport"),
+                _ => false,
+            })
+            .count();
+
+        assert_eq!(sent_request.first_via_transport(), Some("TCP"));
+        assert_eq!(rport_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_transaction_creates_tcp_via_without_rport_when_missing() -> Result<()> {
+        let request =
+            SimpleRequestBuilder::new(Method::Options, "sip:192.0.2.200:5060;transport=tcp")
+                .map_err(|e| Error::Other(e.to_string()))?
+                .from("User", "sip:1001@192.0.2.200", Some("from-tag"))
+                .to("Peer", "sip:1002@192.0.2.200", None)
+                .call_id("tcp-missing-via-test")
+                .cseq(1)
+                .max_forwards(70)
+                .header(TypedHeader::ContentLength(ContentLength::new(0)))
+                .build();
+
+        let sent_request = send_through_client_transaction(request).await?;
+
+        assert_eq!(sent_request.first_via_transport(), Some("TCP"));
+        assert!(top_via_branch(&sent_request).is_some());
+        assert!(!top_via_has_rport(&sent_request));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_transaction_applies_rport_after_final_transport_selection() -> Result<()> {
+        let request =
+            SimpleRequestBuilder::new(Method::Options, "sip:192.0.2.200:5060;transport=tcp")
+                .map_err(|e| Error::Other(e.to_string()))?
+                .from("User", "sip:1001@192.0.2.200", Some("from-tag"))
+                .to("Peer", "sip:1002@192.0.2.200", None)
+                .call_id("final-transport-rport-test")
+                .cseq(1)
+                .via("192.0.2.10:5071", "UDP", None)
+                .max_forwards(70)
+                .header(TypedHeader::ContentLength(ContentLength::new(0)))
+                .build();
+
+        let sent_request = send_through_client_transaction(request).await?;
+
+        assert_eq!(sent_request.first_via_transport(), Some("TCP"));
+        assert!(top_via_branch(&sent_request).is_some());
+        assert!(!top_via_has_rport(&sent_request));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_transaction_creates_udp_via_with_rport_when_missing() -> Result<()> {
+        let request = SimpleRequestBuilder::new(Method::Options, "sip:192.0.2.200:5060")
+            .map_err(|e| Error::Other(e.to_string()))?
+            .from("User", "sip:1001@192.0.2.200", Some("from-tag"))
+            .to("Peer", "sip:1002@192.0.2.200", None)
+            .call_id("udp-missing-via-test")
+            .cseq(1)
+            .max_forwards(70)
+            .header(TypedHeader::ContentLength(ContentLength::new(0)))
+            .build();
+
+        let sent_request = send_through_client_transaction(request).await?;
+
+        assert_eq!(sent_request.first_via_transport(), Some("UDP"));
+        assert!(top_via_branch(&sent_request).is_some());
         assert!(top_via_has_rport(&sent_request));
         Ok(())
     }
@@ -4425,7 +4591,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_stream_invite_accepts_original_f1_and_rejects_coaddressed_f2() -> Result<()> {
+    async fn retired_stream_invite_accepts_alternate_flow_and_retains_original_route() -> Result<()>
+    {
         use rvoip_sip_core::builder::SimpleResponseBuilder;
 
         let (original_flow, later_flow) = two_live_tcp_flow_ids().await;
@@ -4458,36 +4625,8 @@ mod tests {
         manager
             .handle_transport_event(dispatch_stream_event_from(
                 Message::Response(response.clone()),
-                destination,
+                "198.51.100.40:5090".parse().unwrap(),
                 later_flow,
-            ))
-            .await?;
-        let wrong_flow_deadline = tokio::time::Instant::now() + Duration::from_millis(75);
-        loop {
-            let remaining =
-                wrong_flow_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Some(TransactionEvent::SuccessResponse { transaction_id, .. }))
-                    if transaction_id == transaction =>
-                {
-                    panic!("co-addressed replacement flow authenticated a retired response")
-                }
-                Ok(Some(TransactionEvent::StrayResponse { .. })) => {
-                    panic!("known retired route was reported as stray")
-                }
-                Ok(Some(_)) => continue,
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        manager
-            .handle_transport_event(dispatch_stream_event_from(
-                Message::Response(response),
-                destination,
-                original_flow,
             ))
             .await?;
         tokio::time::timeout(Duration::from_millis(500), async {
@@ -4503,11 +4642,17 @@ mod tests {
             }
         })
         .await
-        .expect("original stream flow response was not delivered");
+        .expect("alternate reliable-flow response was not delivered");
+        let retained = manager
+            .transaction_route(&transaction)
+            .await
+            .expect("retired transaction route");
+        assert_eq!(retained.destination, destination);
+        assert_eq!(retained.flow_id, Some(original_flow));
         assert_eq!(
             transport.resolve_calls(),
             0,
-            "response authentication must not resolve a replacement flow by address"
+            "response authentication must not rewrite or resolve the outbound route"
         );
 
         manager.shutdown().await;
@@ -5020,6 +5165,8 @@ mod tests {
             &request,
             &completion,
             route.clone(),
+            super::super::ClientResponseViaIdentity::from_request(&request)
+                .expect("test request top Via"),
             Instant::now() + Duration::from_secs(90),
             7,
             None,
@@ -5061,8 +5208,8 @@ mod tests {
             request_wire: bytes::Bytes::from_static(b"not a SIP request"),
             completion: malformed_completion,
             route: route.clone(),
+            response_via: retired.response_via.clone(),
             expires_at: Instant::now() + Duration::from_secs(90),
-            deadline_version: 8,
         };
         assert_eq!(malformed.route, route);
         assert!(malformed.original_request().is_err());
@@ -8325,7 +8472,7 @@ mod tests {
         assert!(retired.has_completion_wire());
         assert!(retired.shares_wire_allocation());
         assert_eq!(retired.completion.last_response()?, Some(response.clone()));
-        let (expires_at, version) = (retired.expires_at, retired.deadline_version);
+        let (expires_at, version) = (retired.expires_at, retired.deadline_version());
         drop(route_entry);
 
         {

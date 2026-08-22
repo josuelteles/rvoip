@@ -158,12 +158,14 @@ mod functions;
 ///   Transport Layer
 /// ```
 mod handlers;
+mod response_route;
 #[cfg(test)]
 mod tests;
 mod types;
 pub mod utils;
 
 pub use handlers::*;
+pub(crate) use response_route::ClientResponseViaIdentity;
 pub use types::*;
 pub use utils::*;
 
@@ -484,8 +486,8 @@ pub(crate) struct RetiredClientTransaction {
     request_wire: bytes::Bytes,
     completion: RetainedClientTransactionCompletion,
     route: TransportRoute,
+    response_via: Arc<ClientResponseViaIdentity>,
     expires_at: Instant,
-    deadline_version: u64,
 }
 
 impl RetiredClientTransaction {
@@ -493,6 +495,7 @@ impl RetiredClientTransaction {
         request: &Request,
         completion: &ClientTransactionCompletion,
         route: TransportRoute,
+        response_via: ClientResponseViaIdentity,
         expires_at: Instant,
         deadline_version: u64,
         admission_owner: Option<TransactionAdmissionOwner>,
@@ -514,8 +517,8 @@ impl RetiredClientTransaction {
             request_wire,
             completion,
             route,
+            response_via: Arc::new(response_via),
             expires_at,
-            deadline_version,
         }
     }
 
@@ -526,6 +529,10 @@ impl RetiredClientTransaction {
                 "retired client request wire image parsed as a response".into(),
             )),
         }
+    }
+
+    fn deadline_version(&self) -> u64 {
+        self.completion.deadline().1
     }
 
     #[cfg(test)]
@@ -961,7 +968,7 @@ fn process_retained_client_deadline_batch(
         if transaction_destinations
             .remove_if(deadline.transaction_id.as_ref(), |_, state| {
                 state.retired().is_some_and(|retired| {
-                    retired.deadline_version == deadline.version
+                    retired.deadline_version() == deadline.version
                         && retired.expires_at == deadline.expires_at
                 })
             })
@@ -1039,6 +1046,7 @@ async fn run_retained_client_deadline_worker(
 pub(crate) enum ClientResponseRouteState {
     Active {
         route: TransportRoute,
+        response_via: Arc<ClientResponseViaIdentity>,
         /// Allocation identity of the client transaction data that installed
         /// this route. The retained completion's admission owner remembers
         /// the same identity, so retirement does not duplicate this word.
@@ -1048,8 +1056,25 @@ pub(crate) enum ClientResponseRouteState {
 }
 
 impl ClientResponseRouteState {
+    #[cfg(test)]
     pub(crate) fn active(route: TransportRoute, owner: usize) -> Self {
-        Self::Active { route, owner }
+        Self::Active {
+            route,
+            response_via: Arc::new(ClientResponseViaIdentity::for_test()),
+            owner,
+        }
+    }
+
+    fn active_with_via(
+        route: TransportRoute,
+        response_via: ClientResponseViaIdentity,
+        owner: usize,
+    ) -> Self {
+        Self::Active {
+            route,
+            response_via: Arc::new(response_via),
+            owner,
+        }
     }
 
     fn route(&self) -> &TransportRoute {
@@ -1259,7 +1284,23 @@ fn normalize_top_client_via(request: &mut Request, branch: &str) -> bool {
                 .retain(|param| !matches!(param, Param::Branch(_)));
             top_via.params.push(Param::branch(branch.to_string()));
 
-            if !top_via.params.iter().any(is_rport_param) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn add_udp_rport_to_top_client_via(request: &mut Request) -> bool {
+    for header in &mut request.headers {
+        if let TypedHeader::Via(via) = header {
+            let Some(top_via) = via.0.first_mut() else {
+                return false;
+            };
+
+            if top_via.transport().eq_ignore_ascii_case("UDP")
+                && !top_via.params.iter().any(is_rport_param)
+            {
                 top_via.params.push(Param::Rport(None));
             }
 
@@ -1268,6 +1309,17 @@ fn normalize_top_client_via(request: &mut Request, branch: &str) -> bool {
     }
 
     false
+}
+
+fn apply_client_via_transport(request: &mut Request, via_transport: &str) {
+    crate::transaction::utils::set_top_via_protocol(request, via_transport);
+    add_udp_rport_to_top_client_via(request);
+}
+
+fn client_request_wire_size_for_transport(request: &Request, via_transport: &str) -> usize {
+    let mut wire_request = request.clone();
+    apply_client_via_transport(&mut wire_request, via_transport);
+    Message::Request(wire_request).to_bytes().len()
 }
 
 fn sip_diagnostics_enabled() -> bool {
@@ -5810,13 +5862,13 @@ impl TransactionManager {
                 return Some(read(state.value()));
             }
             let expires_at = retired.expires_at;
-            let deadline_version = retired.deadline_version;
+            let deadline_version = retired.deadline_version();
             drop(state);
             if self
                 .transaction_destinations
                 .remove_if(transaction_id, |_, current| {
                     current.retired().is_some_and(|retired| {
-                        retired.deadline_version == deadline_version
+                        retired.deadline_version() == deadline_version
                             && retired.expires_at == expires_at
                             && retired.expires_at <= Instant::now()
                     })
@@ -6199,6 +6251,13 @@ impl TransactionManager {
         }
 
         let exact_route = transaction.data().request_route.lock().await.clone();
+        let Some(response_via) =
+            ClientResponseViaIdentity::from_request(transaction.data().request.as_ref())
+        else {
+            self.transaction_destinations
+                .remove_if(transaction_id, |_, state| state.is_active());
+            return false;
+        };
         let expires_at = Instant::now() + RETIRED_CLIENT_TRANSACTION_TTL;
         // Reserve a unique deadline identity, then serialize the request and
         // exact completion together outside the shared deadline critical
@@ -6214,6 +6273,7 @@ impl TransactionManager {
             transaction.data().request.as_ref(),
             transaction.data().completion.as_ref(),
             exact_route,
+            response_via,
             expires_at,
             deadline_version,
             transaction.data().transaction_admission_owner(),
@@ -6425,9 +6485,12 @@ impl TransactionManager {
         let ClientResponseRouteState::Retired(retired) = state.value_mut() else {
             return false;
         };
-        deadlines.unschedule(transaction_id, retired.expires_at, retired.deadline_version);
+        deadlines.unschedule(
+            transaction_id,
+            retired.expires_at,
+            retired.deadline_version(),
+        );
         retired.expires_at = expires_at;
-        retired.deadline_version = deadline_version;
         retired
             .completion
             .set_deadline(expires_at, deadline_version);
@@ -7456,9 +7519,9 @@ impl TransactionManager {
             tracing::trace!("CANCEL request detected - not adding Via header");
         } else {
             // For non-CANCEL methods, preserve the request builder's selected
-            // Via transport and sent-by address. The transaction layer owns only
-            // the branch/rport normalization needed for transaction matching and
-            // symmetric response routing.
+            // Via transport and sent-by address. The transaction layer owns the
+            // branch normalization needed for transaction matching. Automatic
+            // UDP rport insertion happens after final transport selection below.
             if !normalize_top_client_via(&mut modified_request, &branch) {
                 let local_addr = self.transport.local_addr().map_err(|e| {
                     Error::transport_error(e, "Failed to get local address for Via header")
@@ -7499,12 +7562,17 @@ impl TransactionManager {
         if request_route.authority.is_none() {
             request_route.authority = derived_route.authority;
         }
-        if request_route.transport_type == Some(TransportType::Udp)
-            && Message::Request(modified_request.clone()).to_bytes().len()
-                > self.transport.max_safe_message_size()
-            && self.transport.supports_tcp()
-        {
-            request_route.transport_type = Some(TransportType::Tcp);
+        if request_route.transport_type == Some(TransportType::Udp) {
+            let udp_wire_size = if request.method() == Method::Cancel {
+                Message::Request(modified_request.clone()).to_bytes().len()
+            } else {
+                client_request_wire_size_for_transport(&modified_request, "UDP")
+            };
+            if udp_wire_size > self.transport.max_safe_message_size()
+                && self.transport.supports_tcp()
+            {
+                request_route.transport_type = Some(TransportType::Tcp);
+            }
         }
         if request.method() != Method::Cancel {
             let via_transport = match request_route.transport_type {
@@ -7515,10 +7583,12 @@ impl TransactionManager {
                 Some(TransportType::Wss) => "WSS",
                 None => transport_token_for_request(&modified_request),
             };
-            crate::transaction::utils::set_top_via_protocol(&mut modified_request, via_transport);
+            apply_client_via_transport(&mut modified_request, via_transport);
         }
 
         rvoip_sip_core::validation::validate_wire_request(&modified_request)?;
+        let response_via = ClientResponseViaIdentity::from_request(&modified_request)
+            .ok_or_else(|| Error::Other("outbound client request has no top Via".into()))?;
         let timer_settings =
             timer_settings_override.or_else(|| self.timer_settings_for_request(&modified_request));
 
@@ -7700,14 +7770,18 @@ impl TransactionManager {
         self.client_transactions.insert(key.clone(), transaction);
         if let Some(previous) = self.transaction_destinations.insert(
             shared_retention_key,
-            ClientResponseRouteState::active(request_route, response_route_owner),
+            ClientResponseRouteState::active_with_via(
+                request_route,
+                response_via,
+                response_route_owner,
+            ),
         ) {
             if let Some(retired) = previous.retired() {
                 self.decrement_retired_client_transaction_count();
                 self.unschedule_retired_client_deadline(
                     &key,
                     retired.expires_at,
-                    retired.deadline_version,
+                    retired.deadline_version(),
                 );
             }
         }
@@ -8984,7 +9058,7 @@ impl TransactionManager {
                 .transaction_destinations
                 .remove_if(deadline.transaction_id.as_ref(), |_, state| {
                     state.retired().is_some_and(|retired| {
-                        retired.deadline_version == deadline.version
+                        retired.deadline_version() == deadline.version
                             && retired.expires_at == deadline.expires_at
                     })
                 })

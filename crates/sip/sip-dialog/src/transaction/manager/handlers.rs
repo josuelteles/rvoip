@@ -41,56 +41,9 @@ use crate::transaction::state::TransactionLifecycle;
 use crate::transaction::{SipRequestAuthorization, SipRequestIngressContext, SipRequestRejection};
 use crate::transaction::{TransactionEvent, TransactionKey, TransactionKind, TransactionState};
 
+use super::response_route::client_response_route_matches;
 use super::types::*;
 use super::TransactionManager;
-
-fn bind_client_response_route(
-    expected: &TransportRoute,
-    source: SocketAddr,
-    transport_type: TransportType,
-    ingress_flow_id: Option<TransportFlowId>,
-) -> Option<TransportRoute> {
-    if expected.destination != source || expected.transport_type != Some(transport_type) {
-        return None;
-    }
-
-    let mut bound = expected.clone();
-    match transport_type {
-        TransportType::Udp => {
-            if ingress_flow_id.is_some() {
-                return None;
-            }
-            bound.flow_id = None;
-        }
-        TransportType::Tcp | TransportType::Tls | TransportType::Ws | TransportType::Wss => {
-            // A stream response is authenticated only by the opaque flow that
-            // carried the original request. Resolving by address here could
-            // bind a retired transaction to a later co-addressed connection.
-            let expected_flow_id = expected.flow_id?;
-            if ingress_flow_id != Some(expected_flow_id) {
-                return None;
-            }
-            bound.flow_id = Some(expected_flow_id);
-        }
-    }
-    Some(bound)
-}
-
-fn server_request_route_matches(
-    expected_source: SocketAddr,
-    expected_response_route: &TransportRoute,
-    ingress_context: &SipRequestIngressContext,
-) -> bool {
-    let actual = ingress_context.response_route();
-    expected_source == actual.destination
-        && expected_response_route.transport_type == actual.transport_type
-        && expected_response_route.flow_id == actual.flow_id
-}
-
-fn top_via_sent_by_matches(invite: &Request, cancel: &Request) -> bool {
-    super::NormalizedViaSentBy::from_request(invite)
-        == super::NormalizedViaSentBy::from_request(cancel)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientResponseRouteAuthentication {
@@ -152,45 +105,11 @@ impl TransactionManager {
             .then(|| registration.transaction_id.clone())
     }
 
-    async fn legacy_server_transaction_matches(
-        &self,
-        transaction_id: &TransactionKey,
-        request: &Request,
-        ingress_context: &SipRequestIngressContext,
-    ) -> bool {
-        let route_matches =
-            self.server_transactions
-                .get(transaction_id)
-                .is_some_and(|transaction| {
-                    let data = transaction.value().data();
-                    server_request_route_matches(
-                        data.remote_addr,
-                        &data.response_route,
-                        ingress_context,
-                    )
-                });
-        if !route_matches {
-            return false;
-        }
-        match self.original_request(transaction_id).await {
-            Ok(Some(original)) => top_via_sent_by_matches(&original, request),
-            Ok(None) | Err(_) => false,
-        }
-    }
-
     async fn matching_server_transaction_id(
         &self,
         match_key: &super::ServerTransactionMatchKey,
-        wire_key: &TransactionKey,
-        request: &Request,
-        ingress_context: &SipRequestIngressContext,
     ) -> Option<TransactionKey> {
-        if let Some(transaction_id) = self.registered_server_transaction_id(match_key).await {
-            return Some(transaction_id);
-        }
-        self.legacy_server_transaction_matches(wire_key, request, ingress_context)
-            .await
-            .then(|| wire_key.clone())
+        self.registered_server_transaction_id(match_key).await
     }
 
     async fn authorize_unmatched_cancel_without_challenge(
@@ -485,26 +404,31 @@ impl TransactionManager {
     async fn authenticate_client_response_route(
         &self,
         transaction_id: &TransactionKey,
+        response: &Response,
         source: SocketAddr,
         transport_type: TransportType,
         ingress_flow_id: Option<TransportFlowId>,
     ) -> ClientResponseRouteAuthentication {
-        let Some(mut state) = self.transaction_destinations.get_mut(transaction_id) else {
+        let Some(state) = self.transaction_destinations.get(transaction_id) else {
             return ClientResponseRouteAuthentication::UnknownTransaction;
         };
 
-        let expected = match state.value() {
-            super::ClientResponseRouteState::Active { route, .. } => route.clone(),
+        let (expected, expected_via) = match state.value() {
+            super::ClientResponseRouteState::Active {
+                route,
+                response_via,
+                ..
+            } => (route.clone(), response_via.clone()),
             super::ClientResponseRouteState::Retired(retired) => {
                 if retired.expires_at <= Instant::now() {
                     let expires_at = retired.expires_at;
-                    let deadline_version = retired.deadline_version;
+                    let deadline_version = retired.deadline_version();
                     drop(state);
                     if self
                         .transaction_destinations
                         .remove_if(transaction_id, |_, current| {
                             current.retired().is_some_and(|retired| {
-                                retired.deadline_version == deadline_version
+                                retired.deadline_version() == deadline_version
                                     && retired.expires_at == expires_at
                                     && retired.expires_at <= Instant::now()
                             })
@@ -520,34 +444,25 @@ impl TransactionManager {
                     }
                     return ClientResponseRouteAuthentication::UnknownTransaction;
                 }
-                retired.route.clone()
+                (retired.route.clone(), retired.response_via.clone())
             }
         };
 
-        let Some(bound) =
-            bind_client_response_route(&expected, source, transport_type, ingress_flow_id)
-        else {
+        if !client_response_route_matches(
+            &expected,
+            &expected_via,
+            response,
+            source,
+            transport_type,
+            ingress_flow_id.is_some(),
+        ) {
             return ClientResponseRouteAuthentication::Rejected;
-        };
-
-        match state.value_mut() {
-            super::ClientResponseRouteState::Active { route, .. } => *route = bound,
-            super::ClientResponseRouteState::Retired(retired) if retired.route != bound => {
-                retired.route = bound
-            }
-            super::ClientResponseRouteState::Retired(_) => {}
         }
         ClientResponseRouteAuthentication::Authenticated
     }
 }
 
 /// Create a UDP Via header with a branch parameter for a local address.
-///
-/// Always requests `rport` (RFC 3581) with no value — carriers and NAT
-/// gateways use this to echo back the received port in responses so we
-/// can route ACKs and BYEs back through the same pinhole. The incoming
-/// path honors `received=` / `rport=` echoed on responses (see the
-/// response handler earlier in this module).
 pub fn create_via_header(local_addr: &SocketAddr, branch: &str) -> Result<TypedHeader> {
     create_via_header_for_transport(local_addr, branch, "UDP")
 }
@@ -556,7 +471,8 @@ pub fn create_via_header(local_addr: &SocketAddr, branch: &str) -> Result<TypedH
 ///
 /// This is used by the transaction layer only when a request reaches it without
 /// an existing Via. Request builders normally choose the correct transport
-/// first; transaction normalization must preserve that choice.
+/// first; transaction normalization must preserve that choice. The transaction
+/// manager adds UDP `rport` only after it has selected the final transport.
 pub fn create_via_header_for_transport(
     local_addr: &SocketAddr,
     branch: &str,
@@ -565,7 +481,7 @@ pub fn create_via_header_for_transport(
     use rvoip_sip_core::types::via::Via;
     use rvoip_sip_core::types::Param;
 
-    let via_params = vec![Param::branch(branch.to_string()), Param::Rport(None)];
+    let via_params = vec![Param::branch(branch.to_string())];
 
     let local_host = local_addr.ip().to_string();
     let local_port = local_addr.port();
@@ -588,7 +504,7 @@ mod via_header_tests {
     use super::*;
 
     #[test]
-    fn via_header_includes_rport_param() {
+    fn via_header_defaults_to_udp_with_branch() {
         let local: SocketAddr = "127.0.0.1:5060".parse().unwrap();
         let header = create_via_header(&local, "z9hG4bK-test").expect("create_via_header");
         let serialized = format!("{}", header);
@@ -597,11 +513,7 @@ mod via_header_tests {
             "Via header should default to UDP, got: {}",
             serialized
         );
-        assert!(
-            serialized.contains(";rport"),
-            "Via header should include rport param, got: {}",
-            serialized
-        );
+        assert!(!serialized.contains(";rport"));
         assert!(
             serialized.contains(";branch=z9hG4bK-test"),
             "Via header should include branch param, got: {}",
@@ -620,11 +532,7 @@ mod via_header_tests {
             "Via header should use requested transport, got: {}",
             serialized
         );
-        assert!(
-            serialized.contains(";rport"),
-            "Via header should include rport param, got: {}",
-            serialized
-        );
+        assert!(!serialized.contains(";rport"));
         assert!(
             serialized.contains(";branch=z9hG4bK-test"),
             "Via header should include branch param, got: {}",
@@ -696,7 +604,13 @@ impl TransactionManager {
                     (&message, transaction_key.as_ref())
                 {
                     match self
-                        .authenticate_client_response_route(key, source, transport_type, flow_id)
+                        .authenticate_client_response_route(
+                            key,
+                            response,
+                            source,
+                            transport_type,
+                            flow_id,
+                        )
                         .await
                     {
                         ClientResponseRouteAuthentication::Authenticated => {}
@@ -1058,7 +972,7 @@ impl TransactionManager {
         // replays the cached 200 and cannot create a second downstream CANCEL.
         if let (Some(wire_key), Some(match_key)) = (&wire_key, &match_key) {
             if let Some(transaction_id) = self
-                .matching_server_transaction_id(match_key, wire_key, &request, ingress_context)
+                .matching_server_transaction_id(match_key)
                 .await
             {
                 if self
@@ -1081,12 +995,7 @@ impl TransactionManager {
                 (Some(wire_key), Some(match_key)) => {
                     let invite_wire_key = wire_key.with_method(Method::Invite);
                     let invite_match_key = match_key.with_method(Method::Invite);
-                    self.matching_server_transaction_id(
-                        &invite_match_key,
-                        &invite_wire_key,
-                        &request,
-                        ingress_context,
-                    )
+                    self.matching_server_transaction_id(&invite_match_key)
                     .await
                     .filter(|transaction_id| {
                         self.request_ingress_authorizer().is_none()
