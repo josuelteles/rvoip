@@ -1842,7 +1842,7 @@ async fn send_stateless_transaction_overload(
         response_route,
         transport,
         StatusCode::ServiceUnavailable,
-        Some(1),
+        Some(retry_after_secs.max(1)),
         "Failed to send stateless transaction overload response",
     )
     .await

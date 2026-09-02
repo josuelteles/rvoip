@@ -5353,6 +5353,46 @@ mod tests {
         Ok(())
     }
 
+    /// The overload rejection must carry the configured Retry-After, not the
+    /// default. `send_stateless_transaction_overload` used to drop the value
+    /// it was handed and emit a hardcoded `Retry-After: 1`, which made
+    /// `Config::server_overload_retry_after_secs` silently inert.
+    #[tokio::test]
+    async fn inbound_compact_capacity_503_carries_the_configured_retry_after() -> Result<()> {
+        let transport = Arc::new(MockTransport::new("127.0.0.1:5060"));
+        let (_transport_tx, transport_rx) = mpsc::channel(8);
+        let (mut manager, _events) =
+            TransactionManager::new(transport.clone(), transport_rx, Some(8)).await?;
+        replace_compact_retention_capacity(&mut manager, 1).await;
+        manager.set_stateless_overload_retry_after_secs(4);
+        let scheduler = manager.lifecycle_scheduler.as_ref().unwrap();
+        let held = scheduler
+            .try_reserve_compact_retention()
+            .expect("occupy only compact slot");
+        let request = create_dispatch_request(Method::Options, "z9hG4bK-capacity-retry-after", 1)
+            .map_err(|error| Error::Other(error.to_string()))?;
+        let source: SocketAddr = "192.0.2.22:5060".parse().unwrap();
+
+        manager
+            .handle_transport_event(dispatch_event_from(Message::Request(request), source))
+            .await?;
+
+        let sent = transport.get_sent_messages().await;
+        assert_eq!(sent.len(), 1);
+        let Message::Response(response) = &sent[0].0 else {
+            panic!("capacity rejection must be a SIP response");
+        };
+        assert_eq!(response.status(), StatusCode::ServiceUnavailable);
+        assert!(matches!(
+            response.header(&HeaderName::RetryAfter),
+            Some(TypedHeader::RetryAfter(value)) if value.delay == 4
+        ));
+
+        drop(held);
+        manager.shutdown().await;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn failed_server_initial_command_rolls_back_map_and_compact_lease() -> Result<()> {
         let transport = Arc::new(MockTransport::new("127.0.0.1:5060"));
