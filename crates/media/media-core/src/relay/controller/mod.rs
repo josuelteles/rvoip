@@ -97,47 +97,6 @@ pub enum DtlsRole {
     Server,
 }
 
-#[cfg(feature = "g729")]
-fn decode_g729_payload_to_buffer(
-    decoder: &mut G729Codec,
-    payload: &[u8],
-    output: &mut Vec<i16>,
-) -> Result<usize> {
-    const G729_SAMPLES_PER_FRAME: usize = 80;
-    const G729_SPEECH_FRAME_BYTES: usize = 10;
-    const G729_SID_FRAME_BYTES: usize = 2;
-
-    let frame_count = if payload.is_empty() || payload.len() == G729_SID_FRAME_BYTES {
-        1
-    } else if payload.len() % G729_SPEECH_FRAME_BYTES == 0 {
-        payload.len() / G729_SPEECH_FRAME_BYTES
-    } else {
-        1
-    };
-    let needed = frame_count * G729_SAMPLES_PER_FRAME;
-    if output.len() < needed {
-        output.resize(needed, 0);
-    }
-
-    if payload.is_empty()
-        || payload.len() == G729_SID_FRAME_BYTES
-        || payload.len() % G729_SPEECH_FRAME_BYTES != 0
-    {
-        let frame = decoder.decode(payload)?;
-        output[..frame.samples.len()].copy_from_slice(&frame.samples);
-        return Ok(frame.samples.len());
-    }
-
-    let mut written = 0;
-    for chunk in payload.chunks_exact(G729_SPEECH_FRAME_BYTES) {
-        let frame = decoder.decode(chunk)?;
-        let end = written + frame.samples.len();
-        output[written..end].copy_from_slice(&frame.samples);
-        written = end;
-    }
-    Ok(written)
-}
-
 /// Controller-level capacity and pool tuning.
 #[derive(Debug, Clone)]
 pub struct MediaSessionControllerConfig {
