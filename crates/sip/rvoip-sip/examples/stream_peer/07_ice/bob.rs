@@ -26,13 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let media_start = env_u16("BOB_MEDIA_PORT_START", 10100);
     let media_end = env_u16("BOB_MEDIA_PORT_END", 10200);
 
-    let mut bob = StreamPeer::with_config(Config {
-        media_port_start: media_start,
-        media_port_end: media_end,
-        enable_ice: true,
-        ..Config::local("bob", bob_port)
-    })
-    .await?;
+    // `Config`'s constructible shape is frozen for the 0.3.x line: the AMR
+    // policy fields are private behind builders, so struct-update syntax
+    // cannot reach it from outside the crate. Build it the way the other
+    // examples do.
+    let mut config = Config::local("bob", bob_port).with_media_ports(media_start, media_end);
+    config.enable_ice = true;
+
+    let mut bob = StreamPeer::with_config(config).await?;
 
     // Subscribe before accepting so an IceConnected fired right after
     // the 200 OK isn't missed.
