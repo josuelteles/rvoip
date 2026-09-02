@@ -37,8 +37,8 @@ CODEC_FEATURE_GATES = {
 # accompanying test derives the same set from the manifest and fails if a new
 # feature is added without a decision about this gate.
 NON_PERF_SIP_FEATURES = (
-    "all-codecs,amr,amr-nb,amr-wb,dev-insecure-tls,dhat,event-history,g729,"
-    "generated-validation,opus,opus-sim,persistence,tokio-console"
+    "all-codecs,amr,amr-nb,amr-wb,dev-insecure-tls,dhat,dtls-srtp,event-history,"
+    "g729,generated-validation,ice,opus,opus-sim,persistence,tokio-console"
 )
 
 
