@@ -41,9 +41,12 @@ use ezk_g722::libg722::{
     decoder::Decoder as LibG722Decoder, encoder::Encoder as LibG722Encoder, Bitrate,
 };
 
-const SAMPLE_RATE: u32 = 16_000;
-const BITRATE: u32 = 64_000;
-const DEFAULT_FRAME_SIZE: usize = 320; // 20ms at 16kHz
+// Visible to `super` so `CodecCapabilities::get_all` publishes the same
+// numbers this codec reports from `info()`, instead of a second copy that
+// can drift away from it.
+pub(super) const SAMPLE_RATE: u32 = 16_000;
+pub(super) const BITRATE: u32 = 64_000;
+pub(super) const DEFAULT_FRAME_SIZE: usize = 320; // 20ms at 16kHz
 
 fn new_encoder() -> LibG722Encoder {
     LibG722Encoder::new(Bitrate::Mode1_64000, false, false)

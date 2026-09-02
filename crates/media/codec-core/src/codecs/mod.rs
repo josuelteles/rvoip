@@ -424,6 +424,27 @@ impl CodecCapabilities {
             );
         }
 
+        #[cfg(feature = "g722")]
+        {
+            codec_types.push(CodecType::G722);
+            codec_info.insert(
+                CodecType::G722,
+                CodecInfo {
+                    name: "G722",
+                    sample_rate: g722::SAMPLE_RATE,
+                    channels: 1,
+                    bitrate: g722::BITRATE,
+                    frame_size: g722::DEFAULT_FRAME_SIZE,
+                    // RFC 3551 §4.5.2: G.722 is sampled at 16 kHz but its
+                    // RTP clock rate is 8000. `sample_rate` above is the
+                    // codec's own rate, as this crate documents on
+                    // CodecType::G722; callers that build SDP account for
+                    // the clock-rate quirk separately.
+                    payload_type: Some(9),
+                },
+            );
+        }
+
         #[cfg(feature = "opus")]
         {
             codec_types.push(CodecType::Opus);
@@ -576,22 +597,37 @@ mod tests {
     fn test_codec_capabilities() {
         let caps = CodecCapabilities::get_all();
 
-        // `g722` is deliberately absent from these predicates, unlike
-        // everywhere else in this module: `CodecCapabilities::get_all` has
-        // never published a G.722 entry, even though the factory builds the
-        // codec and the name/payload maps know it. That gap predates the
-        // upstream merge and closing it means picking a published frame size
-        // and bitrate, so it is left as-is rather than guessed at here.
-        #[cfg(any(feature = "g711", feature = "g729", feature = "opus"))]
+        #[cfg(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus"))]
         {
             assert!(!caps.codec_types.is_empty());
             assert!(!caps.codec_info.is_empty());
         }
 
-        #[cfg(not(any(feature = "g711", feature = "g729", feature = "opus")))]
+        #[cfg(not(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus")))]
         {
             assert!(caps.codec_types.is_empty());
             assert!(caps.codec_info.is_empty());
+        }
+
+        #[cfg(feature = "g722")]
+        {
+            assert!(caps.is_supported(CodecType::G722));
+            let info = caps
+                .get_info(CodecType::G722)
+                .expect("G.722 capabilities are published");
+            assert_eq!(info.name, "G722");
+            assert_eq!(info.sample_rate, 16_000);
+            assert_eq!(info.channels, 1);
+            assert_eq!(info.bitrate, 64_000);
+            assert_eq!(info.frame_size, 320);
+            assert_eq!(info.payload_type, Some(9));
+
+            // The published capability and what the codec reports about
+            // itself must not drift apart -- that divergence is exactly why
+            // G.722 went unpublished here for so long.
+            let codec = CodecFactory::create(CodecConfig::g722())
+                .expect("the g722 feature builds its codec");
+            assert_eq!(*info, codec.info());
         }
 
         #[cfg(feature = "g711")]
