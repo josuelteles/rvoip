@@ -104,7 +104,7 @@ impl CodecFactory {
     // branch is compiled out; feature-enabled branches transfer ownership to
     // their concrete codec constructors.
     #[cfg_attr(
-        not(any(feature = "g711", feature = "g729", feature = "opus")),
+        not(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus")),
         allow(clippy::needless_pass_by_value)
     )]
     pub fn create(config: CodecConfig) -> Result<Box<dyn AudioCodec>> {
@@ -510,10 +510,10 @@ mod tests {
     fn test_codec_factory_supported_codecs() {
         let supported = CodecFactory::supported_codecs();
 
-        #[cfg(any(feature = "g711", feature = "g729", feature = "opus"))]
+        #[cfg(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus"))]
         assert!(!supported.is_empty());
 
-        #[cfg(not(any(feature = "g711", feature = "g729", feature = "opus")))]
+        #[cfg(not(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus")))]
         assert!(supported.is_empty());
 
         #[cfg(feature = "g711")]
@@ -533,6 +533,12 @@ mod tests {
         }
 
         assert!(!CodecFactory::is_supported("UNSUPPORTED"));
+
+        // This fork implements G.722 (upstream does not), so the codec is
+        // supported exactly when its feature is on.
+        #[cfg(feature = "g722")]
+        assert!(CodecFactory::is_supported("G722"));
+        #[cfg(not(feature = "g722"))]
         assert!(!CodecFactory::is_supported("G722"));
 
         #[cfg(feature = "opus")]
@@ -570,6 +576,12 @@ mod tests {
     fn test_codec_capabilities() {
         let caps = CodecCapabilities::get_all();
 
+        // `g722` is deliberately absent from these predicates, unlike
+        // everywhere else in this module: `CodecCapabilities::get_all` has
+        // never published a G.722 entry, even though the factory builds the
+        // codec and the name/payload maps know it. That gap predates the
+        // upstream merge and closing it means picking a published frame size
+        // and bitrate, so it is left as-is rather than guessed at here.
         #[cfg(any(feature = "g711", feature = "g729", feature = "opus"))]
         {
             assert!(!caps.codec_types.is_empty());

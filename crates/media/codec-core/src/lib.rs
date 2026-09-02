@@ -285,21 +285,21 @@ mod tests {
         let info = info();
         assert_eq!(info.version, VERSION);
 
-        #[cfg(any(feature = "g711", feature = "g729", feature = "opus"))]
+        #[cfg(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus"))]
         assert!(!info.supported_codecs.is_empty());
 
-        #[cfg(not(any(feature = "g711", feature = "g729", feature = "opus")))]
+        #[cfg(not(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus")))]
         assert!(info.supported_codecs.is_empty());
     }
 
     #[test]
     fn test_supported_codecs() {
-        #[cfg(any(feature = "g711", feature = "g729", feature = "opus"))]
+        #[cfg(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus"))]
         const {
             assert!(!SUPPORTED_CODECS.is_empty())
         };
 
-        #[cfg(not(any(feature = "g711", feature = "g729", feature = "opus")))]
+        #[cfg(not(any(feature = "g711", feature = "g722", feature = "g729", feature = "opus")))]
         assert!(SUPPORTED_CODECS.is_empty());
 
         #[cfg(feature = "g711")]
