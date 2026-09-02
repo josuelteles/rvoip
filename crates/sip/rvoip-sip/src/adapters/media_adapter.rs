@@ -1361,7 +1361,8 @@ pub struct MediaAdapter {
     /// the agent isn't dropped (which would tear down its STUN pump)
     /// while connectivity checks are still running. Unlike
     /// `pending_dtls_identities`, this is not removed once handed off —
-    /// only on `cleanup_session`.
+    /// only on `cleanup_session`, which is also where a pending DTLS
+    /// identity that never reached a handshake is released.
     #[cfg(feature = "ice")]
     pending_ice_agents: Arc<DashMap<SessionId, Arc<rvoip_nat_core::IceAgent>>>,
 
@@ -5359,6 +5360,15 @@ impl MediaAdapter {
         let session_id = handle.session_id();
         self.discard_pending_srtp_offer_exact(handle);
         self.discard_staged_media_negotiation_exact(handle);
+        // The identity generated for an outgoing offer is normally consumed
+        // by maybe_complete_dtls_as_uac/_uas. A session that never reaches
+        // those -- signaling-only media mode, or a call abandoned before its
+        // answer -- would otherwise retain a certificate and its private key
+        // for the lifetime of the process. This sits with the other
+        // non-media state releases, ahead of the early returns below: a
+        // signaling-only session has no media owner and takes one of them.
+        #[cfg(feature = "dtls-srtp")]
+        self.pending_dtls_identities.remove(session_id);
         let managed_resource = self
             .media_resources
             .get(session_id)
@@ -6077,6 +6087,53 @@ mod sdp_format_tests {
         assert!(resume.contains("a=sendrecv"), "{resume}");
         assert!(adapter.media_sessions.is_empty());
         assert!(adapter.media_resources.is_empty());
+    }
+
+    /// Signaling-only media mode generates a DTLS-SRTP identity for the
+    /// offer but never reaches `maybe_complete_dtls_as_uac`, which is the
+    /// only path that consumes it. Cleanup has to release it, or every such
+    /// session leaves a certificate and its private key behind for the life
+    /// of the process.
+    #[cfg(feature = "dtls-srtp")]
+    #[tokio::test]
+    async fn cleanup_releases_a_dtls_identity_that_never_reached_a_handshake() {
+        use crate::session_store::SessionStore;
+        use crate::state_table::types::Role;
+        use rvoip_media_core::relay::controller::MediaSessionController;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let store = Arc::new(SessionStore::new());
+        let session_id = SessionId("dtls-identity-cleanup".to_string());
+        store
+            .create_session(session_id.clone(), Role::UAC, false)
+            .await
+            .expect("create signaling-only session");
+
+        let mut adapter = MediaAdapter::new(
+            Arc::new(MediaSessionController::new()),
+            store,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            16_000,
+            16_100,
+        );
+        adapter.set_media_mode(MediaMode::SignalingOnly { sdp_rtp_port: 9 });
+        adapter.set_dtls_srtp_policy(true);
+
+        assert!(
+            adapter.dtls_offer_identity(&session_id).is_some(),
+            "offering DTLS-SRTP must stash an identity"
+        );
+        assert_eq!(adapter.pending_dtls_identities.len(), 1);
+
+        adapter
+            .cleanup_session(&session_id)
+            .await
+            .expect("cleanup signaling-only session");
+
+        assert!(
+            adapter.pending_dtls_identities.is_empty(),
+            "cleanup must release the certificate and its private key"
+        );
     }
 
     #[tokio::test]
