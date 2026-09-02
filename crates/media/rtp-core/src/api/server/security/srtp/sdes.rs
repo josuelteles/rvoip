@@ -193,9 +193,8 @@ impl SdesServerSession {
             self.session_id
         );
 
-        let suites = crate::api::common::config::implemented_srtp_suites(
-            &self.config.supported_profiles,
-        )?;
+        let suites =
+            crate::api::common::config::implemented_srtp_suites(&self.config.supported_profiles)?;
         let (offerer, attrs) = match SdesNegotiator::new_offerer(&suites) {
             Ok(result) => result,
             Err(e) => {

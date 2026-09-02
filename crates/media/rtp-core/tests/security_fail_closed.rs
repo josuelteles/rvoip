@@ -915,6 +915,9 @@ async fn public_sdes_wrappers_generate_only_real_implemented_offers() {
         assert!(line.starts_with("a=crypto:"));
         assert!(!line.contains("GCM"));
         assert!(!line.contains("placeholder"));
-        assert!(line.contains("inline:"), "offer must carry an inline key: {line}");
+        assert!(
+            line.contains("inline:"),
+            "offer must carry an inline key: {line}"
+        );
     }
 }

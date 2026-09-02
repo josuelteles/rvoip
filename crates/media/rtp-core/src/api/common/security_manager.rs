@@ -709,8 +709,8 @@ mod tests {
 
     #[test]
     fn sdes_offer_contains_fresh_real_key_material() {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
         use crate::security::sdes::SdesNegotiator;
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
         let suites = &[crate::srtp::SRTP_AES128_CM_SHA1_80];
         let (_neg1, attrs1) = SdesNegotiator::new_offerer(suites)
@@ -724,12 +724,19 @@ mod tests {
             let key_bytes = BASE64
                 .decode(&attr.key_inline)
                 .expect("key material must be valid base64");
-            assert_eq!(key_bytes.len(), 30, "AES-128 key (16) + salt (14) = 30 bytes");
+            assert_eq!(
+                key_bytes.len(),
+                30,
+                "AES-128 key (16) + salt (14) = 30 bytes"
+            );
         }
 
         let key1 = &attrs1[0].key_inline;
         let key2 = &attrs2[0].key_inline;
-        assert_ne!(key1, key2, "each offer must generate independent key material");
+        assert_ne!(
+            key1, key2,
+            "each offer must generate independent key material"
+        );
     }
 
     #[test]

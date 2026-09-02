@@ -172,8 +172,9 @@ impl SrtpReplayProtection {
         }
 
         // The window covers [highest_seq - window_size + 1, highest_seq]
-        let window_lower_bound =
-            self.highest_seq.saturating_sub(self.window_size.saturating_sub(1) as u64);
+        let window_lower_bound = self
+            .highest_seq
+            .saturating_sub(self.window_size.saturating_sub(1) as u64);
         if seq < window_lower_bound {
             return false;
         }

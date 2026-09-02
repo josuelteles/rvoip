@@ -971,10 +971,7 @@ impl TransactionManager {
         // Resolve it before proxy unmatched-CANCEL handling so a late duplicate
         // replays the cached 200 and cannot create a second downstream CANCEL.
         if let (Some(wire_key), Some(match_key)) = (&wire_key, &match_key) {
-            if let Some(transaction_id) = self
-                .matching_server_transaction_id(match_key)
-                .await
-            {
+            if let Some(transaction_id) = self.matching_server_transaction_id(match_key).await {
                 if self
                     .dispatch_matching_server_request(
                         &transaction_id,
@@ -996,13 +993,13 @@ impl TransactionManager {
                     let invite_wire_key = wire_key.with_method(Method::Invite);
                     let invite_match_key = match_key.with_method(Method::Invite);
                     self.matching_server_transaction_id(&invite_match_key)
-                    .await
-                    .filter(|transaction_id| {
-                        self.request_ingress_authorizer().is_none()
-                            || self
-                                .inbound_principal_for_context(transaction_id, ingress_context)
-                                .is_some()
-                    })
+                        .await
+                        .filter(|transaction_id| {
+                            self.request_ingress_authorizer().is_none()
+                                || self
+                                    .inbound_principal_for_context(transaction_id, ingress_context)
+                                    .is_some()
+                        })
                 }
                 _ => None,
             }

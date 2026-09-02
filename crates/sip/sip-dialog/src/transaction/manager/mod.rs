@@ -7814,10 +7814,7 @@ impl TransactionManager {
             .ok_or_else(|| {
                 Error::ack_2xx(
                     Ack2xxFailureStage::RouteLookup,
-                    Error::transaction_not_found(
-                        invite_tx_id.clone(),
-                        "ACK route lookup failed",
-                    ),
+                    Error::transaction_not_found(invite_tx_id.clone(), "ACK route lookup failed"),
                 )
             })?;
         let cached_answer = generation

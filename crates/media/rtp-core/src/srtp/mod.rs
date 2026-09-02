@@ -650,9 +650,7 @@ impl SrtpContext {
 
         // Authentication deliberately happens before the replay decision is
         // applied or any state entry is inserted.
-        let packet = self
-            .inbound_crypto
-            .decrypt_rtp(data, candidate.roc)?;
+        let packet = self.inbound_crypto.decrypt_rtp(data, candidate.roc)?;
         if candidate.before_roc_zero {
             return Err(crate::Error::SrtpError(
                 "SRTP packet maps before ROC zero".to_string(),
@@ -814,10 +812,7 @@ mod tests {
         packet: &crate::packet::RtpPacket,
         roc: u32,
     ) -> Bytes {
-        let (encrypted, auth_tag) = context
-            .outbound_crypto
-            .encrypt_rtp(packet, roc)
-            .unwrap();
+        let (encrypted, auth_tag) = context.outbound_crypto.encrypt_rtp(packet, roc).unwrap();
         ProtectedRtpPacket {
             packet: encrypted,
             auth_tag,

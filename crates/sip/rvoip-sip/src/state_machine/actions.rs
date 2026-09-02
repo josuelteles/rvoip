@@ -2899,14 +2899,15 @@ pub(crate) async fn execute_action(
                             .await
                         {
                             Ok(config) => {
-                                let session_config = crate::session_store::state::NegotiatedConfig {
-                                    local_addr: config.local_addr,
-                                    remote_addr: config.remote_addr,
-                                    codec: config.codec,
-                                    sample_rate: config.clock_rate,
-                                    channels: config.channels,
-                                    fmtp: config.negotiated_fmtp.clone(),
-                                };
+                                let session_config =
+                                    crate::session_store::state::NegotiatedConfig {
+                                        local_addr: config.local_addr,
+                                        remote_addr: config.remote_addr,
+                                        codec: config.codec,
+                                        sample_rate: config.clock_rate,
+                                        channels: config.channels,
+                                        fmtp: config.negotiated_fmtp.clone(),
+                                    };
                                 session.local_media_direction = config.local_direction;
                                 session.remote_media_direction = config.remote_direction;
                                 // The peer's answer has now actually been

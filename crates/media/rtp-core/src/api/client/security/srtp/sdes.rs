@@ -305,9 +305,8 @@ impl SdesClient {
             ));
         }
 
-        let suites = crate::api::common::config::implemented_srtp_suites(
-            &self.config.supported_profiles,
-        )?;
+        let suites =
+            crate::api::common::config::implemented_srtp_suites(&self.config.supported_profiles)?;
         let (_offerer, attrs) = SdesNegotiator::new_offerer(&suites).map_err(|e| {
             SecurityError::CryptoError(format!("SDES offer generation failed: {e}"))
         })?;

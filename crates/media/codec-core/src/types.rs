@@ -348,7 +348,12 @@ impl CodecType {
     #[must_use]
     pub const fn default_sample_rate(self) -> u32 {
         match self {
-            Self::G711Pcmu | Self::G711Pcma | Self::G729 | Self::G729A | Self::G729BA | Self::AmrNb => 8000,
+            Self::G711Pcmu
+            | Self::G711Pcma
+            | Self::G729
+            | Self::G729A
+            | Self::G729BA
+            | Self::AmrNb => 8000,
             Self::G722 | Self::AmrWb => 16000,
             Self::Opus => 48000,
         }
@@ -386,7 +391,12 @@ impl CodecType {
     #[must_use]
     pub const fn supported_sample_rates(self) -> &'static [u32] {
         match self {
-            Self::G711Pcmu | Self::G711Pcma | Self::G729 | Self::G729A | Self::G729BA | Self::AmrNb => &[8000],
+            Self::G711Pcmu
+            | Self::G711Pcma
+            | Self::G729
+            | Self::G729A
+            | Self::G729BA
+            | Self::AmrNb => &[8000],
             Self::G722 | Self::AmrWb => &[16000],
             Self::Opus => &[8000, 12000, 16000, 24000, 48000],
         }

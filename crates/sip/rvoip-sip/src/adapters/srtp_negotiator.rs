@@ -224,9 +224,7 @@ fn decode_keysalt(
 /// extensions (lifetime, MKI) or session parameters. Silently dropping
 /// parameters a peer considers load-bearing is a silent security
 /// downgrade, so we reject explicitly per RFC 4568 §6.1.
-fn reject_unsupported_extensions(
-    attr: &CryptoAttribute,
-) -> std::result::Result<(), SessionError> {
+fn reject_unsupported_extensions(attr: &CryptoAttribute) -> std::result::Result<(), SessionError> {
     if let Some(ref lifetime) = attr.key_lifetime {
         return Err(SessionError::SDPNegotiationFailed(format!(
             "a=crypto tag {} uses a key lifetime parameter ({}), which is not supported",
