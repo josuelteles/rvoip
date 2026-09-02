@@ -69,7 +69,11 @@ g711 = []                    # G.711 μ-law/A-law codec (always available)
 g722 = ["dep:ezk-g722"]      # G.722 wideband ADPCM codec
 g729 = []                    # G.729A/G.729AB codec
 opus = ["dep:opus"]          # Opus codec, real encode/decode via libopus
-opus-sim = []                # Deterministic Opus stub for fast tests, no real DSP
+# Deprecated alias kept for compatibility: it turns on the real libopus
+# backend. There is no stub implementation in this crate -- `codecs::opus`
+# compiles only under `opus`, so this must imply it or `SUPPORTED_CODECS`
+# advertises a codec the registry cannot build.
+opus-sim = ["opus"]
 
 # AMR-NB / AMR-WB (3GPP TS 26.071 / TS 26.171, RFC 4867).
 # Both variants encode and decode bit-exactly against the 3GPP reference
