@@ -6502,7 +6502,13 @@ impl SessionCrossCrateEventHandler {
             .sdp_negotiated;
         let process_result = if delayed_offer_answer {
             self.state_machine
-                .process_event_with_remote_sdp_exact(handle, EventType::DialogACK { sdp: None }, sdp_answer)
+                .process_event_with_remote_sdp_exact(
+                    handle,
+                    EventType::DialogACK {
+                        sdp: sdp_answer.clone(),
+                    },
+                    sdp_answer,
+                )
                 .await
         } else {
             self.state_machine

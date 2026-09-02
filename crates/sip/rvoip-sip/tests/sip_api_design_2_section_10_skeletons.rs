@@ -238,6 +238,8 @@ a=sendrecv\r\n";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offerless_initial_invite_answers_the_200_offer_in_ack() {
+    let _ = tracing_subscriber::fmt::try_init();
+
     use std::time::Duration;
 
     use rvoip_sip::api::events::Event;
