@@ -69,9 +69,19 @@ impl RedirectBuilder {
         }
 
         let extras = take_staged(&mut self.state);
+        // A redirect is not a failure, and there is no typed redirect event
+        // yet, so the session is released without publishing one.
         self.coord
-            .helpers
-            .redirect_call_with_extras_exact(lifecycle_handle, self.status, self.contacts, extras)
+            .resolve_incoming_final_exact(
+                lifecycle_handle,
+                None,
+                self.coord.helpers.redirect_call_with_extras_exact(
+                    lifecycle_handle,
+                    self.status,
+                    self.contacts.clone(),
+                    extras,
+                ),
+            )
             .await
     }
 }

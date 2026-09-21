@@ -1549,8 +1549,9 @@ fn incoming_call_control_capability_is_causal_and_generation_qualified() {
         .contains("lifecycle_handle:Option<crate::session_registry::SessionRegistryHandle>"));
     assert!(dispatch.contains("accept_call_exact(exact_handle)"));
     assert!(dispatch.contains("accept_call_with_sdp_exact(exact_handle,sdp)"));
-    assert!(dispatch.contains("reject_call_exact(exact_handle,status,&reason)"));
-    assert!(dispatch.contains("redirect_call_exact(exact_handle,302,vec![target])"));
+    assert!(dispatch.contains("reject_call_exact(exact_handle,status,&reason,)"));
+    assert!(dispatch.contains("redirect_call_exact(exact_handle,302,vec![target],)"));
+    assert!(dispatch.contains("resolve_incoming_final_exact(exact_handle,"));
     assert!(dispatch.contains("SessionHandle::new_captured("));
     assert!(dispatch.contains("set_coordinator_captured("));
     assert!(!dispatch.contains("SessionHandle::new("));

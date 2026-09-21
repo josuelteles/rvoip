@@ -98,6 +98,11 @@ fn spawn_exact_incoming_reject(
                     return rollback_owned_incoming_guard(failure.into_operation(), ()).await;
                 }
             };
+            let terminal = crate::api::events::Event::CallFailed {
+                call_id: lifecycle_handle.session_id().clone(),
+                status_code: status,
+                reason: reason.clone(),
+            };
             if let Err(error) = state_machine
                 .process_event_exact(&lifecycle_handle, EventType::RejectCall { status, reason })
                 .await
@@ -108,6 +113,9 @@ fn spawn_exact_incoming_reject(
                     "exact incoming-call rejection did not dispatch"
                 );
             }
+            // Only schedules the release: it must not wait here, because the
+            // release waits for this very operation to quiesce.
+            coordinator.release_local_final_response_exact(&lifecycle_handle, Some(terminal));
             committed.complete(())
         },
     );
@@ -829,6 +837,7 @@ impl IncomingCallGuard {
             let watchdog_resolved = Arc::clone(&resolved);
             let remaining = deadline.saturating_duration_since(Instant::now());
             let hard_timeout = remaining.saturating_add(INCOMING_GUARD_RESPONSE_COMPLETION_GRACE);
+            let watchdog_coordinator = Arc::clone(&coordinator);
             let scheduled = authority.spawn_owned_exact(
                 &operation_key,
                 SessionOperationKind::Signaling,
@@ -865,6 +874,14 @@ impl IncomingCallGuard {
                         );
                         return rollback_owned_incoming_guard(operation, ()).await;
                     }
+                    watchdog_coordinator.release_local_final_response_exact(
+                        &lifecycle_handle,
+                        Some(crate::api::events::Event::CallFailed {
+                            call_id: lifecycle_handle.session_id().clone(),
+                            status_code: 503,
+                            reason: "Service Unavailable".to_string(),
+                        }),
+                    );
                     commit_owned_incoming_guard(operation, ()).await
                 },
             );
@@ -1049,8 +1066,17 @@ impl IncomingCallGuard {
             ))
         })?;
         self.coordinator
-            .helpers
-            .reject_call_exact(lifecycle_handle, status, reason)
+            .resolve_incoming_final_exact(
+                lifecycle_handle,
+                Some(Event::CallFailed {
+                    call_id: lifecycle_handle.session_id().clone(),
+                    status_code: status,
+                    reason: reason.to_string(),
+                }),
+                self.coordinator
+                    .helpers
+                    .reject_call_exact(lifecycle_handle, status, reason),
+            )
             .await?;
 
         let fut = async {

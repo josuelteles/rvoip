@@ -483,8 +483,6 @@ transitions:
       - type: "SendRejectResponse"
       - type: "CleanupDialog"
       - type: "CleanupMedia"
-    publish:
-      - "CallRejected"
     description: "Reject incoming call"
 
   # UAS redirects call — status + contacts come from the RedirectCall event
@@ -498,8 +496,6 @@ transitions:
       - type: "SendRedirectResponse"
       - type: "CleanupDialog"
       - type: "CleanupMedia"
-    publish:
-      - "CallRejected"
     description: "Redirect incoming call with 3xx + Contact header"
 
   - role: "UAS"
@@ -511,8 +507,6 @@ transitions:
       - type: "SendRedirectResponse"
       - type: "CleanupDialog"
       - type: "CleanupMedia"
-    publish:
-      - "CallRejected"
     description: "Redirect after early media"
 
   # Both sides can hangup from Active

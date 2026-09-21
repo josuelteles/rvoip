@@ -111,17 +111,35 @@ impl RejectBuilder {
             ));
         }
 
+        let terminal = crate::api::events::Event::CallFailed {
+            call_id: self.call_id.clone(),
+            status_code: self.status,
+            reason: reason.clone(),
+        };
         if extras.is_empty() {
             self.coord
-                .helpers
-                .reject_call_exact(lifecycle_handle, self.status, &reason)
+                .resolve_incoming_final_exact(
+                    lifecycle_handle,
+                    Some(terminal),
+                    self.coord
+                        .helpers
+                        .reject_call_exact(lifecycle_handle, self.status, &reason),
+                )
                 .await
         } else {
             // Carry extras through the exact transition lane so there is one
             // response and no pre-dispatch session snapshot write.
             self.coord
-                .helpers
-                .reject_call_with_extras_exact(lifecycle_handle, self.status, &reason, extras)
+                .resolve_incoming_final_exact(
+                    lifecycle_handle,
+                    Some(terminal),
+                    self.coord.helpers.reject_call_with_extras_exact(
+                        lifecycle_handle,
+                        self.status,
+                        &reason,
+                        extras,
+                    ),
+                )
                 .await
         }
     }

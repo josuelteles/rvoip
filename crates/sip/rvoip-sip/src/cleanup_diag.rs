@@ -154,6 +154,12 @@ pub struct CleanupStageSnapshot {
 pub struct CleanupDiagSnapshot {
     pub enabled: bool,
     pub active_total: u64,
+    /// Sessions released because this side authored the final response to an
+    /// initial INVITE. Counted apart from the BYE teardown path.
+    pub local_final_response_released: u64,
+    /// Local final responses that kept their session because the dispatch is
+    /// still retryable.
+    pub local_final_response_retained: u64,
     pub setup_teardown_watchdog_armed: u64,
     pub setup_teardown_watchdog_disarmed: u64,
     pub setup_teardown_watchdog_fired: u64,
@@ -265,6 +271,8 @@ static ENABLE_OVERRIDE: AtomicU8 = AtomicU8::new(ENABLE_OFF);
 static EVENT_LOGS_OVERRIDE: AtomicU8 = AtomicU8::new(ENABLE_OFF);
 static METRICS: OnceLock<Vec<StageMetrics>> = OnceLock::new();
 static SETUP_TEARDOWN_WATCHDOG_ARMED: AtomicU64 = AtomicU64::new(0);
+static LOCAL_FINAL_RESPONSE_RELEASED: AtomicU64 = AtomicU64::new(0);
+static LOCAL_FINAL_RESPONSE_RETAINED: AtomicU64 = AtomicU64::new(0);
 static SETUP_TEARDOWN_WATCHDOG_DISARMED: AtomicU64 = AtomicU64::new(0);
 static SETUP_TEARDOWN_WATCHDOG_FIRED: AtomicU64 = AtomicU64::new(0);
 static SETUP_TEARDOWN_WATCHDOG_TRANSITION_FAILED: AtomicU64 = AtomicU64::new(0);
@@ -351,6 +359,8 @@ pub fn snapshot() -> CleanupDiagSnapshot {
     CleanupDiagSnapshot {
         enabled: enabled(),
         active_total,
+        local_final_response_released: LOCAL_FINAL_RESPONSE_RELEASED.load(Ordering::Relaxed),
+        local_final_response_retained: LOCAL_FINAL_RESPONSE_RETAINED.load(Ordering::Relaxed),
         setup_teardown_watchdog_armed: SETUP_TEARDOWN_WATCHDOG_ARMED.load(Ordering::Relaxed),
         setup_teardown_watchdog_disarmed: SETUP_TEARDOWN_WATCHDOG_DISARMED.load(Ordering::Relaxed),
         setup_teardown_watchdog_fired: SETUP_TEARDOWN_WATCHDOG_FIRED.load(Ordering::Relaxed),
@@ -496,6 +506,14 @@ fn metric(stage: CleanupStage) -> &'static StageMetrics {
     &metrics()[stage.as_index()]
 }
 
+pub(crate) fn record_local_final_response_released() {
+    LOCAL_FINAL_RESPONSE_RELEASED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_local_final_response_retained() {
+    LOCAL_FINAL_RESPONSE_RETAINED.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn record_setup_teardown_watchdog_armed() {
     SETUP_TEARDOWN_WATCHDOG_ARMED.fetch_add(1, Ordering::Relaxed);
 }
@@ -600,6 +618,8 @@ pub(crate) fn reset_for_tests() {
     for metric in metrics() {
         metric.reset();
     }
+    LOCAL_FINAL_RESPONSE_RELEASED.store(0, Ordering::Relaxed);
+    LOCAL_FINAL_RESPONSE_RETAINED.store(0, Ordering::Relaxed);
     SETUP_TEARDOWN_WATCHDOG_ARMED.store(0, Ordering::Relaxed);
     SETUP_TEARDOWN_WATCHDOG_DISARMED.store(0, Ordering::Relaxed);
     SETUP_TEARDOWN_WATCHDOG_FIRED.store(0, Ordering::Relaxed);

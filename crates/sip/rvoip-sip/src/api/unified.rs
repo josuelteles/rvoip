@@ -8536,6 +8536,14 @@ fn ensure_retry_not_challenged(method: Method, response: &Response) -> Result<()
 }
 
 impl UnifiedCoordinator {
+    /// Number of sessions currently retained in the lifecycle store.
+    ///
+    /// The store is capacity bounded, and a full store rejects every new
+    /// INVITE with 503, so this is the occupancy an application watches.
+    pub fn retained_session_count(&self) -> usize {
+        self.helpers.state_machine.store.sessions.len()
+    }
+
     /// Create and start a new coordinator.
     ///
     /// This validates [`Config`], initializes dialog and media adapters,
@@ -10347,6 +10355,99 @@ impl UnifiedCoordinator {
         release_guard.finish_success();
         crate::cleanup_diag::record_setup_teardown_watchdog_release_completed();
         claim_owner.finish(ExactTerminalCompletion::Released);
+    }
+
+    /// End one initial INVITE that this side answered with a local final
+    /// response: 3xx, 4xx-6xx, a challenge, or any other final status.
+    ///
+    /// `dispatch` sends the response and commits the terminal transition. What
+    /// happens next is decided by the lifecycle state, never by the dispatch
+    /// result: a zero-wire retryable attempt went back to `Ringing` and keeps
+    /// its session, because the retry needs it, while a terminal state (wire
+    /// unknown included) publishes its terminal event once and releases.
+    ///
+    /// The release runs in a retained task on purpose.
+    /// `release_exact_local_resources_with_retry` waits for the operations of
+    /// this generation to quiesce, so running it inline would make a caller
+    /// that is itself inside one of those operations wait for itself.
+    pub(crate) async fn resolve_incoming_final_exact<F>(
+        &self,
+        handle: &SessionRegistryHandle,
+        terminal_event: Option<crate::api::events::Event>,
+        dispatch: F,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
+        let dispatched = dispatch.await;
+        self.release_local_final_response_exact(handle, terminal_event);
+        dispatched
+    }
+
+    /// Release the session of a locally answered initial INVITE when its
+    /// lifecycle reached a terminal state. A generation that is already gone
+    /// is idempotent, and a still-live non-terminal state keeps its session.
+    pub(crate) fn release_local_final_response_exact(
+        &self,
+        handle: &SessionRegistryHandle,
+        terminal_event: Option<crate::api::events::Event>,
+    ) {
+        let Some(coordinator) = self.self_weak.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let session_id = handle.session_id().clone();
+        let handle = handle.clone();
+        let spawned = self
+            .setup_teardown_scheduler
+            .spawn_lifecycle_task(async move {
+                // Decided by the lifecycle state. A dispatch that could not
+                // reach the wire leaves the call in a live state and keeps its
+                // session for the retry; the state is authoritative even when
+                // the write outcome is unknown.
+                let terminal = match coordinator
+                    .helpers
+                    .state_machine
+                    .store
+                    .get_session_snapshot_exact(&handle)
+                {
+                    Ok(session) => matches!(
+                        session.call_state,
+                        crate::types::CallState::Terminated
+                            | crate::types::CallState::Terminating
+                            | crate::types::CallState::Cancelled
+                            | crate::types::CallState::Failed(_)
+                    ),
+                    // The generation is gone: another owner already released it.
+                    Err(_) => return,
+                };
+                if !terminal {
+                    crate::cleanup_diag::record_local_final_response_retained();
+                    return;
+                }
+                let event =
+                    terminal_event.unwrap_or_else(|| crate::api::events::Event::CallEnded {
+                        call_id: handle.session_id().clone(),
+                        reason: "Local final response".to_string(),
+                    });
+                if let Err(error) = coordinator
+                    .finalize_local_terminal_exact(&handle, event)
+                    .await
+                {
+                    tracing::debug!(
+                        session = %handle.session_id(),
+                        %error,
+                        "local final response release was incomplete"
+                    );
+                    return;
+                }
+                crate::cleanup_diag::record_local_final_response_released();
+            });
+        if !spawned {
+            tracing::debug!(
+                session = %session_id,
+                "local final response release was not admitted; shutdown owns the release"
+            );
+        }
     }
 
     /// Complete the retained publication/release phase for one exact local

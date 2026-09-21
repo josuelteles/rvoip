@@ -181,18 +181,33 @@ impl GenericResponseBuilder {
         // 3xx → redirect path; 4xx/5xx/6xx → reject path.
         if (300..=399).contains(&self.status) {
             self.coord
-                .helpers
-                .redirect_call_with_extras_exact(
+                .resolve_incoming_final_exact(
                     lifecycle_handle,
-                    self.status,
-                    vec![reason],
-                    extras,
+                    None,
+                    self.coord.helpers.redirect_call_with_extras_exact(
+                        lifecycle_handle,
+                        self.status,
+                        vec![reason],
+                        extras,
+                    ),
                 )
                 .await
         } else {
             self.coord
-                .helpers
-                .reject_call_with_extras_exact(lifecycle_handle, self.status, &reason, extras)
+                .resolve_incoming_final_exact(
+                    lifecycle_handle,
+                    Some(crate::api::events::Event::CallFailed {
+                        call_id: self.call_id.clone(),
+                        status_code: self.status,
+                        reason: reason.clone(),
+                    }),
+                    self.coord.helpers.reject_call_with_extras_exact(
+                        lifecycle_handle,
+                        self.status,
+                        &reason,
+                        extras,
+                    ),
+                )
                 .await
         }
     }

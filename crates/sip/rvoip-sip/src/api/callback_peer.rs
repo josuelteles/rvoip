@@ -2158,8 +2158,19 @@ impl<H: CallHandler> CallbackPeer<H> {
 
                             if let Some(exact_handle) = lifecycle_handle.as_ref() {
                                 let _ = coordinator
-                                    .helpers
-                                    .reject_call_exact(exact_handle, status, &reason)
+                                    .resolve_incoming_final_exact(
+                                        exact_handle,
+                                        Some(crate::api::events::Event::CallFailed {
+                                            call_id: exact_handle.session_id().clone(),
+                                            status_code: status,
+                                            reason: reason.clone(),
+                                        }),
+                                        coordinator.helpers.reject_call_exact(
+                                            exact_handle,
+                                            status,
+                                            &reason,
+                                        ),
+                                    )
                                     .await;
                             } else {
                                 tracing::warn!(call_id = %call_id, "callback reject suppressed without exact lifecycle authority");
@@ -2176,8 +2187,15 @@ impl<H: CallHandler> CallbackPeer<H> {
 
                             if let Some(exact_handle) = lifecycle_handle.as_ref() {
                                 let _ = coordinator
-                                    .helpers
-                                    .redirect_call_exact(exact_handle, 302, vec![target])
+                                    .resolve_incoming_final_exact(
+                                        exact_handle,
+                                        None,
+                                        coordinator.helpers.redirect_call_exact(
+                                            exact_handle,
+                                            302,
+                                            vec![target],
+                                        ),
+                                    )
                                     .await;
                             } else {
                                 tracing::warn!(call_id = %call_id, "callback redirect suppressed without exact lifecycle authority");

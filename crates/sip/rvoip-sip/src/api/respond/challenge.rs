@@ -367,17 +367,25 @@ impl AuthChallengeBuilder {
             ))
         })?;
 
+        let reason = if self.proxy {
+            "Proxy Authentication Required"
+        } else {
+            "Unauthorized"
+        };
         self.coord
-            .helpers
-            .reject_call_with_extras_exact(
+            .resolve_incoming_final_exact(
                 lifecycle_handle,
-                status,
-                if self.proxy {
-                    "Proxy Authentication Required"
-                } else {
-                    "Unauthorized"
-                },
-                extras,
+                Some(crate::api::events::Event::CallFailed {
+                    call_id: self.call_id.clone(),
+                    status_code: status,
+                    reason: reason.to_string(),
+                }),
+                self.coord.helpers.reject_call_with_extras_exact(
+                    lifecycle_handle,
+                    status,
+                    reason,
+                    extras,
+                ),
             )
             .await
     }
