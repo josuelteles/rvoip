@@ -277,34 +277,130 @@ New sip-dialog unit tests:
 
 ## Known limitations
 
-- A request with the same branch as a live server transaction but another
-  sent-by is a separate transaction by RFC 3261 §17.2.3, but `TransactionKey`
-  (public, used by sharding, indexes and diagnostics) has no sent-by, so it
-  cannot open its own transaction. It gets a stateless 500 with
-  `Retry-After: 1` and never touches the existing transaction. This includes
-  a TCP client that reconnects, puts the new port in its Via and resends the
-  INVITE with the same branch: before, it got the retained final replayed.
-  Fixing it properly means carrying sent-by in the transaction key.
-- Other non-INVITE copies over TCP (a BYE, for example) that land in the same
-  retirement window still get the generic retriable 500: their original
-  response is not retained on a reliable transport and cannot be recomputed.
-- A redirect still publishes a generic terminal event; there is no typed
-  redirect event.
+- Two calls that reuse one branch from different sent-bys cannot both have a
+  server transaction: `TransactionKey` (public, used by sharding, indexes and
+  diagnostics) has no sent-by. The second is refused with a stateless 500 and
+  `Retry-After: 1`, and never touches the first. This is the one remaining
+  deviation from RFC 3261 §17.2.3, and it needs a forged branch or a broken
+  generator to happen. The same request from another sent-by (same Call-ID,
+  From tag and CSeq, no To tag) is not this case: it is a merged request and
+  gets 482, see below.
+- A copy of a non-INVITE request whose transaction retired without any final
+  (a transport error, for example) is absorbed in silence and counted, like a
+  retransmission in `Trying` (RFC 3261 §17.2.2). Nothing is left to replay.
+- The reason phrase an application passes to a response builder never reaches
+  the status line: the wire always carries the status's own phrase. Only the
+  published event carries the custom text.
 
-The C0 cases of the final test file (which adds the TCP variants) were run
-again on 1d4ce510 with its own target directory: all five fail the same way
-as recorded above (transaction gone right after the 480, no retransmission,
-ACK on the 2xx path with one orphan `WARN`, session retained).
+## Sent-by matching, merged requests and retained finals
+
+### The inventory behind the decision
+
+Everything that builds or looks up a *server* transaction key, outside tests
+(the full list is 31 sites; server-side ones summarized here):
+
+| Where | What it does |
+|---|---|
+| `transaction/utils/transaction_helpers.rs::transaction_key_from_message` | the one construction from an inbound message; ACK and CANCEL derive the INVITE key from it |
+| `transaction/manager/mod.rs::create_server_transaction*` | the key a new server transaction is published under |
+| `transaction/key.rs::from_request` / `with_method` | used by dialog-core and rvoip-sip to name the INVITE of an ACK or CANCEL |
+| `transaction/server/{invite,non_invite}.rs` | the key of a request dispatched into a live transaction |
+| `manager/core.rs`, `manager/transaction_integration.rs` | dialog indexes, sharding and route hashes, all keyed by the whole key |
+| `transaction/safe_diagnostics.rs` | redacted rendering for logs |
+| rvoip-sip: `session_event_handler.rs`, `dialog_adapter.rs`, `state_machine/actions.rs`, `api/incoming.rs`, `adapters/outbound_request_tracker.rs` | 15 sites that keep the key as a string and parse it back with `parse::<TransactionKey>()` |
+
+Carrying the sent-by inside `TransactionKey` was considered and dropped:
+
+- `Eq`/`Hash` would change meaning, so a server key built with
+  `TransactionKey::new(branch, method, true)` would silently stop matching its
+  transaction. The signature stays, the behavior does not: a silent break for
+  anything outside this repository too.
+- `Display`/`FromStr` would have to carry the sent-by (with the colons of an
+  IPv6 host) through those 15 string round trips.
+- The only requirement that needs it is two different calls sharing a branch,
+  which needs a forged branch or a broken generator.
+
+The reconnecting TCP client, the real case behind the limitation, is answered
+without touching the key, by RFC 3261 §8.2.2.2.
+
+### What the stack does now
+
+- A request whose branch matches a server transaction with another top Via
+  sent-by never acts on it (§17.2.3).
+- If it is the same request (Call-ID, From tag, CSeq number and method, and no
+  To tag), it is a merged request and gets 482. The key collides, so the 482
+  is stateless: a copy of it gets the same answer. This is what the TCP client
+  that reconnects and puts its new port in the Via receives, and it never
+  becomes a second call.
+- The same check guards the cached INVITE 2xx replay: a 2xx is replayed only
+  to the sent-by it was sent to.
+- Otherwise it is another call reusing the branch, and gets the stateless 500
+  described in the limitations.
+- `retained_transaction_key_ingress` was revised accordingly: its TCP attempts
+  come from a fresh source port each time, which by §17.2.3 makes them merged
+  requests and not retransmissions. It now requires 482 for every attempt
+  after the first, and that no attempt becomes a second call. The invariant it
+  was written for holds: a reserved key never swallows a request.
+- On a reliable transport, where Timer J is zero, a retired non-INVITE server
+  transaction leaves its final response in the admission reservation that
+  still holds the key. A copy arriving in that window gets the same bytes back
+  on its own flow, with no event for the transaction user. The retained final
+  is released with the reservation and counted in
+  `transaction_manager.retained_server_finals`.
+- An INVITE retransmission in `Completed` retransmits the final response
+  (§17.2.1). It used to be ignored, which over TCP left the peer with nothing
+  until Timer H.
+
+New counters: `server_merged_request_rejected`, `server_final_retained`,
+`server_final_replayed`, `server_copy_absorbed`.
+
+## Local redirect
+
+- Every local final 3xx-6xx to an initial INVITE now publishes
+  `CallFailed { status_code, reason }`: the redirect builder, the 3xx branch
+  of the generic builder and `CallHandlerDecision::Redirect`. A redirect is
+  told apart by the status range, and `CallFailed`'s documentation says so.
+  There is still exactly one terminal event per session.
+- The 3xx branch of the generic builder used to pass the reason phrase as the
+  contact list, so `coordinator.respond(&call, 302).send()` failed with an
+  invalid Contact URI and no 302 ever reached the wire. The generic builder
+  now takes contacts of its own (`with_contact`, `with_contacts`), and a 3xx
+  without any goes out without a `Contact` header (RFC 3261 §21.3 recommends
+  one in 300-305, but it is the application's to give).
+- The default reason phrase of a response builder is the status's, not `"OK"`.
+- Several contacts in one `Contact` header are comma separated. They used to
+  be concatenated (`<sip:a><sip:b>`), which is not a valid header.
+
+### Proposals, not in this delivery
+
+- `Event::CallRedirected { call_id, status_code, contacts }` for the next
+  major version, together with `#[non_exhaustive]` on `Event`: today a new
+  variant would break every consumer that matches exhaustively.
+- Merged-request detection for a forked INVITE that arrives through two paths
+  with different branches (RFC 3261 §8.2.2.2). It needs its own index by
+  Call-ID, From tag and CSeq; today those arrive as two calls.
+- Carrying the sent-by in the server transaction key, with the cost described
+  in the inventory above.
 
 ## Suites
 
-Debug builds, 2026-09-22:
+Debug builds, 2026-09-22, after the sent-by, retained-final and redirect work:
 
 | Command | Result |
 |---|---|
-| `cargo test -p rvoip-sip-dialog --no-fail-fast` | 1091 passed, 0 failed |
-| `cargo test -p rvoip-sip --no-fail-fast` | 1527 passed, 0 failed, 39 ignored |
-| `cargo test -p rvoip-sip --features perf-tests --no-fail-fast` | everything passes except the 16 `perf_*` benchmark targets, which refuse to run outside `--release` ("debug-build numbers are not citable") |
-| `cargo test -p rvoip-sip-proxy -p rvoip-sip-registrar --no-fail-fast` | passed |
-| `cargo test -p rvoip-sip --features perf-tests --test invite_server_transaction_after_local_final` | 25 passed |
+| `cargo test -p rvoip-sip-dialog --no-fail-fast` | 1095 passed, 0 failed |
+| `cargo test -p rvoip-sip --no-fail-fast` | 1527 passed, 0 failed |
+| `cargo test -p rvoip-sip-core --lib` | 2134 passed, 0 failed |
+| `cargo test -p rvoip-sip-proxy -p rvoip-sip-registrar --no-fail-fast` | 54 passed, 0 failed |
+| `cargo test -p rvoip-sip --features perf-tests --test invite_server_transaction_after_local_final` | 43 passed (C0, A, M, C, K and D cases) |
 | `cargo test -p rvoip-sip --test local_final_response_session_release` | 7 passed |
+| `cargo test -p rvoip-sip-dialog --test retired_server_final_replay` | 4 passed (R1, R2, R3, R6, R7) |
+| `cargo test -p rvoip-sip-dialog --test retained_transaction_key_ingress` | 4 passed |
+
+The 16 `perf_*` targets under `--features perf-tests` still refuse to run
+outside `--release`.
+
+R4 (a copy of a transaction that retired without any final) has no test: the
+path is reached only by a transport error at the moment the final is written.
+K6 and K7 of the original plan do not apply, because the transaction key was
+left unchanged.

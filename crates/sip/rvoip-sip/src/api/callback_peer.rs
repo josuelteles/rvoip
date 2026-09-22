@@ -2189,7 +2189,11 @@ impl<H: CallHandler> CallbackPeer<H> {
                                 let _ = coordinator
                                     .resolve_incoming_final_exact(
                                         exact_handle,
-                                        None,
+                                        Some(crate::api::events::Event::CallFailed {
+                                            call_id: exact_handle.session_id().clone(),
+                                            status_code: 302,
+                                            reason: crate::api::respond::generic::status_reason(302),
+                                        }),
                                         coordinator.helpers.redirect_call_exact(
                                             exact_handle,
                                             302,

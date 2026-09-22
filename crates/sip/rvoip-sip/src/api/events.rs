@@ -311,7 +311,11 @@ pub enum Event {
         reason: String,
     },
 
-    /// Call failed (4xx/5xx response or timeout)
+    /// Call failed (4xx/5xx response or timeout).
+    ///
+    /// Also published for every local final 3xx-6xx to an initial INVITE:
+    /// rejections, challenges and redirects. A redirect is told apart by a
+    /// `status_code` in the 3xx range.
     CallFailed {
         /// Session identifier for the failed call.
         call_id: CallId,

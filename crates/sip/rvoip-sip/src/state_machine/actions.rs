@@ -826,10 +826,11 @@ fn exact_redirect_response_headers(
         TypedHeader,
     };
 
+    // RFC 3261 §21.3 recommends a Contact in 300-305, but the contacts are
+    // the application's to give: without any, the 3xx goes out without one
+    // rather than with an invented URI.
     if contacts.is_empty() {
-        return Err(zero_wire_exact_response_error(
-            "initial INVITE redirect has no Contact URI",
-        ));
+        return Ok(extra_headers.unwrap_or_default());
     }
     let mut params = Vec::with_capacity(contacts.len());
     for contact in contacts {

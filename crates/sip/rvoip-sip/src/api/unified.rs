@@ -7986,6 +7986,7 @@ impl UnifiedCoordinator {
                 "server_transactions": transaction_counts.server_transactions,
                 "total": transaction_counts.active_transactions_total,
                 "terminated_transactions": transaction_counts.terminated_transactions,
+                "retained_server_finals": transaction_counts.retained_server_finals,
                 "server_invite_dialog_index": transaction_counts.server_invite_dialog_index,
                 "server_invite_dialog_keys_by_tx": transaction_counts.server_invite_dialog_keys_by_tx,
                 "invite_2xx_response_cache": transaction_counts.invite_2xx_response_cache,

@@ -614,17 +614,19 @@ impl Contact {
 
 impl fmt::Display for Contact {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Every contact is its own comma-separated entry (RFC 3261 §20.10),
+        // whether it came in its own value or shares one with others.
         let mut first = true;
         for value in &self.0 {
             match value {
                 ContactValue::Params(params) => {
-                    if !first {
-                        write!(f, ", ")?;
-                    }
                     for cp in params {
+                        if !first {
+                            write!(f, ", ")?;
+                        }
                         write!(f, "{}", cp.address)?;
+                        first = false;
                     }
-                    first = false;
                 }
                 ContactValue::Star => write!(f, "*")?,
             }
@@ -782,6 +784,22 @@ mod tests {
     use crate::types::address::Address;
     use crate::types::uri::Uri;
     use std::str::FromStr;
+
+    #[test]
+    fn contacts_sharing_one_value_are_comma_separated() {
+        let params = ["sip:a@127.0.0.1:5090", "sip:b@127.0.0.1:5091"]
+            .into_iter()
+            .map(|uri| ContactParamInfo {
+                address: Address::new(Uri::from_str(uri).unwrap()),
+            })
+            .collect();
+        let contact = Contact::new_params(params);
+        let rendered = contact.to_string();
+        assert_eq!(rendered, "<sip:a@127.0.0.1:5090>, <sip:b@127.0.0.1:5091>");
+
+        let reparsed = Contact::from_str(&rendered).unwrap();
+        assert_eq!(reparsed.addresses().count(), 2);
+    }
 
     #[test]
     fn test_contact_typed_header_trait() {

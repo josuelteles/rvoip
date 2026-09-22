@@ -20,6 +20,7 @@ pub struct GenericResponseBuilder {
     method: Method,
     status: u16,
     reason: Option<String>,
+    contacts: Vec<String>,
     exact_transaction: Option<TransactionKey>,
     response_obligation: Option<Arc<ExactResponseObligation>>,
     state: BuilderHeaderState,
@@ -71,6 +72,7 @@ impl GenericResponseBuilder {
             method,
             status,
             reason: None,
+            contacts: Vec::new(),
             exact_transaction: None,
             response_obligation: None,
             state: BuilderHeaderState::default(),
@@ -106,6 +108,7 @@ impl GenericResponseBuilder {
             method,
             status,
             reason: None,
+            contacts: Vec::new(),
             exact_transaction: Some(transaction_id),
             response_obligation: Some(response_obligation),
             state: BuilderHeaderState::default(),
@@ -118,11 +121,43 @@ impl GenericResponseBuilder {
         self
     }
 
+    /// Add a `Contact` URI to a 3xx to the initial INVITE.
+    ///
+    /// Contacts are only what the application gives: a 3xx without any goes
+    /// out without a `Contact` header. RFC 3261 §21.3 recommends one in
+    /// 300-305, so a redirect should normally carry at least one. Other
+    /// statuses reject contacts at [`Self::send`].
+    pub fn with_contact(mut self, uri: impl Into<String>) -> Self {
+        self.contacts.push(uri.into());
+        self
+    }
+
+    /// Add several `Contact` URIs to a 3xx. See [`Self::with_contact`].
+    pub fn with_contacts<I, S>(mut self, uris: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.contacts.extend(uris.into_iter().map(Into::into));
+        self
+    }
+
     /// Send the response, routing 3xx through the redirect path and
     /// 4xx/5xx/6xx through the reject path.
     pub async fn send(mut self) -> Result<()> {
-        let reason = self.reason.unwrap_or_else(|| "OK".to_string());
+        let reason = self
+            .reason
+            .take()
+            .unwrap_or_else(|| status_reason(self.status));
         let extras = take_staged(&mut self.state);
+        if !self.contacts.is_empty()
+            && (self.exact_transaction.is_some() || !(300..=399).contains(&self.status))
+        {
+            return Err(SessionError::InvalidInput(format!(
+                "Contact URIs are only accepted for a 3xx to the initial INVITE, got {}",
+                self.status
+            )));
+        }
 
         if let Some(transaction_id) = self.exact_transaction.take() {
             let obligation = self.response_obligation.take().ok_or_else(|| {
@@ -183,11 +218,15 @@ impl GenericResponseBuilder {
             self.coord
                 .resolve_incoming_final_exact(
                     lifecycle_handle,
-                    None,
+                    Some(crate::api::events::Event::CallFailed {
+                        call_id: self.call_id.clone(),
+                        status_code: self.status,
+                        reason,
+                    }),
                     self.coord.helpers.redirect_call_with_extras_exact(
                         lifecycle_handle,
                         self.status,
-                        vec![reason],
+                        std::mem::take(&mut self.contacts),
                         extras,
                     ),
                 )
@@ -227,4 +266,11 @@ impl SipRequestOptions for GenericResponseBuilder {
     fn header_state(&self) -> &BuilderHeaderState {
         &self.state
     }
+}
+
+/// Reason phrase of `status`, used when the application gave none.
+pub(crate) fn status_reason(status: u16) -> String {
+    rvoip_sip_core::StatusCode::from_u16(status)
+        .map(|code| code.reason_phrase().to_string())
+        .unwrap_or_default()
 }

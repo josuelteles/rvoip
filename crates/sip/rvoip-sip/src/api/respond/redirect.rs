@@ -69,12 +69,16 @@ impl RedirectBuilder {
         }
 
         let extras = take_staged(&mut self.state);
-        // A redirect is not a failure, and there is no typed redirect event
-        // yet, so the session is released without publishing one.
+        // A local 3xx ends the call like any other local final 3xx-6xx, so
+        // it publishes `CallFailed`; the status range tells a redirect apart.
         self.coord
             .resolve_incoming_final_exact(
                 lifecycle_handle,
-                None,
+                Some(crate::api::events::Event::CallFailed {
+                    call_id: self.call_id.clone(),
+                    status_code: self.status,
+                    reason: super::generic::status_reason(self.status),
+                }),
                 self.coord.helpers.redirect_call_with_extras_exact(
                     lifecycle_handle,
                     self.status,

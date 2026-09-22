@@ -127,6 +127,17 @@ enum Mode {
     Hold,
     /// Accept with 200.
     Accept,
+    /// Final through `coordinator.respond(..)` (the generic builder), with an
+    /// optional reason phrase.
+    Generic {
+        status: u16,
+        reason: Option<&'static str>,
+        contacts: &'static [&'static str],
+    },
+    /// 3xx through `coordinator.redirect(..)` with these contacts.
+    Redirect { contacts: &'static [&'static str] },
+    /// `CallHandlerDecision::Redirect` from the handler.
+    HandlerRedirect(&'static str),
 }
 
 struct UasHandler {
@@ -134,6 +145,8 @@ struct UasHandler {
     coordinator: Arc<tokio::sync::OnceCell<Arc<UnifiedCoordinator>>>,
     ringing_seen: Arc<tokio::sync::Notify>,
     held: Arc<Mutex<Vec<CallId>>>,
+    /// Terminal events published for incoming calls, as short labels.
+    terminal: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -164,7 +177,56 @@ impl CallHandler for UasHandler {
                 CallHandlerDecision::Defer(call.defer(Duration::from_secs(60)))
             }
             Mode::Accept => CallHandlerDecision::Accept,
+            Mode::HandlerRedirect(target) => CallHandlerDecision::Redirect(target.to_string()),
+            Mode::Generic {
+                status,
+                reason,
+                contacts,
+            } => {
+                let coordinator = self
+                    .coordinator
+                    .get()
+                    .expect("coordinator is published before any INVITE")
+                    .clone();
+                let mut builder = coordinator.respond(&call_id, status).expect("respond");
+                if let Some(reason) = reason {
+                    builder = builder.with_reason(reason);
+                }
+                builder = builder.with_contacts(contacts.iter().copied());
+                builder.send().await.expect("generic final");
+                CallHandlerDecision::Defer(call.defer(Duration::from_secs(60)))
+            }
+            Mode::Redirect { contacts } => {
+                let coordinator = self
+                    .coordinator
+                    .get()
+                    .expect("coordinator is published before any INVITE")
+                    .clone();
+                coordinator
+                    .redirect(&call_id)
+                    .with_status(302)
+                    .with_contacts(contacts.iter().map(|c| c.to_string()).collect())
+                    .send()
+                    .await
+                    .expect("redirect");
+                CallHandlerDecision::Defer(call.defer(Duration::from_secs(60)))
+            }
         }
+    }
+
+    async fn on_event(&self, event: rvoip_sip::api::events::Event) {
+        use rvoip_sip::api::events::Event;
+        let label = match event {
+            Event::CallFailed {
+                status_code,
+                reason,
+                ..
+            } => format!("CallFailed {status_code} {reason}"),
+            Event::CallEnded { reason, .. } => format!("CallEnded {reason}"),
+            Event::CallCancelled { .. } => "CallCancelled".to_string(),
+            _ => return,
+        };
+        self.terminal.lock().unwrap().push(label);
     }
 }
 
@@ -211,6 +273,7 @@ struct Harness {
     logs: LogCapture,
     ringing_seen: Arc<tokio::sync::Notify>,
     held: Arc<Mutex<Vec<CallId>>>,
+    terminal: Arc<Mutex<Vec<String>>>,
     _log_guard: tracing::subscriber::DefaultGuard,
 }
 
@@ -235,12 +298,14 @@ impl Harness {
         let cell = Arc::new(tokio::sync::OnceCell::new());
         let ringing_seen = Arc::new(tokio::sync::Notify::new());
         let held = Arc::new(Mutex::new(Vec::new()));
+        let terminal = Arc::new(Mutex::new(Vec::new()));
         let peer = CallbackPeer::new(
             UasHandler {
                 mode,
                 coordinator: cell.clone(),
                 ringing_seen: ringing_seen.clone(),
                 held: held.clone(),
+                terminal: terminal.clone(),
             },
             Config::local("uas", uas_port).with_auto_180_ringing(true),
         )
@@ -316,6 +381,7 @@ impl Harness {
             logs,
             ringing_seen,
             held,
+            terminal,
             _log_guard: log_guard,
         }
     }
@@ -465,6 +531,27 @@ impl Harness {
             SDP.len(),
             via = self.via(tag, None, ""),
             transport = self.wire.token().to_ascii_lowercase(),
+        )
+    }
+
+    /// An INVITE with the branch of `tag` but another Via sent-by, and
+    /// optionally another Call-ID: what a reconnected client (same call) or a
+    /// true branch collision (another call) sends.
+    fn foreign_invite(&self, tag: &str, sent_by: &str, call_tag: &str) -> String {
+        let (uas_port, client_port) = (self.uas_port, self.client_port);
+        format!(
+            "INVITE sip:uas@127.0.0.1:{uas_port} SIP/2.0\r\n\
+             {via}\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sip:caller@127.0.0.1:{client_port}>;tag={call_tag}\r\n\
+             To: <sip:uas@127.0.0.1:{uas_port}>\r\n\
+             Call-ID: {call_tag}@127.0.0.1\r\n\
+             CSeq: 1 INVITE\r\n\
+             Contact: <sip:caller@127.0.0.1:{client_port}>\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\r\n{SDP}",
+            SDP.len(),
+            via = self.via(tag, Some(sent_by), ""),
         )
     }
 
@@ -1394,4 +1481,322 @@ over_udp_and_tcp!(
     c6_cancel_with_copied_to_tag_is_accepted,
     c6_cancel_over_tcp_with_copied_to_tag_is_accepted,
     c6
+);
+
+// ===== D: local redirect (RFC 3261 §21.3) =====
+
+/// Status line and Contact headers of the first final to the INVITE, and the
+/// terminal events once the session settled.
+async fn local_final(wire: Wire, mode: Mode, status: u16) -> (String, Vec<String>, Vec<String>) {
+    let mut h = Harness::start(wire, mode).await;
+    let baseline = h.snapshot().await;
+    let tag = "d";
+
+    h.ringing(tag).await;
+    let (_, response) = h.expect(status, "INVITE").await;
+    let released = h.session_released(baseline.sessions, T1 / 2).await;
+    h.send(h.non_2xx_ack(tag, &response, None)).await;
+    h.quiesce().await;
+    let status_line = response.lines().next().unwrap_or("").to_string();
+    // One entry per contact, whether they share a header or not (§20.10).
+    let contacts: Vec<String> = response
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name.trim().eq_ignore_ascii_case("Contact") || name.trim() == "m")
+                .then(|| value.to_string())
+        })
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(|entry| entry.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let terminal = h.terminal.lock().unwrap().clone();
+    let lines = vec![
+        format!("status line: {status_line}"),
+        format!("Contact: {contacts:?}"),
+        format!("terminal events: {terminal:?}"),
+        format!("session released after {released:?}"),
+    ];
+    report(&format!("D/{wire:?}/{mode:?}"), &lines, &h.logs);
+    h.stop().await;
+    assert!(
+        released.is_some(),
+        "the session is released after a local final"
+    );
+    (status_line, contacts, terminal)
+}
+
+/// D1: the redirect builder sends every contact and publishes `CallFailed`
+/// with the 3xx status, exactly once.
+async fn d1(wire: Wire) {
+    let (status_line, contacts, terminal) = local_final(
+        wire,
+        Mode::Redirect {
+            contacts: &["sip:a@127.0.0.1:5090", "sip:b@127.0.0.1:5091"],
+        },
+        302,
+    )
+    .await;
+    assert_eq!(status_line, "SIP/2.0 302 Moved Temporarily");
+    assert_eq!(contacts.len(), 2, "both contacts on the wire: {contacts:?}");
+    assert!(contacts[0].contains("sip:a@127.0.0.1:5090"));
+    assert!(contacts[1].contains("sip:b@127.0.0.1:5091"));
+    assert_eq!(
+        terminal,
+        vec!["CallFailed 302 Moved Temporarily".to_string()]
+    );
+}
+
+over_udp_and_tcp!(
+    d1_redirect_builder_sends_contacts_and_call_failed,
+    d1_redirect_builder_over_tcp_sends_contacts_and_call_failed,
+    d1
+);
+
+/// D3: a 302 through the generic builder without contacts has no Contact
+/// header, never the reason phrase as one, and the status reason phrase.
+async fn d3(wire: Wire) {
+    let (status_line, contacts, terminal) = local_final(
+        wire,
+        Mode::Generic {
+            status: 302,
+            reason: None,
+            contacts: &[],
+        },
+        302,
+    )
+    .await;
+    assert_eq!(status_line, "SIP/2.0 302 Moved Temporarily");
+    assert!(contacts.is_empty(), "no invented Contact: {contacts:?}");
+    assert_eq!(
+        terminal,
+        vec!["CallFailed 302 Moved Temporarily".to_string()]
+    );
+}
+
+over_udp_and_tcp!(
+    d3_generic_302_without_contacts_has_no_contact,
+    d3_generic_302_over_tcp_without_contacts_has_no_contact,
+    d3
+);
+
+/// D4: a 486 through the generic builder without a reason phrase uses the
+/// status reason phrase and publishes `CallFailed` 486 once.
+async fn d4(wire: Wire) {
+    let (status_line, contacts, terminal) = local_final(
+        wire,
+        Mode::Generic {
+            status: 486,
+            reason: None,
+            contacts: &[],
+        },
+        486,
+    )
+    .await;
+    assert_eq!(status_line, "SIP/2.0 486 Busy Here");
+    assert!(contacts.is_empty());
+    assert_eq!(terminal, vec!["CallFailed 486 Busy Here".to_string()]);
+}
+
+over_udp_and_tcp!(
+    d4_generic_486_uses_the_status_reason,
+    d4_generic_486_over_tcp_uses_the_status_reason,
+    d4
+);
+
+/// D2: a 302 through the generic builder carries exactly the contacts the
+/// application gave, with the status reason phrase and `CallFailed` 302.
+async fn d2(wire: Wire) {
+    let (status_line, contacts, terminal) = local_final(
+        wire,
+        Mode::Generic {
+            status: 302,
+            reason: None,
+            contacts: &["sip:elsewhere@127.0.0.1:5092"],
+        },
+        302,
+    )
+    .await;
+    assert_eq!(status_line, "SIP/2.0 302 Moved Temporarily");
+    assert_eq!(contacts.len(), 1, "{contacts:?}");
+    assert!(contacts[0].contains("sip:elsewhere@127.0.0.1:5092"));
+    assert_eq!(
+        terminal,
+        vec!["CallFailed 302 Moved Temporarily".to_string()]
+    );
+}
+
+over_udp_and_tcp!(
+    d2_generic_302_carries_the_given_contact,
+    d2_generic_302_over_tcp_carries_the_given_contact,
+    d2
+);
+
+/// D1 for `CallHandlerDecision::Redirect`: one Contact, `CallFailed` 302 once.
+async fn d1_handler(wire: Wire) {
+    let (status_line, contacts, terminal) = local_final(
+        wire,
+        Mode::HandlerRedirect("sip:handler@127.0.0.1:5093"),
+        302,
+    )
+    .await;
+    assert_eq!(status_line, "SIP/2.0 302 Moved Temporarily");
+    assert_eq!(contacts.len(), 1, "{contacts:?}");
+    assert!(contacts[0].contains("sip:handler@127.0.0.1:5093"));
+    assert_eq!(
+        terminal,
+        vec!["CallFailed 302 Moved Temporarily".to_string()]
+    );
+}
+
+over_udp_and_tcp!(
+    d1_handler_redirect_publishes_call_failed,
+    d1_handler_redirect_over_tcp_publishes_call_failed,
+    d1_handler
+);
+
+// ===== K: branch collisions (RFC 3261 §8.2.2.2, §17.2.3) =====
+
+/// K2 and K3: the same INVITE from another sent-by, as a reconnected client
+/// sends it, is a merged request: 482, and the original transaction is
+/// untouched, whether it is in `Completed` (K2) or `Proceeding` (K3).
+async fn k_merged(wire: Wire, mode: Mode, original_state: &'static str) {
+    let mut h = Harness::start(wire, mode).await;
+    let tag = "k-merged";
+
+    h.ringing(tag).await;
+    if mode == Mode::Reject480 {
+        h.expect(480, "INVITE").await;
+    }
+    h.quiesce().await;
+    let before = h.snapshot().await;
+
+    h.send(h.foreign_invite(tag, "127.0.0.1:9", tag)).await;
+    let (_, _) = h.expect(482, "INVITE").await;
+    h.quiesce().await;
+    let after = h.snapshot().await;
+
+    let lines = vec![
+        format!("before the merged INVITE: {before:?}"),
+        format!("after it: {after:?}"),
+        format!("500 responses: {}", h.count(500, "INVITE")),
+    ];
+    report(
+        &format!("K-merged/{wire:?}/{original_state}"),
+        &lines,
+        &h.logs,
+    );
+    let server_errors = h.count(500, "INVITE");
+    h.stop().await;
+
+    assert_eq!(before.state_count(original_state), 1);
+    assert_eq!(
+        after.state_count(original_state),
+        1,
+        "the original transaction stays in {original_state}"
+    );
+    assert_eq!(after.server_transactions, before.server_transactions);
+    assert_eq!(server_errors, 0, "a merged request is never a server error");
+}
+
+async fn k2(wire: Wire) {
+    k_merged(wire, Mode::Reject480, "Completed").await;
+}
+
+async fn k3(wire: Wire) {
+    k_merged(wire, Mode::Hold, "Proceeding").await;
+}
+
+over_udp_and_tcp!(
+    k2_merged_invite_after_the_final_gets_482,
+    k2_merged_invite_over_tcp_after_the_final_gets_482,
+    k2
+);
+
+over_udp_and_tcp!(
+    k3_merged_invite_while_proceeding_gets_482,
+    k3_merged_invite_over_tcp_while_proceeding_gets_482,
+    k3
+);
+
+/// K1: another call reusing the branch from another sent-by. RFC 3261 §17.2.3
+/// wants its own transaction, but the transaction key has no sent-by, so it
+/// is refused as retriable. The original transaction is untouched.
+async fn k1(wire: Wire) {
+    let mut h = Harness::start(wire, Mode::Hold).await;
+    let tag = "k1";
+
+    h.ringing(tag).await;
+    h.quiesce().await;
+    h.send(h.foreign_invite(tag, "127.0.0.1:9", "k1-other-call"))
+        .await;
+    let (_, refusal) = h.expect(500, "INVITE").await;
+    h.quiesce().await;
+    let after = h.snapshot().await;
+
+    let lines = vec![
+        format!("after the colliding INVITE: {after:?}"),
+        format!("482 responses: {}", h.count(482, "INVITE")),
+        format!("Retry-After: {:?}", header(&refusal, "Retry-After")),
+    ];
+    report(&format!("K1/{wire:?}"), &lines, &h.logs);
+    let merged = h.count(482, "INVITE");
+    h.stop().await;
+
+    assert_eq!(
+        after.state_count("Proceeding"),
+        1,
+        "the original is untouched"
+    );
+    assert_eq!(after.server_transactions, 1, "no second transaction");
+    assert_eq!(merged, 0, "another call is not a merged request");
+    assert_eq!(header(&refusal, "Retry-After").as_deref(), Some("1"));
+}
+
+over_udp_and_tcp!(
+    k1_branch_collision_from_another_call_is_refused,
+    k1_branch_collision_over_tcp_from_another_call_is_refused,
+    k1
+);
+
+/// K4: a retransmission with the same sent-by is still absorbed by the
+/// original transaction, which retransmits its final.
+async fn k4(wire: Wire) {
+    let mut h = Harness::start(wire, Mode::Reject480).await;
+    let tag = "k4";
+
+    h.ringing(tag).await;
+    h.expect(480, "INVITE").await;
+    h.quiesce().await;
+    let before = h.count(480, "INVITE");
+    h.send(h.invite(tag)).await;
+    h.quiesce().await;
+    let after = h.snapshot().await;
+    let finals = h.count(480, "INVITE");
+
+    let lines = vec![
+        format!("480s before and after the retransmission: {before} -> {finals}"),
+        format!("after: {after:?}"),
+    ];
+    report(&format!("K4/{wire:?}"), &lines, &h.logs);
+    let (merged, refused) = (h.count(482, "INVITE"), h.count(500, "INVITE"));
+    h.stop().await;
+
+    assert_eq!(
+        finals,
+        before + 1,
+        "the retransmission gets the final again"
+    );
+    assert_eq!(after.state_count("Completed"), 1);
+    assert_eq!((merged, refused), (0, 0));
+}
+
+over_udp_and_tcp!(
+    k4_retransmission_with_the_same_sent_by_is_absorbed,
+    k4_retransmission_over_tcp_with_the_same_sent_by_is_absorbed,
+    k4
 );
