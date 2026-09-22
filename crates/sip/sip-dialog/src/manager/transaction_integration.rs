@@ -6465,9 +6465,23 @@ impl DialogManager {
                 Ok(()) // Most timer events don't require dialog-level action
             }
 
-            TransactionEvent::AckReceived { request, .. } => {
+            // End-to-end ACK of a 2xx: the dialog/session input that may start
+            // media on the UAS side.
+            TransactionEvent::AckRequest { request, .. } => {
                 self.handle_ack_received_event(dialog_id, transaction_id, request)
                     .await
+            }
+
+            // ACK of a non-2xx final, absorbed by its INVITE server
+            // transaction. It is a transaction observation only: no media and
+            // no session ACK event.
+            TransactionEvent::AckReceived { .. } => {
+                debug!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(transaction_id),
+                    %dialog_id,
+                    "Non-2xx ACK confirmed its INVITE server transaction"
+                );
+                Ok(())
             }
 
             TransactionEvent::CancelReceived { .. } => {

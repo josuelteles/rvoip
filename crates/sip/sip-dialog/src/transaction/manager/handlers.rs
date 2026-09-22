@@ -698,6 +698,38 @@ impl TransactionManager {
                 .get(&key)
                 .map(|r| r.value().clone());
             if let Some(transaction) = existing {
+                if !self.server_request_sent_by_matches(&key, &request) {
+                    // Same branch and method from another sent-by: a different
+                    // transaction (RFC 3261 §17.2.3) that cannot share this
+                    // key. It must never act on the existing one.
+                    diagnostics::record_server_sent_by_mismatch();
+                    if request.method() == Method::Cancel {
+                        handle_stray_cancel(
+                            request,
+                            ingress_context.response_route(),
+                            &self.transport,
+                        )
+                        .await?;
+                    } else {
+                        // Never silent: answer it the way any request that
+                        // cannot open a server transaction is answered.
+                        warn!(
+                            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&key),
+                            source = %ingress_context.source,
+                            "Rejecting request whose branch matches a server transaction with another Via sent-by"
+                        );
+                        send_stateless_final_response(
+                            &request,
+                            ingress_context.response_route(),
+                            &self.transport,
+                            StatusCode::ServerInternalError,
+                            Some(1),
+                            "Failed to send stateless sent-by collision response",
+                        )
+                        .await?;
+                    }
+                    return Ok(());
+                }
                 if request.method() == Method::Invite {
                     diagnostics::record_duplicate_invite_existing_transaction();
                 } else if request.method() == Method::Bye {
@@ -819,6 +851,7 @@ impl TransactionManager {
                 request.clone(),
             ))
             .map(|key| key.with_method(Method::Invite))
+            .filter(|invite_key| self.server_request_sent_by_matches(invite_key, &request))
             .and_then(|invite_key| self.inbound_principal_for_context(&invite_key, ingress_context))
         } else {
             None
@@ -935,7 +968,9 @@ impl TransactionManager {
                 match request.method() {
                     Method::Cancel => {
                         let invite_tx_id = transaction.id().with_method(Method::Invite);
-                        if self.server_transactions.contains_key(&invite_tx_id) {
+                        if self.server_transactions.contains_key(&invite_tx_id)
+                            && self.server_request_sent_by_matches(&invite_tx_id, &request)
+                        {
                             send_transaction_event(
                                 &self.events_tx,
                                 crate::transaction::TransactionEvent::CancelRequest {
@@ -1197,7 +1232,10 @@ impl TransactionManager {
     ) -> Result<()> {
         debug!("Processing ACK request with dialog-based matching");
 
-        // First try direct branch-based matching for non-2xx ACKs
+        // First try direct branch-based matching for non-2xx ACKs. Only a
+        // transaction that sent a 300-699 final (Completed, or Confirmed for
+        // an ACK retransmission) owns its ACK; after a 2xx the ACK is an
+        // end-to-end request matched through the dialog index below.
         if let Some(key) = crate::transaction::utils::transaction_key_from_message(
             &Message::Request(request.clone()),
         ) {
@@ -1208,7 +1246,20 @@ impl TransactionManager {
                 .get(&invite_key)
                 .map(|r| r.value().clone());
             if let Some(transaction) = invite_tx {
-                if transaction.state() != TransactionState::Confirmed {
+                // A non-2xx final can reach the wire, and its ACK arrive,
+                // before the transaction applies Completed. The ACK is queued
+                // behind that transition, so it still belongs here.
+                let state = transaction.state();
+                let non_2xx_final_at_write_boundary = state == TransactionState::Proceeding
+                    && transaction.data().final_response_may_have_reached_wire()
+                    && self.server_invite_final_class(&invite_key)
+                        == Some(ServerInviteFinalClass::NonSuccess);
+                if (matches!(
+                    state,
+                    TransactionState::Completed | TransactionState::Confirmed
+                ) || non_2xx_final_at_write_boundary)
+                    && self.server_request_sent_by_matches(&invite_key, &request)
+                {
                     if self.request_ingress_authorizer().is_some()
                         && self
                             .inbound_principal_for_context(&invite_key, ingress_context)
@@ -1258,19 +1309,21 @@ impl TransactionManager {
             debug!(transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_id), "Found ACK for 2xx response using dialog-based matching");
             self.mark_invite_2xx_response_cache_acked(&tx_id);
 
-            // RFC 3261: ACK for 2xx responses should NOT be processed in the transaction
-            // Instead, emit AckReceived event for dialog-core to handle
+            // RFC 3261: ACK for 2xx responses should NOT be processed in the transaction.
+            // It is an end-to-end request for dialog-core: AckRequest, never
+            // the transaction-owned AckReceived.
             send_transaction_event(
                 &self.events_tx,
-                crate::transaction::TransactionEvent::AckReceived {
+                crate::transaction::TransactionEvent::AckRequest {
                     transaction_id: tx_id,
                     request,
+                    source,
                 },
             )
             .await
-            .map_err(|e| Error::Other(format!("Failed to emit AckReceived event: {}", e)))?;
+            .map_err(|e| Error::Other(format!("Failed to emit AckRequest event: {}", e)))?;
 
-            debug!("Emitted AckReceived event for dialog-core to handle 2xx ACK");
+            debug!("Emitted AckRequest event for dialog-core to handle 2xx ACK");
             return Ok(());
         }
 
@@ -1293,10 +1346,28 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Match a 2xx ACK to its server INVITE through the dialog index. Only a
+    /// binding whose transaction authorized a 2xx matches: the ACK of a
+    /// non-2xx final belongs to the transaction itself, so once that
+    /// transaction is gone the ACK is stray, never a 2xx ACK.
     pub(crate) fn find_server_invite_for_ack(&self, request: &Request) -> Option<TransactionKey> {
         let (exact_key, fallback_key) = ServerInviteDialogKey::ack_lookup_keys(request)?;
+        let authorized_2xx = |entry: ServerInviteAckIndexEntry| {
+            if entry.final_class == Some(ServerInviteFinalClass::Success) {
+                Some(entry)
+            } else {
+                debug!(
+                    final_class = ?entry.final_class,
+                    "Dialog-indexed server INVITE did not authorize a 2xx; ACK is not a 2xx ACK"
+                );
+                None
+            }
+        };
 
-        if let Some(entry) = self.lookup_server_invite_by_dialog_key(&exact_key) {
+        if let Some(entry) = self
+            .lookup_server_invite_by_dialog_key(&exact_key)
+            .and_then(authorized_2xx)
+        {
             debug!(
                 call_id_len = exact_key.call_id.len(),
                 "Found matching INVITE server transaction for ACK by dialog index"
@@ -1307,7 +1378,10 @@ impl TransactionManager {
         }
 
         if let Some(fallback_key) = fallback_key.as_ref() {
-            if let Some(entry) = self.lookup_server_invite_by_dialog_key(fallback_key) {
+            if let Some(entry) = self
+                .lookup_server_invite_by_dialog_key(fallback_key)
+                .and_then(authorized_2xx)
+            {
                 debug!(
                     call_id_len = fallback_key.call_id.len(),
                     "Found matching INVITE server transaction for ACK by dialog index fallback"

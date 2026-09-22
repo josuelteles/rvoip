@@ -18,7 +18,7 @@ mod tests {
         MAX_EAGER_TRANSACTION_INDEX_CAPACITY, RETAINED_CLIENT_DEADLINE_BATCH_MAX,
         TERMINATED_CLEANUP_BATCH_MAX,
     };
-    use super::super::{ServerInviteAckIndexEntry, ServerInviteDialogKey};
+    use super::super::{ServerInviteAckIndexEntry, ServerInviteDialogKey, ServerInviteFinalClass};
     use crate::transaction::client::builders::{ByeBuilder, InviteBuilder, RegisterBuilder};
     use crate::transaction::client::ClientInviteTransaction;
     use crate::transaction::completion::ClientTransactionCompletion;
@@ -62,6 +62,17 @@ mod tests {
         should_fail_send: Arc<AtomicBool>,
         raw_send_count: Arc<AtomicUsize>,
         raw_routes: Arc<Mutex<Vec<rvoip_sip_transport::TransportRoute>>>,
+        /// Runs inside the next non-2xx final response write, before that
+        /// write returns: a barrier at the transport write boundary.
+        at_non_2xx_final_write: Arc<Mutex<Option<WriteBoundaryWork>>>,
+    }
+
+    struct WriteBoundaryWork(futures::future::BoxFuture<'static, ()>);
+
+    impl std::fmt::Debug for WriteBoundaryWork {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("WriteBoundaryWork")
+        }
     }
 
     impl MockTransport {
@@ -72,6 +83,7 @@ mod tests {
                 should_fail_send: Arc::new(AtomicBool::new(false)),
                 raw_send_count: Arc::new(AtomicUsize::new(0)),
                 raw_routes: Arc::new(Mutex::new(Vec::new())),
+                at_non_2xx_final_write: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -82,7 +94,12 @@ mod tests {
                 should_fail_send: Arc::new(AtomicBool::new(should_fail)),
                 raw_send_count: Arc::new(AtomicUsize::new(0)),
                 raw_routes: Arc::new(Mutex::new(Vec::new())),
+                at_non_2xx_final_write: Arc::new(Mutex::new(None)),
             }
+        }
+
+        async fn run_at_non_2xx_final_write(&self, work: futures::future::BoxFuture<'static, ()>) {
+            *self.at_non_2xx_final_write.lock().await = Some(WriteBoundaryWork(work));
         }
 
         #[allow(dead_code)]
@@ -119,7 +136,6 @@ mod tests {
             }
 
             // Otherwise process normally
-            let mut messages = self.sent_messages.lock().await;
             println!(
                 "MockTransport::send_message - Sending message: {:?} to {}",
                 if let Message::Request(ref req) = message {
@@ -129,7 +145,18 @@ mod tests {
                 },
                 destination
             );
-            messages.push((message, destination));
+            let non_2xx_final = matches!(
+                &message,
+                Message::Response(response)
+                    if !response.status().is_provisional() && !response.status().is_success()
+            );
+            self.sent_messages.lock().await.push((message, destination));
+            if non_2xx_final {
+                let work = self.at_non_2xx_final_write.lock().await.take();
+                if let Some(WriteBoundaryWork(work)) = work {
+                    work.await;
+                }
+            }
             Ok(())
         }
 
@@ -915,6 +942,243 @@ mod tests {
             drain_for_request_event(&mut event_rx, Duration::from_millis(250)).await,
             Some(TransactionEvent::CancelRequest { source, .. }) if source == source_a
         ));
+
+        manager.shutdown().await;
+        Ok(())
+    }
+
+    /// A dispatch request whose top Via sent-by is `sent_by`.
+    fn request_with_sent_by(method: Method, branch: &str, sent_by: &str, cseq: u32) -> Request {
+        SimpleRequestBuilder::new(method, "sip:bob@example.com")
+            .unwrap()
+            .from("Alice", "sip:alice@example.com", Some("alice-dispatch-tag"))
+            .to("Bob", "sip:bob@example.com", None)
+            .contact("sip:alice@127.0.0.1:5060", None)
+            .call_id("sent-by-call-id")
+            .cseq(cseq)
+            .via(sent_by, "UDP", Some(branch))
+            .max_forwards(70)
+            .build()
+    }
+
+    async fn count_sent_status(transport: &MockTransport, status: StatusCode) -> usize {
+        transport
+            .get_sent_messages()
+            .await
+            .iter()
+            .filter(|(message, _)| {
+                matches!(message, Message::Response(response) if response.status() == status)
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn same_branch_with_another_sent_by_never_matches_the_server_transaction() -> Result<()> {
+        let transport = Arc::new(MockTransport::new("127.0.0.1:5061"));
+        let (_transport_tx, transport_rx) = mpsc::channel(32);
+        let (manager, mut event_rx) =
+            TransactionManager::new(transport.clone(), transport_rx, Some(32)).await?;
+        let source: SocketAddr = "192.0.2.30:5060".parse().unwrap();
+        let branch = "z9hG4bK-sent-by-match";
+        let invite = request_with_sent_by(Method::Invite, branch, "192.0.2.30:5060", 1);
+        manager
+            .handle_transport_event(dispatch_event_from(
+                Message::Request(invite.clone()),
+                source,
+            ))
+            .await?;
+        let invite_id =
+            match drain_for_request_event(&mut event_rx, Duration::from_millis(250)).await {
+                Some(TransactionEvent::InviteRequest { transaction_id, .. }) => transaction_id,
+                other => panic!("expected INVITE request, got {other:?}"),
+            };
+
+        // CANCEL with the INVITE branch from another sent-by: it is not
+        // matched to the INVITE, so dialog-core answers it 481 as unmatched.
+        let foreign_cancel = request_with_sent_by(Method::Cancel, branch, "192.0.2.99:5070", 1);
+        manager
+            .handle_transport_event(dispatch_event_from(
+                Message::Request(foreign_cancel),
+                source,
+            ))
+            .await?;
+        assert!(
+            matches!(
+                drain_for_request_event(&mut event_rx, Duration::from_millis(250)).await,
+                Some(TransactionEvent::NonInviteRequest { request, .. })
+                    if request.method() == Method::Cancel
+            ),
+            "a CANCEL from another sent-by must not become a CancelRequest for the INVITE"
+        );
+        assert_eq!(
+            manager
+                .find_invite_server_transaction_for_cancel(&request_with_sent_by(
+                    Method::Cancel,
+                    branch,
+                    "192.0.2.99:5070",
+                    1
+                ))
+                .await?,
+            None
+        );
+        assert_eq!(
+            manager
+                .find_invite_server_transaction_for_cancel(&request_with_sent_by(
+                    Method::Cancel,
+                    branch,
+                    "192.0.2.30:5060",
+                    1
+                ))
+                .await?,
+            Some(invite_id.clone())
+        );
+
+        // An INVITE from another sent-by is not a retransmission: it is
+        // answered statelessly and never reaches the INVITE transaction.
+        manager
+            .handle_transport_event(dispatch_event_from(
+                Message::Request(request_with_sent_by(
+                    Method::Invite,
+                    branch,
+                    "192.0.2.99:5070",
+                    1,
+                )),
+                source,
+            ))
+            .await?;
+        assert_eq!(
+            count_sent_status(&transport, StatusCode::ServerInternalError).await,
+            1
+        );
+        assert!(
+            drain_for_request_event(&mut event_rx, Duration::from_millis(50))
+                .await
+                .is_none(),
+            "a colliding INVITE must not reach the transaction user"
+        );
+
+        // The ACK of the 480 must come from the INVITE sent-by to confirm it.
+        let failure = create_test_response(
+            &invite,
+            StatusCode::TemporarilyUnavailable,
+            Some("Temporarily Unavailable"),
+        );
+        manager.send_response(&invite_id, failure).await?;
+        assert!(
+            manager
+                .wait_for_transaction_state(
+                    &invite_id,
+                    TransactionState::Completed,
+                    Duration::from_millis(500),
+                )
+                .await?
+        );
+        manager
+            .handle_transport_event(dispatch_event_from(
+                Message::Request(request_with_sent_by(
+                    Method::Ack,
+                    branch,
+                    "192.0.2.99:5070",
+                    1,
+                )),
+                source,
+            ))
+            .await?;
+        assert!(
+            !manager
+                .wait_for_transaction_state(
+                    &invite_id,
+                    TransactionState::Confirmed,
+                    Duration::from_millis(100),
+                )
+                .await?,
+            "an ACK from another sent-by must not confirm the INVITE"
+        );
+        manager
+            .handle_transport_event(dispatch_event_from(
+                Message::Request(request_with_sent_by(
+                    Method::Ack,
+                    branch,
+                    "192.0.2.30:5060",
+                    1,
+                )),
+                source,
+            ))
+            .await?;
+        assert!(
+            manager
+                .wait_for_transaction_state(
+                    &invite_id,
+                    TransactionState::Confirmed,
+                    Duration::from_millis(500),
+                )
+                .await?
+        );
+
+        manager.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_final_at_the_write_boundary_refuses_a_second_final() -> Result<()> {
+        let transport = Arc::new(MockTransport::new("127.0.0.1:5061"));
+        let (_transport_tx, transport_rx) = mpsc::channel(32);
+        let (manager, mut event_rx) =
+            TransactionManager::new(transport.clone(), transport_rx, Some(32)).await?;
+        let source: SocketAddr = "192.0.2.40:5060".parse().unwrap();
+        let invite =
+            request_with_sent_by(Method::Invite, "z9hG4bK-one-final", "192.0.2.40:5060", 1);
+        manager
+            .handle_transport_event(dispatch_event_from(
+                Message::Request(invite.clone()),
+                source,
+            ))
+            .await?;
+        let invite_id =
+            match drain_for_request_event(&mut event_rx, Duration::from_millis(250)).await {
+                Some(TransactionEvent::InviteRequest { transaction_id, .. }) => transaction_id,
+                other => panic!("expected INVITE request, got {other:?}"),
+            };
+        assert!(!manager.server_invite_has_final(&invite_id));
+
+        // While the 480 is on the wire, the CANCEL decision sees a committed
+        // final, and a 487 attempt is refused.
+        let terminated = create_test_response(
+            &invite,
+            StatusCode::RequestTerminated,
+            Some("Request Terminated"),
+        );
+        let at_write = manager.clone();
+        let id = invite_id.clone();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        transport
+            .run_at_non_2xx_final_write(Box::pin(async move {
+                let has_final = at_write.server_invite_has_final(&id);
+                let second = at_write.send_response(&id, terminated).await;
+                let _ = seen_tx.send((has_final, second.is_err()));
+            }))
+            .await;
+        manager
+            .send_response(
+                &invite_id,
+                create_test_response(
+                    &invite,
+                    StatusCode::TemporarilyUnavailable,
+                    Some("Temporarily Unavailable"),
+                ),
+            )
+            .await?;
+        let (has_final, refused) = seen_rx.await.expect("write boundary ran");
+        assert!(has_final, "a final in flight counts as committed");
+        assert!(refused, "only one final may cross the transport");
+        assert_eq!(
+            count_sent_status(&transport, StatusCode::RequestTerminated).await,
+            0
+        );
+        assert_eq!(
+            count_sent_status(&transport, StatusCode::TemporarilyUnavailable).await,
+            1
+        );
 
         manager.shutdown().await;
         Ok(())
@@ -4839,6 +5103,8 @@ mod tests {
 
         // The 2xx reaches the wire, but its cache entry is not created yet:
         // this is the window between the transport write and the insertion.
+        // The manager records the 2xx class before that write.
+        assert!(manager.classify_server_invite_final(&tx_id, ServerInviteFinalClass::Success));
         transaction
             .send_response(create_test_response(&invite, StatusCode::Ok, Some("OK")))
             .await?;
@@ -5424,6 +5690,10 @@ mod tests {
             .create_server_transaction(invite_request, source)
             .await?;
         let transaction_id = transaction.id().clone();
+        // Stands in for the 2xx the manager records before writing it.
+        assert!(
+            manager.classify_server_invite_final(&transaction_id, ServerInviteFinalClass::Success)
+        );
 
         let ack_request = create_test_ack().map_err(|e| Error::Other(e.to_string()))?;
         for _ in 0..2 {
@@ -5454,6 +5724,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_2xx_ack_at_the_final_write_boundary_is_transaction_owned() -> Result<()> {
+        let transport = Arc::new(MockTransport::new("127.0.0.1:5061"));
+        let (_transport_tx, transport_rx) = mpsc::channel(32);
+        let (manager, mut event_rx) =
+            TransactionManager::new(transport.clone(), transport_rx, Some(32)).await?;
+
+        let source: SocketAddr = "192.0.2.81:5060".parse().unwrap();
+        let invite = create_dispatch_request(Method::Invite, "z9hG4bK.ack-write-boundary", 301)
+            .map_err(|error| Error::Other(error.to_string()))?;
+        manager
+            .handle_transport_event(dispatch_event_from(
+                Message::Request(invite.clone()),
+                source,
+            ))
+            .await?;
+        let invite_id =
+            match drain_for_request_event(&mut event_rx, Duration::from_millis(250)).await {
+                Some(TransactionEvent::InviteRequest { transaction_id, .. }) => transaction_id,
+                other => panic!("expected INVITE request, got {other:?}"),
+            };
+
+        let failure = create_test_response(&invite, StatusCode::Decline, Some("Decline"));
+        let ack =
+            crate::transaction::method::ack::create_ack_for_error_response(&invite, &failure)?;
+        // The ACK is fully handled inside the 603 write, before the write
+        // returns and before the transaction applies Completed.
+        let at_write = manager.clone();
+        transport
+            .run_at_non_2xx_final_write(Box::pin(async move {
+                at_write
+                    .handle_transport_event(dispatch_event_from(Message::Request(ack), source))
+                    .await
+                    .expect("ACK at the write boundary");
+            }))
+            .await;
+
+        manager.send_response(&invite_id, failure).await?;
+        assert!(
+            manager
+                .wait_for_transaction_state(
+                    &invite_id,
+                    TransactionState::Confirmed,
+                    Duration::from_millis(500),
+                )
+                .await?,
+            "a non-2xx ACK arriving during the final write must confirm the INVITE"
+        );
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    TransactionEvent::AckRequest { .. } | TransactionEvent::StrayAckRequest { .. }
+                ),
+                "the hop-by-hop ACK must stay with its transaction: {event:?}"
+            );
+        }
+
+        manager.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_2xx_final_never_turns_a_dialog_matched_ack_into_a_2xx_ack() -> Result<()> {
+        let transport = Arc::new(MockTransport::new("127.0.0.1:5060"));
+        let (_transport_tx, transport_rx) = mpsc::channel(10);
+        let (manager, _event_rx) =
+            TransactionManager::new(transport.clone(), transport_rx, Some(10)).await?;
+
+        let invite_request = create_test_invite().map_err(|e| Error::Other(e.to_string()))?;
+        let source = SocketAddr::from_str("192.168.1.100:5060").unwrap();
+        let transaction = manager
+            .create_server_transaction(invite_request.clone(), source)
+            .await?;
+        let transaction_id = transaction.id().clone();
+        let ack_request = create_test_ack().map_err(|e| Error::Other(e.to_string()))?;
+
+        // No final yet: nothing to acknowledge end to end.
+        assert_eq!(manager.find_server_invite_for_ack(&ack_request), None);
+
+        manager
+            .send_response(
+                &transaction_id,
+                create_test_response(
+                    &invite_request,
+                    StatusCode::TemporarilyUnavailable,
+                    Some("Temporarily Unavailable"),
+                ),
+            )
+            .await?;
+        assert_eq!(manager.find_server_invite_for_ack(&ack_request), None);
+
+        // Neither after the transaction is gone and only its retired binding
+        // remains, nor after a later attempt to record a 2xx.
+        manager.retire_server_invite_dialog_index_for(&transaction_id);
+        assert!(
+            !manager.classify_server_invite_final(&transaction_id, ServerInviteFinalClass::Success)
+        );
+        assert_eq!(manager.find_server_invite_for_ack(&ack_request), None);
+
+        manager.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn retired_server_invite_keeps_one_ack_binding_and_deadline() -> Result<()> {
         let transport = Arc::new(MockTransport::new("127.0.0.1:5060"));
         let (_transport_tx, transport_rx) = mpsc::channel(10);
@@ -5466,6 +5840,10 @@ mod tests {
             .create_server_transaction(invite_request, source)
             .await?;
         let transaction_id = transaction.id().clone();
+        // Stands in for the 2xx the manager records before writing it.
+        assert!(
+            manager.classify_server_invite_final(&transaction_id, ServerInviteFinalClass::Success)
+        );
         let ack_request = create_test_ack().map_err(|e| Error::Other(e.to_string()))?;
 
         manager.retire_server_invite_dialog_index_for(&transaction_id);

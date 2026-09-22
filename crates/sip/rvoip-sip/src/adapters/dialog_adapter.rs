@@ -4931,10 +4931,12 @@ impl DialogAdapter {
 
         if let Some(dialog_id) = dialog_id.as_ref() {
             self.cleanup_mapped_total.fetch_add(1, Ordering::Relaxed);
+            // Session-end cleanup: an INVITE server transaction that sent a
+            // non-2xx final keeps running until its ACK or Timer H.
             self.dialog_api
                 .dialog_manager()
                 .core()
-                .cleanup_dialog_storage_and_transactions(dialog_id)
+                .cleanup_dialog_storage_for_session_end(dialog_id)
                 .await;
 
             // A final response (including a 3xx followed by a fresh INVITE)
@@ -5969,6 +5971,7 @@ mod tests {
 
         for forbidden in [
             "cleanup_dialog_storage_and_transactions",
+            "cleanup_dialog_storage_for_session_end",
             "cleanup_transaction_receiver",
             "terminate_transaction",
             "finish_initial_invite_teardown",

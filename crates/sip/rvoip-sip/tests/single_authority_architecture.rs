@@ -1163,6 +1163,9 @@ fn inbound_ack_has_one_exact_causal_owner() {
         &core_source,
         "async fn process_global_transaction_event(&self",
     ));
+    // The 2xx ACK without an exact binding is dropped; the non-2xx ACK is a
+    // transaction observation.
+    assert!(ingress.contains("elseifmatches!(&event,TransactionEvent::AckRequest{..})"));
     assert!(ingress.contains("elseifmatches!(&event,TransactionEvent::AckReceived{..})"));
     assert!(
         !ingress.contains("find_dialog_for_request(request).await"),

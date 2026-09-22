@@ -3586,7 +3586,7 @@ impl SessionCrossCrateEventHandler {
                 .dialog_api
                 .dialog_manager()
                 .core()
-                .cleanup_dialog_storage_and_transactions(dialog_id)
+                .cleanup_dialog_storage_for_session_end(dialog_id)
                 .await;
             debug!(
                 dialog_id = %dialog_id,

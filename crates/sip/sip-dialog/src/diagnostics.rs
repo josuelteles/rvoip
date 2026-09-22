@@ -111,6 +111,10 @@ static TERMINATION_CLEANUP_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static TERMINATION_CLEANUP_MAX_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static TERMINATION_CLEANUP_POLL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static TERMINATION_CLEANUP_REMOVED: AtomicU64 = AtomicU64::new(0);
+static NON_2XX_INVITE_SERVER_RETAINED: AtomicU64 = AtomicU64::new(0);
+static NON_2XX_INVITE_SERVER_ACK_CONFIRMED: AtomicU64 = AtomicU64::new(0);
+static NON_2XX_INVITE_SERVER_TIMER_H: AtomicU64 = AtomicU64::new(0);
+static SERVER_SENT_BY_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static TERMINATION_CLEANUP_BATCHES: AtomicU64 = AtomicU64::new(0);
 static TERMINATION_CLEANUP_BATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static TERMINATION_CLEANUP_BATCH_MAX: AtomicU64 = AtomicU64::new(0);
@@ -494,6 +498,16 @@ pub struct Snapshot {
     /// not poll transactions, so new runs report zero.
     pub termination_cleanup_poll_attempts: u64,
     pub termination_cleanup_removed: u64,
+    /// INVITE server transactions of a 300-699 final kept alive by a
+    /// session-end dialog cleanup, so they can finish on ACK or Timer H.
+    pub non_2xx_invite_server_retained: u64,
+    /// INVITE server transactions of a 300-699 final confirmed by their ACK.
+    pub non_2xx_invite_server_ack_confirmed: u64,
+    /// INVITE server transactions of a 300-699 final ended by Timer H.
+    pub non_2xx_invite_server_timer_h: u64,
+    /// Requests whose branch matched a server transaction created with a
+    /// different top Via sent-by, and so were not matched to it.
+    pub server_sent_by_mismatch: u64,
     pub termination_cleanup_batches: u64,
     pub termination_cleanup_batch_total: u64,
     pub termination_cleanup_batch_max: u64,
@@ -997,6 +1011,11 @@ pub fn snapshot() -> Snapshot {
         termination_cleanup_poll_attempts: TERMINATION_CLEANUP_POLL_ATTEMPTS
             .load(Ordering::Relaxed),
         termination_cleanup_removed: TERMINATION_CLEANUP_REMOVED.load(Ordering::Relaxed),
+        non_2xx_invite_server_retained: NON_2XX_INVITE_SERVER_RETAINED.load(Ordering::Relaxed),
+        non_2xx_invite_server_ack_confirmed: NON_2XX_INVITE_SERVER_ACK_CONFIRMED
+            .load(Ordering::Relaxed),
+        non_2xx_invite_server_timer_h: NON_2XX_INVITE_SERVER_TIMER_H.load(Ordering::Relaxed),
+        server_sent_by_mismatch: SERVER_SENT_BY_MISMATCH.load(Ordering::Relaxed),
         termination_cleanup_batches: TERMINATION_CLEANUP_BATCHES.load(Ordering::Relaxed),
         termination_cleanup_batch_total: TERMINATION_CLEANUP_BATCH_TOTAL.load(Ordering::Relaxed),
         termination_cleanup_batch_max: TERMINATION_CLEANUP_BATCH_MAX.load(Ordering::Relaxed),
@@ -1663,6 +1682,23 @@ pub(crate) fn record_termination_cleanup_in_flight(delta: i64) {
     update_max(&TERMINATION_CLEANUP_MAX_IN_FLIGHT, current);
 }
 
+/// Always counted: these are protocol outcomes, not timing samples.
+pub(crate) fn record_non_2xx_invite_server_retained() {
+    NON_2XX_INVITE_SERVER_RETAINED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_non_2xx_invite_server_ack_confirmed() {
+    NON_2XX_INVITE_SERVER_ACK_CONFIRMED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_non_2xx_invite_server_timer_h() {
+    NON_2XX_INVITE_SERVER_TIMER_H.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_server_sent_by_mismatch() {
+    SERVER_SENT_BY_MISMATCH.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn record_termination_cleanup_removed() {
     if transaction_timing_enabled() {
         TERMINATION_CLEANUP_REMOVED.fetch_add(1, Ordering::Relaxed);
@@ -2312,6 +2348,10 @@ fn all_counters() -> Vec<&'static AtomicU64> {
         &TERMINATION_CLEANUP_MAX_IN_FLIGHT,
         &TERMINATION_CLEANUP_POLL_ATTEMPTS,
         &TERMINATION_CLEANUP_REMOVED,
+        &NON_2XX_INVITE_SERVER_RETAINED,
+        &NON_2XX_INVITE_SERVER_ACK_CONFIRMED,
+        &NON_2XX_INVITE_SERVER_TIMER_H,
+        &SERVER_SENT_BY_MISMATCH,
         &TERMINATION_CLEANUP_BATCHES,
         &TERMINATION_CLEANUP_BATCH_TOTAL,
         &TERMINATION_CLEANUP_BATCH_MAX,

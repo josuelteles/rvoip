@@ -2387,7 +2387,7 @@ impl DialogManager {
                     );
                 }
             }
-        } else if matches!(&event, TransactionEvent::AckReceived { .. }) {
+        } else if matches!(&event, TransactionEvent::AckRequest { .. }) {
             // A 2xx ACK is emitted by transaction-core with the exact matched
             // server INVITE key. Never recover a missing authoritative binding
             // by independently matching request tags: that could route a stale
@@ -2395,6 +2395,13 @@ impl DialogManager {
             warn!(
                 transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id),
                 "Dropping ACK whose exact server INVITE has no dialog binding"
+            );
+        } else if matches!(&event, TransactionEvent::AckReceived { .. }) {
+            // The ACK of a non-2xx final, absorbed by its transaction after
+            // the session released the dialog. Nothing is left to notify.
+            debug!(
+                transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id),
+                "Non-2xx ACK confirmed its transaction after the dialog was released"
             );
         } else {
             // Event for transaction not associated with any dialog. Check if
@@ -2812,6 +2819,17 @@ impl DialogManager {
             .terminate_transaction(cancel_tx_id)
             .await;
 
+        // RFC 3261 §9.2: a CANCEL has no effect on an INVITE that already
+        // sent its final response. The INVITE transaction's single final
+        // write decides the race: when another final got there first, the
+        // 487 is refused and that final stands.
+        if self
+            .transaction_manager
+            .server_invite_has_final(invite_tx_id)
+        {
+            debug!("CANCEL answered 200; the INVITE already sent its final response");
+            return Ok(());
+        }
         let original_invite = self
             .transaction_manager
             .get_server_transaction_request(invite_tx_id)
@@ -2823,12 +2841,22 @@ impl DialogManager {
             &original_invite,
             rvoip_sip_core::StatusCode::RequestTerminated,
         );
-        self.transaction_manager
+        if let Err(_error) = self
+            .transaction_manager
             .send_response(invite_tx_id, terminated)
             .await
-            .map_err(|_error| DialogError::TransactionError {
+        {
+            if self
+                .transaction_manager
+                .server_invite_has_final(invite_tx_id)
+            {
+                debug!("CANCEL crossed the INVITE final response; the final stands");
+                return Ok(());
+            }
+            return Err(DialogError::TransactionError {
                 message: "Failed to send 487 Request Terminated".to_string(),
-            })?;
+            });
+        }
 
         self.terminate_dialog_for_tx_and_emit_cancelled_authoritative(
             invite_tx_id,
@@ -3775,6 +3803,29 @@ impl DialogManager {
     /// can be woken and removed instead of becoming unowned transaction-runner
     /// tasks.
     pub async fn cleanup_dialog_storage_and_transactions(&self, dialog_id: &DialogId) -> bool {
+        self.cleanup_dialog_storage_with_transactions(dialog_id, false)
+            .await
+    }
+
+    /// Cleanup for a session that ended, which keeps protocol authority where
+    /// RFC 3261 §17.2.1 still needs it.
+    ///
+    /// Same as [`Self::cleanup_dialog_storage_and_transactions`], except for
+    /// an INVITE server transaction that already sent a 300-699 final: it is
+    /// unlinked from the dialog but not terminated, so it keeps retransmitting
+    /// the final, absorbs the ACK and ends on Timer I or Timer H. Everything
+    /// the session owned is still released right away. Shutdown and rollback
+    /// before any final was sent keep using the forced variant.
+    pub async fn cleanup_dialog_storage_for_session_end(&self, dialog_id: &DialogId) -> bool {
+        self.cleanup_dialog_storage_with_transactions(dialog_id, true)
+            .await
+    }
+
+    async fn cleanup_dialog_storage_with_transactions(
+        &self,
+        dialog_id: &DialogId,
+        preserve_non_2xx_invite_server: bool,
+    ) -> bool {
         if let Err(_error) = self.session_refresh_tasks.cancel_dialog(dialog_id).await {
             warn!(dialog=%dialog_id, "Session refresh task did not drain before dialog cleanup");
             return false;
@@ -3804,7 +3855,19 @@ impl DialogManager {
         transaction_ids.retain(|transaction_id| seen.insert(transaction_id.clone()));
 
         for transaction_id in transaction_ids {
-            if let Err(_error) = self
+            if preserve_non_2xx_invite_server
+                && self
+                    .transaction_manager
+                    .server_invite_owns_non_2xx_final(&transaction_id)
+            {
+                // Its later events (ACK, Timer I/H, termination) arrive
+                // unassociated once the dialog is gone.
+                crate::diagnostics::record_non_2xx_invite_server_retained();
+                debug!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&transaction_id),
+                    "Keeping the INVITE server transaction of a non-2xx final after session end"
+                );
+            } else if let Err(_error) = self
                 .transaction_manager
                 .terminate_transaction(&transaction_id)
                 .await
@@ -8210,9 +8273,10 @@ mod outbound_flow_handler_tests {
             .max_forwards(70)
             .build();
         manager
-            .process_global_transaction_event(TransactionEvent::AckReceived {
+            .process_global_transaction_event(TransactionEvent::AckRequest {
                 transaction_id: invite_tx.clone(),
                 request: ack,
+                source: dest_addr(5070),
             })
             .await;
 
@@ -8226,6 +8290,46 @@ mod outbound_flow_handler_tests {
         assert!(
             manager.find_dialog_for_transaction(&invite_tx).is_err(),
             "authoritatively delivered ACK retires the server INVITE binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_2xx_ack_is_a_transaction_observation_only() {
+        let (manager, mut session_events) = make_manager().await;
+        let mut dialog = Dialog::new(
+            "non-2xx-ack-observation".to_string(),
+            "sip:bob@example.com".parse().unwrap(),
+            "sip:alice@example.com".parse().unwrap(),
+            Some("bob-tag".to_string()),
+            Some("alice-tag".to_string()),
+            false,
+        );
+        dialog.state = DialogState::Early;
+        let dialog_id = dialog.id.clone();
+        manager.store_dialog(dialog).await.expect("store dialog");
+        let invite_tx = TransactionKey::new(
+            "z9hG4bK-non-2xx-ack-observation".to_string(),
+            Method::Invite,
+            true,
+        );
+        manager.link_transaction_to_dialog_indexed(&invite_tx, &dialog_id);
+
+        manager
+            .process_global_transaction_event(TransactionEvent::AckReceived {
+                transaction_id: invite_tx.clone(),
+                request: dispatch_request(Method::Ack, "z9hG4bK-non-2xx-ack-observation", 1),
+            })
+            .await;
+
+        assert!(
+            session_events.try_recv().is_err(),
+            "a non-2xx ACK must not reach the session layer"
+        );
+        assert_eq!(
+            manager
+                .find_dialog_for_transaction(&invite_tx)
+                .expect("a non-2xx ACK does not retire the dialog binding"),
+            dialog_id
         );
     }
 
@@ -8402,6 +8506,119 @@ mod outbound_flow_handler_tests {
         assert!(!manager
             .pending_response_transaction_by_dialog
             .contains_key(&dialog_id));
+    }
+
+    /// Builds an Early dialog with one indexed INVITE server transaction.
+    async fn dialog_with_invite_server_transaction(
+        manager: &DialogManager,
+        tag: &str,
+    ) -> (
+        DialogId,
+        Arc<dyn crate::transaction::server::ServerTransaction>,
+    ) {
+        let mut dialog = Dialog::new(
+            format!("{tag}-call"),
+            "sip:alice@example.com".parse().unwrap(),
+            "sip:bob@example.com".parse().unwrap(),
+            Some("alice-tag".to_string()),
+            Some("bob-tag".to_string()),
+            false,
+        );
+        dialog.state = DialogState::Early;
+        let dialog_id = dialog.id.clone();
+        manager.store_dialog(dialog).await.expect("store dialog");
+
+        let request = SimpleRequestBuilder::new(Method::Invite, "sip:bob@example.com")
+            .unwrap()
+            .from("Alice", "sip:alice@example.com", Some("alice-tag"))
+            .to("Bob", "sip:bob@example.com", None)
+            .contact("sip:alice@127.0.0.1:5070", None)
+            .call_id(&format!("{tag}-call"))
+            .cseq(1)
+            .via("127.0.0.1:5070", "UDP", Some(&format!("z9hG4bK-{tag}")))
+            .max_forwards(70)
+            .build();
+        let transaction = manager
+            .transaction_manager()
+            .create_server_transaction(request, dest_addr(5070))
+            .await
+            .expect("server transaction");
+        manager.link_transaction_to_dialog_indexed(transaction.id(), &dialog_id);
+        (dialog_id, transaction)
+    }
+
+    #[tokio::test]
+    async fn session_end_cleanup_keeps_the_invite_server_transaction_of_a_non_2xx_final() {
+        let (manager, _rx) = make_manager().await;
+        let (dialog_id, transaction) =
+            dialog_with_invite_server_transaction(&manager, "session-end-480").await;
+        let transaction_id = transaction.id().clone();
+        let invite = transaction.original_request().await.expect("INVITE");
+        let unavailable = crate::transaction::utils::response_builders::create_response(
+            &invite,
+            rvoip_sip_core::StatusCode::TemporarilyUnavailable,
+        );
+        manager
+            .transaction_manager()
+            .send_response(&transaction_id, unavailable)
+            .await
+            .expect("480");
+        for _ in 0..50 {
+            if transaction.state() == TransactionState::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(transaction.state(), TransactionState::Completed);
+
+        assert!(
+            manager
+                .cleanup_dialog_storage_for_session_end(&dialog_id)
+                .await
+        );
+
+        // The dialog and its indexes are gone; the transaction keeps its
+        // protocol authority in Completed.
+        assert!(!manager.dialogs.contains_key(&dialog_id));
+        assert!(!manager.transaction_to_dialog.contains_key(&transaction_id));
+        assert!(manager
+            .server_transactions_for_dialog(&dialog_id)
+            .is_empty());
+        assert_eq!(manager.transaction_manager().transaction_count().await, 1);
+        assert_eq!(transaction.state(), TransactionState::Completed);
+        assert!(manager
+            .transaction_manager()
+            .server_invite_owns_non_2xx_final(&transaction_id));
+    }
+
+    #[tokio::test]
+    async fn session_end_cleanup_still_terminates_an_invite_without_a_final() {
+        use crate::transaction::runner::HasLifecycle;
+        use crate::transaction::state::TransactionLifecycle;
+
+        let (manager, _rx) = make_manager().await;
+        let (dialog_id, transaction) =
+            dialog_with_invite_server_transaction(&manager, "session-end-rollback").await;
+        assert!(!manager
+            .transaction_manager()
+            .server_invite_owns_non_2xx_final(transaction.id()));
+
+        assert!(
+            manager
+                .cleanup_dialog_storage_for_session_end(&dialog_id)
+                .await
+        );
+        for _ in 0..20 {
+            if transaction.data().get_lifecycle() == TransactionLifecycle::Destroyed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(manager.transaction_manager().transaction_count().await, 0);
+        assert_eq!(
+            transaction.data().get_lifecycle(),
+            TransactionLifecycle::Destroyed
+        );
     }
 
     #[tokio::test]

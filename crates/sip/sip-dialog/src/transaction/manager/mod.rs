@@ -4475,7 +4475,19 @@ impl TransactionManager {
             } else {
                 None
             };
+            // Classified before the write, so an ACK that races the wire
+            // already sees which final it acknowledges.
+            let final_class = (transaction_id.is_server()
+                && transaction_id.method() == &Method::Invite)
+                .then(|| ServerInviteFinalClass::of(response.status()))
+                .flatten();
+            let classified = final_class
+                .is_some_and(|class| self.classify_server_invite_final(transaction_id, class));
             let result = server_tx.send_response(response).await;
+            if classified && tx.state() == TransactionState::Proceeding {
+                // Zero-wire retryable: no final was committed.
+                self.clear_server_invite_final_class(transaction_id);
+            }
             if result.is_ok() {
                 self.cache_invite_2xx_response_for(transaction_id).await;
                 if is_200_ok && !matches!(original_method, Some(Method::Invite) | Some(Method::Bye))
@@ -6802,10 +6814,70 @@ impl TransactionManager {
         };
         let invite_key = cancel_key.with_method(Method::Invite);
 
-        Ok(self
+        Ok((self.server_transactions.contains_key(&invite_key)
+            && self.server_request_sent_by_matches(&invite_key, cancel_request))
+        .then_some(invite_key))
+    }
+
+    /// RFC 3261 §17.2.3: a request matches a server transaction only when the
+    /// top Via sent-by equals the one of the request that created it, not
+    /// just the branch and method `TransactionKey` carries. A transaction
+    /// whose original request is not retained falls back to the key match.
+    pub(crate) fn server_request_sent_by_matches(
+        &self,
+        transaction_id: &TransactionKey,
+        request: &Request,
+    ) -> bool {
+        let original = self
             .server_transactions
-            .contains_key(&invite_key)
-            .then_some(invite_key))
+            .get(transaction_id)
+            .and_then(|entry| entry.value().original_request_sync());
+        match original {
+            Some(original) => {
+                let expected = NormalizedViaSentBy::from_request(&original);
+                expected.is_some() && expected == NormalizedViaSentBy::from_request(request)
+            }
+            None => true,
+        }
+    }
+
+    /// Whether the INVITE server transaction already committed a final
+    /// response: it left `Proceeding`, or a final write has started. A
+    /// transaction that is gone can no longer take one either.
+    pub fn server_invite_has_final(&self, transaction_id: &TransactionKey) -> bool {
+        match self.server_transactions.get(transaction_id) {
+            Some(entry) => {
+                let transaction = entry.value();
+                transaction.state() != TransactionState::Proceeding
+                    || transaction.data().final_response_may_have_reached_wire()
+            }
+            None => true,
+        }
+    }
+
+    /// Whether `transaction_id` is a live INVITE server transaction that sent
+    /// a 300-699 final and still owns it (RFC 3261 §17.2.1): `Completed`
+    /// retransmits the final and waits for the ACK or Timer H, `Confirmed`
+    /// absorbs ACK retransmissions until Timer I. A 2xx moves the transaction
+    /// straight to `Terminated`, so neither state can follow a 2xx.
+    pub fn server_invite_owns_non_2xx_final(&self, transaction_id: &TransactionKey) -> bool {
+        if !transaction_id.is_server() || transaction_id.method() != &Method::Invite {
+            return false;
+        }
+        self.server_transactions
+            .get(transaction_id)
+            .is_some_and(|entry| {
+                let transaction = entry.value();
+                transaction.kind() == TransactionKind::InviteServer
+                    && matches!(
+                        transaction.state(),
+                        TransactionState::Completed | TransactionState::Confirmed
+                    )
+                    && matches!(
+                        transaction.data().get_lifecycle(),
+                        TransactionLifecycle::Active
+                    )
+            })
     }
 
     /// Retrieve the original request that created a server transaction.
@@ -7345,6 +7417,71 @@ impl TransactionManager {
                 generation,
                 dialog_key,
             });
+        }
+    }
+
+    /// Record the class of the final `transaction_id` is about to send, on
+    /// every dialog-index binding of that transaction. The first committed
+    /// final wins, so a later final cannot relabel it. Returns whether this
+    /// call recorded it.
+    pub(crate) fn classify_server_invite_final(
+        &self,
+        transaction_id: &TransactionKey,
+        class: ServerInviteFinalClass,
+    ) -> bool {
+        let Some(keys) = self
+            .server_invite_dialog_keys_by_tx
+            .get(transaction_id)
+            .map(|keys| keys.value().clone())
+        else {
+            return false;
+        };
+        let mut recorded = false;
+        for key in keys {
+            if let Some(mut entry) = self.server_invite_dialog_index.get_mut(&key) {
+                if entry.transaction_id == *transaction_id && entry.final_class.is_none() {
+                    entry.final_class = Some(class);
+                    recorded = true;
+                }
+            }
+        }
+        recorded
+    }
+
+    /// Final class recorded for `transaction_id` by
+    /// [`Self::classify_server_invite_final`], while it is still active.
+    pub(crate) fn server_invite_final_class(
+        &self,
+        transaction_id: &TransactionKey,
+    ) -> Option<ServerInviteFinalClass> {
+        let keys = self
+            .server_invite_dialog_keys_by_tx
+            .get(transaction_id)
+            .map(|keys| keys.value().clone())?;
+        keys.iter().find_map(|key| {
+            self.server_invite_dialog_index
+                .get(key)
+                .filter(|entry| entry.transaction_id == *transaction_id)
+                .and_then(|entry| entry.final_class)
+        })
+    }
+
+    /// Undo [`Self::classify_server_invite_final`] for a final that never
+    /// reached the wire and left the transaction retryable.
+    fn clear_server_invite_final_class(&self, transaction_id: &TransactionKey) {
+        let Some(keys) = self
+            .server_invite_dialog_keys_by_tx
+            .get(transaction_id)
+            .map(|keys| keys.value().clone())
+        else {
+            return;
+        };
+        for key in keys {
+            if let Some(mut entry) = self.server_invite_dialog_index.get_mut(&key) {
+                if entry.transaction_id == *transaction_id {
+                    entry.final_class = None;
+                }
+            }
         }
     }
 

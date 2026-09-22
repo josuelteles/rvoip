@@ -348,8 +348,17 @@ impl ServerInviteLogic {
         let tx_id = &data.id;
         let timer_config = &data.timer_config;
 
-        // Start Timer I that automatically transitions to Terminated state when it fires
-        let interval_i = timer_config.wait_time_i;
+        // Start Timer I that automatically transitions to Terminated state when it fires.
+        // RFC 3261 section 17.2.1: T4 for unreliable transports, zero for
+        // reliable ones, which carry no ACK retransmissions to absorb.
+        let interval_i = if crate::transaction::timer_utils::uses_unreliable_transport(
+            &data.response_route,
+            data.transport.default_transport_type(),
+        ) {
+            timer_config.wait_time_i
+        } else {
+            Duration::ZERO
+        };
 
         // Use timer_utils to start the timer with transition
         let timer_manager = self.timer_factory.timer_manager();
@@ -444,6 +453,7 @@ impl ServerInviteLogic {
         match current_state {
             TransactionState::Completed => {
                 warn!(id=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_id), "Timer H (ACK Timeout) fired in Completed state");
+                crate::diagnostics::record_non_2xx_invite_server_timer_h();
 
                 // Notify TU about timeout using common logic
                 common_logic::send_transaction_timeout_event(tx_id, &data.events_tx).await;
@@ -576,6 +586,7 @@ impl ServerInviteLogic {
                     })
                     .await;
 
+                crate::diagnostics::record_non_2xx_invite_server_ack_confirmed();
                 // Transition to Confirmed state
                 Ok(Some(TransactionState::Confirmed))
             }
@@ -748,9 +759,16 @@ impl TransactionLogic<ServerTransactionData, ServerInviteTimerHandles> for Serve
                 // Cancel Timer 100 if still running (TU sent a response)
                 self.cancel_timer_100(timer_handles);
 
-                // Start Timer G (response retransmission)
-                self.start_timer_g(data, timer_handles, command_tx.clone())
-                    .await;
+                // Start Timer G (response retransmission). RFC 3261 section
+                // 17.2.1: only an unreliable transport retransmits the final;
+                // a reliable one still waits for the ACK under Timer H.
+                if crate::transaction::timer_utils::uses_unreliable_transport(
+                    &data.response_route,
+                    data.transport.default_transport_type(),
+                ) {
+                    self.start_timer_g(data, timer_handles, command_tx.clone())
+                        .await;
+                }
 
                 // Start Timer H (ACK timeout)
                 self.start_timer_h(data, timer_handles, command_tx).await;

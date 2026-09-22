@@ -68,11 +68,12 @@ use crate::transaction::{TransactionKey, TransactionState};
 pub enum TransactionEvent {
     // --- Request Processing (Events primarily for Server Transactions) ---
     /// An ACK request was received, matching an Invite Server Transaction that had previously
-    /// sent a non-2xx final response.
+    /// sent a non-2xx (300-699) final response.
     ///
-    /// This typically signals the completion of the INVITE transaction if it was in the
-    /// `Completed` state (after sending a 2xx) or `Confirmed` state (after sending a non-2xx).
-    /// The transaction might move to `Terminated`.
+    /// The transaction absorbs this ACK: it moves from `Completed` to `Confirmed`, stops
+    /// retransmitting the final and ends on Timer I (RFC 3261 §17.2.1). The event is a
+    /// transaction observation only. It never starts media and is never the ACK of a 2xx,
+    /// which arrives as [`TransactionEvent::AckRequest`].
     AckReceived {
         /// The unique identifier for the server transaction that received the ACK.
         transaction_id: TransactionKey,
@@ -275,7 +276,8 @@ pub enum TransactionEvent {
 
     /// An ACK request for a 2xx response has been received.
     /// Since these ACKs are end-to-end, they don't belong to the transaction,
-    /// but the TU needs to know about them.
+    /// but the TU needs to know about them. It is matched through the dialog of
+    /// a server INVITE that sent a 2xx, and it is the dialog/session ACK input.
     AckRequest {
         /// The transaction ID of the original INVITE transaction.
         transaction_id: TransactionKey,

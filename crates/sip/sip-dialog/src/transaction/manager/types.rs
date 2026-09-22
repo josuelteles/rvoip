@@ -51,6 +51,11 @@ impl ServerInviteDialogKey {
 pub(crate) struct ServerInviteAckIndexEntry {
     pub(crate) transaction_id: TransactionKey,
     pub(crate) expires_at: Option<Instant>,
+    /// Class of the final response the transaction authorized, recorded
+    /// before that final reaches the wire. Only a 2xx makes an ACK with a
+    /// different branch an end-to-end 2xx ACK (RFC 3261 §17.1.1.3); the ACK
+    /// of a non-2xx final belongs to the transaction.
+    pub(crate) final_class: Option<ServerInviteFinalClass>,
     /// Monotonic identity assigned by the manager whenever this dialog-key
     /// binding changes. Retention deadlines carry the same generation so an
     /// old deadline cannot remove a newer binding for a reused dialog key.
@@ -81,12 +86,32 @@ impl Invite2xxResponseCacheEntry {
     }
 }
 
+/// Final response class of an INVITE server transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerInviteFinalClass {
+    Success,
+    NonSuccess,
+}
+
+impl ServerInviteFinalClass {
+    pub(crate) fn of(status: rvoip_sip_core::StatusCode) -> Option<Self> {
+        let code = status.as_u16();
+        match code {
+            200..=299 => Some(Self::Success),
+            300..=699 => Some(Self::NonSuccess),
+            _ => None,
+        }
+    }
+}
+
 impl ServerInviteAckIndexEntry {
+    /// Test binding of a server INVITE that already sent a 2xx.
     #[cfg(test)]
     pub(crate) fn active(transaction_id: TransactionKey) -> Self {
         Self {
             transaction_id,
             expires_at: None,
+            final_class: Some(ServerInviteFinalClass::Success),
             deadline_generation: 0,
             _admission_owner: None,
         }
@@ -99,6 +124,7 @@ impl ServerInviteAckIndexEntry {
         Self {
             transaction_id,
             expires_at: None,
+            final_class: None,
             deadline_generation: 0,
             _admission_owner: admission_owner,
         }
@@ -153,4 +179,43 @@ pub struct StrayRequest {
     pub request: rvoip_sip_core::Request,
     /// The source address from which the request was received
     pub source: SocketAddr,
+}
+
+/// Top Via sent-by (RFC 3261 §17.2.3), normalized for comparison: domain names
+/// ignore case and a trailing dot, and a missing port is the transport
+/// default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedViaSentBy {
+    host: NormalizedViaSentByHost,
+    port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NormalizedViaSentByHost {
+    Domain(String),
+    Address(std::net::IpAddr),
+}
+
+impl NormalizedViaSentBy {
+    pub(crate) fn from_request(request: &rvoip_sip_core::Request) -> Option<Self> {
+        let via = request.first_via()?;
+        let top = via.0.first()?;
+        let host = match top.host() {
+            rvoip_sip_core::Host::Domain(domain) => {
+                NormalizedViaSentByHost::Domain(domain.trim_end_matches('.').to_ascii_lowercase())
+            }
+            rvoip_sip_core::Host::Address(address) => NormalizedViaSentByHost::Address(*address),
+        };
+        let default_port = if top.transport().eq_ignore_ascii_case("TLS")
+            || top.transport().eq_ignore_ascii_case("WSS")
+        {
+            5061
+        } else {
+            5060
+        };
+        Some(Self {
+            host,
+            port: top.port().unwrap_or(default_port),
+        })
+    }
 }
