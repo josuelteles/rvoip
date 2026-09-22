@@ -50,7 +50,9 @@ impl ServerInviteDialogKey {
 #[derive(Debug, Clone)]
 pub(crate) struct ServerInviteAckIndexEntry {
     pub(crate) transaction_id: TransactionKey,
-    pub(crate) expires_at: Option<Instant>,
+    /// Retention deadline once the transaction retired, on the Tokio clock
+    /// like the transaction timers, so a paused clock governs both.
+    pub(crate) expires_at: Option<tokio::time::Instant>,
     /// Class of the final response the transaction authorized, recorded
     /// before that final reaches the wire. Only a 2xx makes an ACK with a
     /// different branch an end-to-end 2xx ACK (RFC 3261 §17.1.1.3); the ACK
@@ -130,7 +132,7 @@ impl ServerInviteAckIndexEntry {
         }
     }
 
-    pub(crate) fn is_expired(&self, now: Instant) -> bool {
+    pub(crate) fn is_expired(&self, now: tokio::time::Instant) -> bool {
         self.expires_at.is_some_and(|expires_at| now >= expires_at)
     }
 }

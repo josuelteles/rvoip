@@ -251,7 +251,7 @@ payloads: `non_2xx_invite_server_retained`,
 | C2: CANCEL after the 480 | 200 to CANCEL, no 487, 480 kept | same |
 | C3: CANCEL races the final | one final per order (487 when the CANCEL is handled first, 480 when the final is, one of them when concurrent); write boundary pinned by `a_final_at_the_write_boundary_refuses_a_second_final` | same |
 | C4: unmatched CANCEL | 481, INVITE untouched | same |
-| C5: duplicate CANCEL | second 200 from the CANCEL transaction, no second 487 | no second 487; the copy gets a stateless 500 (see pending) |
+| C5: duplicate CANCEL | second 200 from the CANCEL transaction, no second 487 | no second 487; the copy is answered statelessly with 200 (481 once the INVITE is gone), never 500 |
 | C6: CANCEL with the 180 To tag and `received=` | 200 and one 487 (interop only) | same |
 
 New sip-dialog unit tests:
@@ -263,19 +263,33 @@ New sip-dialog unit tests:
 `same_branch_with_another_sent_by_never_matches_the_server_transaction` and
 `a_final_at_the_write_boundary_refuses_a_second_final`.
 
-## Pending
+## Follow-up fixes
 
-- Over TCP, a duplicate of a non-INVITE request that arrives while its
-  terminated transaction is inside the removal grace (Timer J is zero) cannot
-  open a new transaction and gets a stateless 500. Seen with C5. A conforming
-  UAC does not retransmit over TCP, and the INVITE is not affected, but the
-  answer should be a replay or 481.
+- Duplicate CANCEL over TCP. Timer J is zero on a reliable transport, so a
+  copy that arrives while the CANCEL transaction is being retired cannot open
+  a transaction (`transaction_exists`) and used to get the generic stateless
+  500. A CANCEL copy is now answered statelessly with a recomputed result,
+  which has no side effect (RFC 3261 §9.2): 200 while the matched INVITE
+  exists (the first CANCEL already left it with a final), 481 once it is gone.
+- The server-INVITE ACK index (binding deadline and expiry queue) runs on
+  `tokio::time::Instant`, the clock of the transaction timers. C0a now checks
+  that the retired binding expires under the paused clock.
+
+## Known limitations
+
+- A request with the same branch as a live server transaction but another
+  sent-by is a separate transaction by RFC 3261 §17.2.3, but `TransactionKey`
+  (public, used by sharding, indexes and diagnostics) has no sent-by, so it
+  cannot open its own transaction. It gets a stateless 500 with
+  `Retry-After: 1` and never touches the existing transaction. This includes
+  a TCP client that reconnects, puts the new port in its Via and resends the
+  INVITE with the same branch: before, it got the retained final replayed.
+  Fixing it properly means carrying sent-by in the transaction key.
+- Other non-INVITE copies over TCP (a BYE, for example) that land in the same
+  retirement window still get the generic retriable 500: their original
+  response is not retained on a reliable transport and cannot be recomputed.
 - A redirect still publishes a generic terminal event; there is no typed
   redirect event.
-- The retired `server_invite_dialog_index` entry expires on T4 measured with
-  `std::time::Instant`, so paused-clock tests see it until real time passes.
-  It is bounded, but it does not follow the virtual clock like the
-  transaction timers do.
 
 The C0 cases of the final test file (which adds the TCP variants) were run
 again on 1d4ce510 with its own target directory: all five fail the same way

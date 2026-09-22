@@ -900,6 +900,39 @@ impl TransactionManager {
                 .await?;
                 return Ok(());
             }
+            Err(Error::TransactionExists { .. }) if request.method() == Method::Cancel => {
+                // A CANCEL copy whose own transaction is still being retired:
+                // over a reliable transport Timer J is zero, so there is no
+                // retained response to replay. Its answer is recomputable
+                // without side effects (RFC 3261 §9.2): the first CANCEL left
+                // the INVITE with a final, so a matching INVITE means 200, and
+                // no matching INVITE means 481.
+                let status = match self
+                    .find_invite_server_transaction_for_cancel(&request)
+                    .await
+                {
+                    Ok(Some(invite_key)) if self.server_invite_has_final(&invite_key) => {
+                        StatusCode::Ok
+                    }
+                    Ok(Some(_)) => StatusCode::ServerInternalError,
+                    Ok(None) | Err(_) => StatusCode::CallOrTransactionDoesNotExist,
+                };
+                debug!(
+                    status = status.as_u16(),
+                    "Answering a CANCEL copy while its transaction is retired"
+                );
+                let retry_after = (status == StatusCode::ServerInternalError).then_some(1);
+                send_stateless_final_response(
+                    &request,
+                    ingress_context.response_route(),
+                    &self.transport,
+                    status,
+                    retry_after,
+                    "Failed to answer a CANCEL copy of a retired transaction",
+                )
+                .await?;
+                return Ok(());
+            }
             Err(error) => {
                 // A creation failure must never leave the request unanswered.
                 // The dominant case is a transaction key still reserved by
@@ -1414,14 +1447,14 @@ impl TransactionManager {
             .get(dialog_key)
             .map(|entry| entry.value().clone())?;
 
-        if entry.is_expired(std::time::Instant::now()) {
+        if entry.is_expired(tokio::time::Instant::now()) {
             // Do not let an expired snapshot race with a replacement binding
             // for the same dialog key. The deadline generation is the exact
             // identity of the observed index entry.
             self.server_invite_dialog_index
                 .remove_if(dialog_key, |_, current| {
                     current.deadline_generation == entry.deadline_generation
-                        && current.is_expired(std::time::Instant::now())
+                        && current.is_expired(tokio::time::Instant::now())
                 });
             None
         } else {

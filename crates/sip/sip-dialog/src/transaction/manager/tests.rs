@@ -5934,7 +5934,7 @@ mod tests {
         );
 
         assert_eq!(
-            manager.expire_due_server_invite_dialog_index(Instant::now(), 1),
+            manager.expire_due_server_invite_dialog_index(tokio::time::Instant::now(), 1),
             1
         );
         assert!(!manager.server_invite_dialog_index.contains_key(&dialog_key));
@@ -5964,7 +5964,7 @@ mod tests {
             to_tag: Some("to-stale".into()),
         };
         let mut retired = ServerInviteAckIndexEntry::active(old_transaction);
-        retired.expires_at = Some(Instant::now() - Duration::from_millis(1));
+        retired.expires_at = Some(tokio::time::Instant::now() - Duration::from_millis(1));
         manager.insert_server_invite_dialog_index_entry(dialog_key.clone(), retired);
         let stale_generation = manager
             .server_invite_dialog_index
@@ -5984,7 +5984,7 @@ mod tests {
         assert_ne!(stale_generation, replacement_generation);
 
         assert_eq!(
-            manager.expire_due_server_invite_dialog_index(Instant::now(), 1),
+            manager.expire_due_server_invite_dialog_index(tokio::time::Instant::now(), 1),
             1
         );
         let retained = manager
@@ -6020,13 +6020,14 @@ mod tests {
                 to_tag: None,
             };
             let mut retired = ServerInviteAckIndexEntry::active(transaction_id);
-            retired.expires_at = Some(Instant::now() - Duration::from_millis(1));
+            retired.expires_at = Some(tokio::time::Instant::now() - Duration::from_millis(1));
             manager.insert_server_invite_dialog_index_entry(dialog_key, retired);
         }
 
         assert_eq!(manager.server_invite_dialog_index.len(), TOTAL);
         assert_eq!(
-            manager.expire_due_server_invite_dialog_index(Instant::now(), FIRST_BUDGET),
+            manager
+                .expire_due_server_invite_dialog_index(tokio::time::Instant::now(), FIRST_BUDGET),
             FIRST_BUDGET
         );
         assert_eq!(
@@ -6034,7 +6035,7 @@ mod tests {
             TOTAL - FIRST_BUDGET
         );
         assert_eq!(
-            manager.expire_due_server_invite_dialog_index(Instant::now(), TOTAL),
+            manager.expire_due_server_invite_dialog_index(tokio::time::Instant::now(), TOTAL),
             TOTAL - FIRST_BUDGET
         );
         assert!(manager.server_invite_dialog_index.is_empty());

@@ -223,9 +223,14 @@ impl Harness {
         let subscriber = tracing_subscriber::registry().with(logs.clone().with_filter(filter));
         let log_guard = tracing::subscriber::set_default(subscriber);
 
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-        let uas_port = probe.local_addr().expect("probe addr").port();
-        drop(probe);
+        // The UAS listens on both transports, so the port must be free for both.
+        let uas_port = loop {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            let port = tcp.local_addr().expect("probe addr").port();
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                break port;
+            }
+        };
 
         let cell = Arc::new(tokio::sync::OnceCell::new());
         let ringing_seen = Arc::new(tokio::sync::Notify::new());
@@ -267,7 +272,15 @@ impl Harness {
                 (Writer::Udp(socket, uas_addr), port)
             }
             Wire::Tcp => {
-                let stream = TcpStream::connect(&uas_addr).await.expect("TCP connect");
+                let mut connected = None;
+                for _ in 0..SETTLE_ROUNDS {
+                    if let Ok(stream) = TcpStream::connect(&uas_addr).await {
+                        connected = Some(stream);
+                        break;
+                    }
+                    settle().await;
+                }
+                let stream = connected.expect("TCP connect");
                 let port = stream.local_addr().expect("client addr").port();
                 let (mut read_half, write_half) = stream.into_split();
                 tokio::spawn(async move {
@@ -700,6 +713,12 @@ async fn c0a(wire: Wire) {
     assert_eq!(
         after_h.server_transactions, baseline.server_transactions,
         "the transaction must end on Timer H"
+    );
+    // The retired ACK binding expires T4 after the transaction ended, on the
+    // same (paused) clock as the transaction timers.
+    assert_eq!(
+        after_h.dialog_index, baseline.dialog_index,
+        "the retired ACK binding must expire under the paused clock"
     );
 }
 
@@ -1286,8 +1305,8 @@ over_udp_and_tcp!(
 /// C5: a duplicate CANCEL is answered by the CANCEL transaction again and has
 /// no second effect on the INVITE. Over TCP Timer J is zero, so there is no
 /// CANCEL transaction left to answer the copy (a conforming UAC never sends
-/// one); the invariant checked there is that the INVITE sees no second
-/// effect.
+/// one): it is answered statelessly, 200 while the INVITE still exists and
+/// 481 once Timer I (zero over TCP) ended it, never 500.
 async fn c5(wire: Wire) {
     let mut h = Harness::start(wire, Mode::Hold).await;
     let tag = "c5";
@@ -1325,8 +1344,18 @@ async fn c5(wire: Wire) {
     h.stop().await;
 
     assert_eq!(counts.1, 1, "no second 487 to the INVITE");
-    if wire == Wire::Udp {
-        assert_eq!(counts, (2, 1, 0), "the CANCEL transaction answers the copy");
+    match wire {
+        Wire::Udp => assert_eq!(counts, (2, 1, 0), "the CANCEL transaction answers the copy"),
+        Wire::Tcp => {
+            assert_eq!(cancel_responses.len(), 2, "the copy is answered");
+            assert!(
+                matches!(
+                    cancel_responses[1].as_str(),
+                    "SIP/2.0 200 OK" | "SIP/2.0 481 Call/Transaction Does Not Exist"
+                ),
+                "the copy gets 200 or 481, never a server error: {cancel_responses:?}"
+            );
+        }
     }
 }
 

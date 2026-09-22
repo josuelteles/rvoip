@@ -1878,7 +1878,7 @@ impl Invite2xxDeadlineScheduler {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ServerInviteAckExpiryEntry {
-    due_at: Instant,
+    due_at: tokio::time::Instant,
     generation: u64,
     dialog_key: ServerInviteDialogKey,
 }
@@ -7486,7 +7486,7 @@ impl TransactionManager {
     }
 
     pub(crate) fn retire_server_invite_dialog_index_for(&self, transaction_id: &TransactionKey) {
-        let expires_at = Instant::now() + self.timer_settings.t4;
+        let expires_at = tokio::time::Instant::now() + self.timer_settings.t4;
 
         if let Some((_, keys)) = self.server_invite_dialog_keys_by_tx.remove(transaction_id) {
             for key in keys {
@@ -7794,7 +7794,7 @@ impl TransactionManager {
 
     fn maintenance_prune_auxiliary_retained_state(&self) {
         self.expire_due_server_invite_dialog_index(
-            Instant::now(),
+            tokio::time::Instant::now(),
             SERVER_INVITE_ACK_EXPIRY_BATCH_MAX,
         );
         self.prune_invite_2xx_response_cache();
@@ -8167,7 +8167,11 @@ impl TransactionManager {
         }
     }
 
-    fn expire_due_server_invite_dialog_index(&self, now: Instant, max_work: usize) -> usize {
+    fn expire_due_server_invite_dialog_index(
+        &self,
+        now: tokio::time::Instant,
+        max_work: usize,
+    ) -> usize {
         if max_work == 0 {
             return 0;
         }
@@ -8201,7 +8205,7 @@ impl TransactionManager {
     /// Full-map repair for explicit diagnostics only. Normal cleanup is
     /// exclusively driven by `server_invite_dialog_expiry_queue`.
     fn repair_expired_server_invite_dialog_index(&self) -> usize {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         let expired: Vec<(ServerInviteDialogKey, u64)> = self
             .server_invite_dialog_index
             .iter()
