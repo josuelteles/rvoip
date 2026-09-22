@@ -8,9 +8,14 @@
 //! peer waited out its own timeout — and the behaviour alternated between
 //! working and hanging as attempts fell inside or outside the window.
 //!
-//! RFC 3261 §17.2.1 requires the retained final response to be replayed, and
-//! §18.2.1 does not stop requiring it just because a connection-oriented peer
-//! reconnected under a new flow.
+//! RFC 3261 §17.2.1 requires the retained final response to be replayed to a
+//! retransmission, and §18.2.1 does not stop requiring it just because a
+//! connection-oriented peer reconnected under a new flow. A retransmission is
+//! matched by §17.2.3, which includes the top Via sent-by: the TCP attempts
+//! here come from a fresh source port each time, so they are not
+//! retransmissions of the first INVITE. They carry its Call-ID, From tag and
+//! CSeq with no To tag, which makes them merged requests, answered with 482
+//! (§8.2.2.2). What every attempt must get is an answer.
 
 use rvoip_sip_core::builder::SimpleResponseBuilder;
 use rvoip_sip_core::StatusCode;
@@ -104,7 +109,7 @@ fn assert_sip_response(bytes: &[u8], label: &str) {
 }
 
 /// One INVITE over a brand new TCP connection, answered and ACKed.
-async fn tcp_exchange(server: SocketAddr, label: &str) {
+async fn tcp_exchange(server: SocketAddr, label: &str) -> String {
     let socket = TcpSocket::new_v4().expect("client socket");
     socket
         .bind("127.0.0.1:0".parse().unwrap())
@@ -128,6 +133,11 @@ async fn tcp_exchange(server: SocketAddr, label: &str) {
     assert_sip_response(&buf[..bytes], label);
 
     let _ = stream.write_all(&ack(server, client, "TCP")).await;
+    String::from_utf8_lossy(&buf[..bytes])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 async fn udp_exchange(socket: &UdpSocket, server: SocketAddr, client: SocketAddr, label: &str) {
@@ -189,14 +199,33 @@ async fn udp_uas() -> (SocketAddr, Arc<TransactionManager>, Arc<AtomicUsize>) {
 /// where flow identity can be controlled without socket games.
 #[tokio::test(flavor = "multi_thread")]
 async fn retained_key_answers_every_sequential_tcp_invite() {
-    let (server, manager, _invites) = tcp_uas().await;
+    let (server, manager, invites) = tcp_uas().await;
 
+    let mut status_lines = Vec::new();
     for attempt in 0..ATTEMPTS {
-        tcp_exchange(server, &format!("attempt {attempt}")).await;
+        status_lines.push(tcp_exchange(server, &format!("attempt {attempt}")).await);
         // Stay well inside the retention window so every attempt after the
         // first lands on the reserved key.
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    assert!(
+        status_lines[0].starts_with("SIP/2.0 180") || status_lines[0].starts_with("SIP/2.0 200"),
+        "the first INVITE is a call: {:?}",
+        status_lines[0]
+    );
+    for (attempt, status_line) in status_lines.iter().enumerate().skip(1) {
+        assert!(
+            status_line.starts_with("SIP/2.0 482"),
+            "attempt {attempt} came from another sent-by with the first INVITE's \
+             Call-ID, From tag and CSeq, so it is a merged request: {status_line:?}"
+        );
+    }
+    assert_eq!(
+        invites.load(Ordering::Relaxed),
+        1,
+        "a merged request must not become a second call"
+    );
 
     manager.shutdown().await;
 }
@@ -209,7 +238,11 @@ async fn retained_key_answers_tcp_invite_after_cached_2xx_expires() {
 
     tcp_exchange(server, "first call").await;
     tokio::time::sleep(PAST_CACHED_2XX_RETENTION).await;
-    tcp_exchange(server, "post-cache attempt").await;
+    let answer = tcp_exchange(server, "post-cache attempt").await;
+    assert!(
+        answer.starts_with("SIP/2.0 "),
+        "the reserved key still answers: {answer:?}"
+    );
 
     manager.shutdown().await;
 }

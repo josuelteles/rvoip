@@ -1033,8 +1033,8 @@ mod tests {
             Some(invite_id.clone())
         );
 
-        // An INVITE from another sent-by is not a retransmission: it is
-        // answered statelessly and never reaches the INVITE transaction.
+        // The same INVITE from another sent-by is a merged request
+        // (RFC 3261 §8.2.2.2): 482, and it never reaches the transaction user.
         manager
             .handle_transport_event(dispatch_event_from(
                 Message::Request(request_with_sent_by(
@@ -1047,14 +1047,35 @@ mod tests {
             ))
             .await?;
         assert_eq!(
-            count_sent_status(&transport, StatusCode::ServerInternalError).await,
+            count_sent_status(&transport, StatusCode::LoopDetected).await,
             1
         );
         assert!(
             drain_for_request_event(&mut event_rx, Duration::from_millis(50))
                 .await
                 .is_none(),
-            "a colliding INVITE must not reach the transaction user"
+            "a merged INVITE must not reach the transaction user"
+        );
+
+        // Another call reusing the branch is not merged: it is refused as
+        // retriable, the deviation from §17.2.3 the key cannot express.
+        let mut other_call = request_with_sent_by(Method::Invite, branch, "192.0.2.99:5070", 1);
+        other_call
+            .headers
+            .retain(|header| !matches!(header, TypedHeader::CallId(_)));
+        other_call.headers.push(TypedHeader::CallId(
+            rvoip_sip_core::types::call_id::CallId::new("another-call"),
+        ));
+        manager
+            .handle_transport_event(dispatch_event_from(Message::Request(other_call), source))
+            .await?;
+        assert_eq!(
+            count_sent_status(&transport, StatusCode::ServerInternalError).await,
+            1
+        );
+        assert_eq!(
+            count_sent_status(&transport, StatusCode::LoopDetected).await,
+            1
         );
 
         // The ACK of the 480 must come from the INVITE sent-by to confirm it.

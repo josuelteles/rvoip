@@ -83,6 +83,35 @@ impl Drop for StagedServerPublicationGuard {
 }
 
 impl TransactionManager {
+    /// Status to answer an INVITE whose branch matches a cached 2xx that was
+    /// sent to another Via sent-by: 482 for a merged request (RFC 3261
+    /// §8.2.2.2), otherwise the retriable status of a branch collision.
+    /// `None` when the sent-by matches and the cached replay owns it.
+    fn cached_invite_2xx_sent_by_collision(
+        &self,
+        transaction_id: &TransactionKey,
+        request: &Request,
+    ) -> Option<StatusCode> {
+        let cached = self
+            .invite_2xx_response_cache
+            .get(transaction_id)
+            .map(|entry| entry.value().response.clone())?;
+        let cached_sent_by = NormalizedViaSentBy::from_response(&cached)?;
+        if Some(cached_sent_by) == NormalizedViaSentBy::from_request(request) {
+            return None;
+        }
+        diagnostics::record_server_sent_by_mismatch();
+        if request.to_tag().is_none()
+            && response_merge_identity(&cached).is_some()
+            && response_merge_identity(&cached) == request_merge_identity(request)
+        {
+            diagnostics::record_server_merged_request_rejected();
+            Some(StatusCode::LoopDetected)
+        } else {
+            Some(StatusCode::ServerInternalError)
+        }
+    }
+
     fn absorb_compact_non_invite_client_response(&self, transaction_id: &TransactionKey) -> bool {
         self.compact_non_invite_tombstones
             .get(transaction_id)
@@ -710,9 +739,36 @@ impl TransactionManager {
                             &self.transport,
                         )
                         .await?;
+                    } else if transaction
+                        .original_request_sync()
+                        .is_some_and(|original| is_merged_request(&original, &request))
+                    {
+                        // RFC 3261 §8.2.2.2: the same request (Call-ID, From
+                        // tag, CSeq, no To tag) that did not match the
+                        // transaction by §17.2.3, for example a TCP client
+                        // that reconnected and put its new port in the Via.
+                        // The key collides, so the 482 is stateless; a copy
+                        // gets the same answer.
+                        diagnostics::record_server_merged_request_rejected();
+                        debug!(
+                            transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&key),
+                            source = %ingress_context.source,
+                            "Rejecting a merged request with 482"
+                        );
+                        send_stateless_final_response(
+                            &request,
+                            ingress_context.response_route(),
+                            &self.transport,
+                            StatusCode::LoopDetected,
+                            None,
+                            "Failed to send stateless merged request response",
+                        )
+                        .await?;
                     } else {
-                        // Never silent: answer it the way any request that
-                        // cannot open a server transaction is answered.
+                        // Another call reusing the branch. By §17.2.3 it is a
+                        // separate transaction, but `TransactionKey` has no
+                        // sent-by, so it cannot open one: a known deviation,
+                        // answered as retriable and never silent.
                         warn!(
                             transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&key),
                             source = %ingress_context.source,
@@ -828,15 +884,31 @@ impl TransactionManager {
                 return Ok(());
             }
 
-            if request.method() == Method::Invite
-                && self
+            if request.method() == Method::Invite {
+                // The cached 2xx belongs to the transaction that sent it. A
+                // request with another sent-by is not its retransmission
+                // (RFC 3261 §17.2.3), so it is answered here instead.
+                if let Some(status) = self.cached_invite_2xx_sent_by_collision(&key, &request) {
+                    send_stateless_final_response(
+                        &request,
+                        ingress_context.response_route(),
+                        &self.transport,
+                        status,
+                        (status == StatusCode::ServerInternalError).then_some(1),
+                        "Failed to answer a cached-2xx sent-by collision",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                if self
                     .retransmit_cached_invite_2xx_response_on_route(
                         &key,
                         ingress_context.response_route(),
                     )
                     .await?
-            {
-                return Ok(());
+                {
+                    return Ok(());
+                }
             }
         }
 
@@ -900,6 +972,29 @@ impl TransactionManager {
                 .await?;
                 return Ok(());
             }
+            Err(Error::TransactionExists { key, .. })
+                if request.method() != Method::Invite
+                    && self.retained_server_final(&key, &request).is_some() =>
+            {
+                // A copy of a request whose transaction already answered and
+                // retired (RFC 3261 §17.2.2). The retained final goes back on
+                // the route this copy arrived on, without a TU event.
+                let wire = self
+                    .retained_server_final(&key, &request)
+                    .expect("checked by the guard");
+                diagnostics::record_server_final_replayed();
+                debug!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&key),
+                    "Replaying the retained final to a copy of a retired transaction"
+                );
+                self.transport
+                    .send_message_raw_via(wire, ingress_context.response_route())
+                    .await
+                    .map_err(|error| {
+                        Error::transport_error(error, "Failed to replay a retained final")
+                    })?;
+                return Ok(());
+            }
             Err(Error::TransactionExists { .. }) if request.method() == Method::Cancel => {
                 // A CANCEL copy whose own transaction is still being retired:
                 // over a reliable transport Timer J is zero, so there is no
@@ -931,6 +1026,18 @@ impl TransactionManager {
                     "Failed to answer a CANCEL copy of a retired transaction",
                 )
                 .await?;
+                return Ok(());
+            }
+            Err(Error::TransactionExists { key, .. }) if request.method() != Method::Invite => {
+                // The transaction retired without a final (a transport error,
+                // for example), so there is nothing to replay. Absorbing the
+                // copy is what a retransmission in Trying gets (§17.2.2).
+                diagnostics::record_server_copy_absorbed();
+                debug!(
+                    transaction=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&key),
+                    method=%crate::transaction::safe_diagnostics::SafeMethod::new(&request.method()),
+                    "Absorbing a copy of a retired transaction that left no final"
+                );
                 return Ok(());
             }
             Err(error) => {
@@ -1547,6 +1654,38 @@ async fn send_stateless_transaction_overload(
 /// Answer without a transaction when server-transaction allocation itself
 /// failed. An inbound request must never be left unanswered: the peer would
 /// otherwise wait out its own timeout with nothing on the wire to explain it.
+/// Call-ID, From tag and CSeq (number and method) of a message, the identity
+/// RFC 3261 §8.2.2.2 compares.
+type MergeIdentity = (String, String, u32, Method);
+
+fn request_merge_identity(request: &Request) -> Option<MergeIdentity> {
+    let cseq = request.cseq()?;
+    Some((
+        request.call_id()?.to_string(),
+        request.from_tag()?,
+        cseq.seq,
+        cseq.method.clone(),
+    ))
+}
+
+fn response_merge_identity(response: &Response) -> Option<MergeIdentity> {
+    let cseq = response.cseq()?;
+    Some((
+        response.call_id()?.to_string(),
+        response.from_tag()?,
+        cseq.seq,
+        cseq.method.clone(),
+    ))
+}
+
+/// RFC 3261 §8.2.2.2: `request` has no To tag and carries the Call-ID, From
+/// tag and CSeq (number and method) of `original`.
+fn is_merged_request(original: &Request, request: &Request) -> bool {
+    request.to_tag().is_none()
+        && request_merge_identity(original).is_some()
+        && request_merge_identity(original) == request_merge_identity(request)
+}
+
 async fn send_stateless_final_response(
     request: &Request,
     response_route: TransportRoute,

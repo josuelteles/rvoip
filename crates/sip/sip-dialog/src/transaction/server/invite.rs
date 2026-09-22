@@ -530,6 +530,29 @@ impl ServerInviteLogic {
                 // No state transition needed for INVITE retransmission
                 Ok(None)
             }
+            TransactionState::Completed => {
+                // RFC 3261 section 17.2.1: a request retransmission in
+                // Completed passes the most recent final response to the
+                // transport again. Over a reliable transport there is no
+                // Timer G to do it later.
+                debug!(id=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_id), "Received INVITE retransmission in Completed state");
+                let response = {
+                    let last_response = data.last_response.lock().await;
+                    last_response.clone()
+                };
+                if let Some(response) = response {
+                    if let Err(e) = data
+                        .transport
+                        .send_message_via(Message::Response(response), data.response_route.clone())
+                        .await
+                    {
+                        error!(id=%crate::transaction::safe_diagnostics::SafeTransactionKey::new(&tx_id), error=%crate::transaction::safe_diagnostics::SafeOpaqueError::new(&e), "Failed to retransmit final response");
+                        common_logic::send_transport_error_event(tx_id, &data.events_tx).await;
+                        return Ok(Some(TransactionState::Terminated));
+                    }
+                }
+                Ok(None)
+            }
             TransactionState::Terminated => {
                 let response = {
                     let last_response = data.last_response.lock().await;

@@ -279,6 +279,8 @@ pub struct TransactionManagerRetentionCounts {
     pub invite_2xx_response_due_queue: usize,
     pub transaction_destinations: usize,
     pub compact_non_invite_tombstones: usize,
+    /// Admission reservations holding a retained final response.
+    pub retained_server_finals: usize,
     pub compact_non_invite_deadlines: usize,
     pub event_subscribers: usize,
     pub subscriber_to_transactions: usize,
@@ -1191,8 +1193,24 @@ enum TransactionManagerEventReceiver {
     Shared(mpsc::Receiver<Arc<TransactionEvent>>),
 }
 
+/// The final response a retired server transaction left in its admission
+/// reservation, so a copy arriving before the reservation is released is
+/// answered with the same bytes (RFC 3261 §17.2.2). It lives and dies with
+/// the reservation, and is only used where the transaction itself is already
+/// gone: a reliable transport, where Timer J is zero.
+#[derive(Clone)]
+pub(crate) struct RetainedServerFinal {
+    pub(crate) wire: bytes::Bytes,
+    pub(crate) sent_by: Option<NormalizedViaSentBy>,
+}
+
+struct AdmissionEntry {
+    generation: u64,
+    retained_final: Option<RetainedServerFinal>,
+}
+
 struct TransactionAdmissionRegistry {
-    entries: DashMap<TransactionKey, u64>,
+    entries: DashMap<TransactionKey, AdmissionEntry>,
     next_generation: AtomicU64,
     /// Exact-key cleanup invoked while the retiring admission generation still
     /// owns the wire key. The dialog layer uses this as a backstop when its
@@ -1382,7 +1400,10 @@ impl TransactionAdmissionRegistry {
         match self.entries.entry(key.clone()) {
             Entry::Occupied(_) => None,
             Entry::Vacant(entry) => {
-                entry.insert(generation);
+                entry.insert(AdmissionEntry {
+                    generation,
+                    retained_final: None,
+                });
                 Some(TransactionAdmissionOwner {
                     _inner: Arc::new(TransactionAdmissionOwnerInner {
                         registry: Arc::clone(self),
@@ -1409,7 +1430,7 @@ impl Drop for TransactionAdmissionOwnerInner {
         // generation therefore cannot publish a same-key dialog route between
         // cleanup and admission release (the ABA case this fence prevents).
         if let Entry::Occupied(entry) = self.registry.entries.entry(self.key.clone()) {
-            if *entry.get() != self.generation {
+            if entry.get().generation != self.generation {
                 return;
             }
             let hook = self
@@ -1439,6 +1460,20 @@ pub struct TransactionAdmissionOwner {
 impl TransactionAdmissionOwner {
     pub(crate) fn generation(&self) -> u64 {
         self._inner.generation
+    }
+
+    /// Leave the final response in this reservation. Released with it.
+    pub(crate) fn retain_server_final(
+        &self,
+        wire: bytes::Bytes,
+        sent_by: Option<NormalizedViaSentBy>,
+    ) {
+        let inner = &self._inner;
+        if let Some(mut entry) = inner.registry.entries.get_mut(&inner.key) {
+            if entry.generation == inner.generation {
+                entry.retained_final = Some(RetainedServerFinal { wire, sent_by });
+            }
+        }
     }
 }
 
@@ -2541,6 +2576,7 @@ impl TransactionManager {
             client_transactions,
             server_transactions,
             active_transactions_total: client_transactions + server_transactions,
+            retained_server_finals: self.retained_server_final_count(),
             terminated_transactions: self.terminated_transactions.len(),
             server_invite_dialog_index: self.server_invite_dialog_index.len(),
             server_invite_dialog_keys_by_tx: self.server_invite_dialog_keys_by_tx.len(),
@@ -6817,6 +6853,35 @@ impl TransactionManager {
         Ok((self.server_transactions.contains_key(&invite_key)
             && self.server_request_sent_by_matches(&invite_key, cancel_request))
         .then_some(invite_key))
+    }
+
+    /// The final a retired server transaction left in its reservation, when
+    /// the request comes from the sent-by that final was sent to.
+    pub(crate) fn retained_server_final(
+        &self,
+        transaction_id: &TransactionKey,
+        request: &Request,
+    ) -> Option<bytes::Bytes> {
+        let retained = self
+            .transaction_admissions
+            .entries
+            .get(transaction_id)
+            .and_then(|entry| entry.retained_final.clone())?;
+        if retained.sent_by.is_some()
+            && retained.sent_by != NormalizedViaSentBy::from_request(request)
+        {
+            return None;
+        }
+        Some(retained.wire)
+    }
+
+    /// Reservations currently holding a retained final, for diagnostics.
+    pub(crate) fn retained_server_final_count(&self) -> usize {
+        self.transaction_admissions
+            .entries
+            .iter()
+            .filter(|entry| entry.retained_final.is_some())
+            .count()
     }
 
     /// RFC 3261 §17.2.3: a request matches a server transaction only when the

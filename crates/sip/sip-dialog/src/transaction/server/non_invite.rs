@@ -234,8 +234,15 @@ impl TransactionLogic<ServerTransactionData, ServerNonInviteTimerHandles> for Se
                     {
                         data.state.set(TransactionState::Terminated);
                     }
-                } else if !data.clone().schedule_termination().await {
-                    data.state.set(TransactionState::Terminated);
+                } else {
+                    // Timer J is zero here, so the transaction goes. Its final
+                    // stays in the admission reservation that still holds the
+                    // key, so a copy arriving before the key is released is
+                    // answered with the same bytes.
+                    data.retain_final_in_admission_reservation().await;
+                    if !data.clone().schedule_termination().await {
+                        data.state.set(TransactionState::Terminated);
+                    }
                 }
             }
             TransactionState::Terminated => {

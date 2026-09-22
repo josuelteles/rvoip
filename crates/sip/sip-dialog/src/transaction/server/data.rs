@@ -535,6 +535,26 @@ impl ServerTransactionData {
     /// manager-owned Timer J replay tombstone. The immutable response bytes
     /// and exact ingress route are the only protocol state retained. Low-level
     /// transactions use the shared runtime deadline worker instead.
+    /// Leave the final response in the admission reservation of this key, for
+    /// a copy that arrives before the reservation is released.
+    pub(crate) async fn retain_final_in_admission_reservation(&self) {
+        let Some(owner) = self.transaction_admission_owner() else {
+            return;
+        };
+        let Some(response) = self.last_response.lock().await.clone() else {
+            return;
+        };
+        if response.status().is_provisional() {
+            return;
+        }
+        let sent_by = crate::transaction::manager::NormalizedViaSentBy::from_response(&response);
+        owner.retain_server_final(
+            bytes::Bytes::from(rvoip_sip_core::Message::Response(response).to_bytes()),
+            sent_by,
+        );
+        crate::diagnostics::record_server_final_retained();
+    }
+
     pub(crate) async fn schedule_compact_timer_j(
         self: Arc<Self>,
         delay: std::time::Duration,

@@ -200,7 +200,16 @@ enum NormalizedViaSentByHost {
 
 impl NormalizedViaSentBy {
     pub(crate) fn from_request(request: &rvoip_sip_core::Request) -> Option<Self> {
-        let via = request.first_via()?;
+        Self::from_via(request.first_via()?)
+    }
+
+    /// The sent-by a response was sent to: its top Via is the one the
+    /// request carried.
+    pub(crate) fn from_response(response: &Response) -> Option<Self> {
+        Self::from_via(response.first_via()?)
+    }
+
+    fn from_via(via: rvoip_sip_core::types::via::Via) -> Option<Self> {
         let top = via.0.first()?;
         let host = match top.host() {
             rvoip_sip_core::Host::Domain(domain) => {
